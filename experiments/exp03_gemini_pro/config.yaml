@@ -1,0 +1,10 @@
+experiment: exp03_gemini_pro
+description: "Gemini 2.5 Pro with grounding (DR equivalent) — 5 SurveyBench topics"
+
+system: autosurvey_gemini
+topics: 5
+
+evaluation:
+  methods: [swr, cwr]
+  eval_types: [outline, content]
+  judges: configs/judges.json

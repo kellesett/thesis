@@ -1,0 +1,23 @@
+[
+  {
+    "name": "local-deepseek",
+    "url": "http://localhost:8000/v1",
+    "model": "deepseek-chat",
+    "api_key_env": "LOCAL_API_KEY",
+    "n": 1
+  },
+  {
+    "name": "gemini-flash",
+    "url": "https://openrouter.ai/api/v1",
+    "model": "google/gemini-2.0-flash-001",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "n": 1
+  },
+  {
+    "name": "claude-sonnet",
+    "url": "https://openrouter.ai/api/v1",
+    "model": "anthropic/claude-sonnet-4-5",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "n": 1
+  }
+]

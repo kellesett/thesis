@@ -1,0 +1,10 @@
+experiment: exp01_openai_dr
+description: "OpenAI Deep Research (o4-mini) — 5 SurveyBench topics"
+
+system: openai_o4_mini_dr
+topics: 5
+
+evaluation:
+  methods: [swr, cwr]
+  eval_types: [outline, content]
+  judges: configs/judges.json   # относительно ROOT
