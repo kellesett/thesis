@@ -1,5 +1,8 @@
 # experiments/Dockerfile.base
-# Базовый образ для всех экспериментов.
+# Базовый образ для экспериментов exp01–exp03 (без CUDA).
+# Содержит только системные зависимости и исходный код проекта.
+# Python-зависимости устанавливаются в Dockerfile каждого эксперимента.
+#
 # Сборка: docker build -f experiments/Dockerfile.base -t thesis-base .
 # (запускай из корня репозитория)
 
@@ -7,16 +10,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Системные зависимости
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Python зависимости (кэшируются отдельным слоем)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Исходный код
+# Исходный код (общий для всех экспериментов)
 COPY src/        ./src/
 COPY configs/    ./configs/
 COPY repos/SurveyForge/SurveyBench/ ./repos/SurveyForge/SurveyBench/

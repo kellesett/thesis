@@ -1,0 +1,36 @@
+experiment: exp04_surveyforge
+system: surveyforge
+
+# ── Backend ────────────────────────────────────────────────────────────────────
+# "openrouter" — облачные модели через OpenRouter (OPENROUTER_API_KEY в .env)
+# "local"      — локальный сервер (LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_MODEL в .env)
+backend: local
+
+# LLM для генерации — всегда берётся из этого поля
+# openrouter: "openai/gpt-4o-mini-2024-07-18", "anthropic/claude-3-5-haiku", etc.
+# local:      имя модели как его знает сервер, например "qwen2.5-72b"
+model: Qwen3-235B-A22B-Instruct-2507
+
+# Количество тем из SurveyBench
+topics: 5
+
+# Пути к базам данных (монтируются через Docker volume)
+db_path: /app/datasets/surveyforge_db/database
+survey_outline_path: /app/datasets/surveyforge_db
+
+# Модель эмбеддингов (локальный путь внутри контейнера)
+embedding_model: /app/datasets/gte-large-en-v1.5
+
+# Параметры генерации (из paper: section_num=6, subsection_len=500)
+section_num: 6
+subsection_len: 500
+outline_reference_num: 1500
+rag_num: 100
+rag_max_out: 60
+refinement: false   # true = рефайнмент секций (медленнее, качественнее)
+
+evaluation:
+  methods: [swr, cwr]
+  eval_types: [outline, content]
+  k_refs: 3
+  judges: configs/judges.json

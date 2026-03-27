@@ -18,9 +18,9 @@ OUT     = ROOT / "results" / CFG["experiment"]
 
 
 def step(label: str, cmd: list[str]) -> None:
-    print(f"\n{'─' * 60}")
+    print(f"\n{'-' * 60}")
     print(f"  {label}")
-    print(f"{'─' * 60}")
+    print(f"{'-' * 60}")
     subprocess.run(cmd, check=True)
 
 
@@ -31,16 +31,17 @@ def main() -> None:
     methods   = eval_cfg.get("methods",    ["swr", "cwr"])
     etypes    = eval_cfg.get("eval_types", ["outline", "content"])
     judges    = eval_cfg.get("judges",     str(ROOT / "configs" / "judges.json"))
+    k_refs    = eval_cfg.get("k_refs",     1)
 
     gen_out  = OUT / "generated"
     eval_out = OUT / "eval"
 
-    print(f"\n{'═' * 60}")
+    print(f"\n{'=' * 60}")
     print(f"  Experiment : {CFG['experiment']}")
     print(f"  System     : {system}")
     print(f"  Topics     : {topics}")
     print(f"  Methods    : {methods}")
-    print(f"{'═' * 60}")
+    print(f"{'=' * 60}")
 
     # ── Step 1: Generation ────────────────────────────────────
     step("Step 1 / Generation", [
@@ -57,20 +58,22 @@ def main() -> None:
         "--eval",    ",".join(etypes),
         "--judges",  str(judges),
         "--systems", system,
+        "--results-dir", str(gen_out),
         "--out",     str(eval_out),
         "--resume",
     ]
+    eval_cmd += ["--k-refs", str(k_refs)]
     if "swr" in methods: eval_cmd.append("--swr")
     if "cwr" in methods: eval_cmd.append("--cwr")
 
     step("Step 2 / Evaluation", eval_cmd)
 
     # ── Done ─────────────────────────────────────────────────
-    print(f"\n{'═' * 60}")
-    print(f"  ✅  {CFG['experiment']} complete")
+    print(f"\n{'=' * 60}")
+    print(f"  [OK]  {CFG['experiment']} complete")
     print(f"  generated → {gen_out}")
     print(f"  eval      → {eval_out}")
-    print(f"{'═' * 60}\n")
+    print(f"{'=' * 60}\n")
 
 
 if __name__ == "__main__":

@@ -7,4 +7,5 @@ topics: 5
 evaluation:
   methods: [swr, cwr]
   eval_types: [outline, content]
+  k_refs: 3
   judges: configs/judges.json   # относительно ROOT

@@ -1,10 +1,11 @@
 experiment: exp02_perplexity_dr
-description: "Perplexity Sonar Deep Research — 5 SurveyBench topics"
+description: "Perplexity Sonar Deep Research — 1 SurveyBench topic"
 
 system: perplexity_dr
-topics: 5
+topics: 1
 
 evaluation:
   methods: [swr, cwr]
   eval_types: [outline, content]
-  judges: configs/judges.json
+  k_refs: 1
+  judges: experiments/exp02_perplexity_dr/judges.json

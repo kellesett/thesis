@@ -1,0 +1,10 @@
+# experiments/exp01_openai_dr/requirements.txt
+# Зависимости для OpenAI Deep Research (OpenRouter API)
+openai>=1.0
+python-dotenv
+PyYAML
+tqdm
+requests
+huggingface_hub
+datasets
+pandas

@@ -69,7 +69,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ROOT_DIR      = Path(__file__).parent.parent
-RESULTS_DIR   = ROOT_DIR / "results"
 DATASETS_DIR  = ROOT_DIR / "datasets" / "human_surveys"
 EVAL_OUT_DIR  = ROOT_DIR / "eval_results"
 
@@ -84,10 +83,11 @@ MAX_CONTENT_CHARS = 12_000
 @dataclass
 class JudgeConfig:
     name: str
-    url: str
     model: str
     api_key_env: str
-    n: int = 1          # сколько раз вызывать
+    n: int = 1                      # сколько раз вызывать
+    _url: Optional[str] = None      # прямой URL (поле url в JSON)
+    _url_env: Optional[str] = None  # имя env-переменной с URL (поле url_env в JSON)
 
     @property
     def api_key(self) -> str:
@@ -98,8 +98,24 @@ class JudgeConfig:
             )
         return key
 
+    def get_url(self) -> str:
+        if self._url:
+            return self._url
+        if self._url_env:
+            val = os.getenv(self._url_env)
+            if not val:
+                raise EnvironmentError(
+                    f"Переменная {self._url_env} не задана в .env (судья '{self.name}')"
+                )
+            return val
+        raise ValueError(f"Судья '{self.name}': укажи 'url' или 'url_env' в judges.json")
+
+    @property
+    def url(self) -> str:
+        return self.get_url()
+
     def make_client(self) -> OpenAI:
-        return OpenAI(base_url=self.url, api_key=self.api_key)
+        return OpenAI(base_url=self.get_url(), api_key=self.api_key)
 
 
 def load_judges(path: str) -> list[JudgeConfig]:
@@ -109,10 +125,11 @@ def load_judges(path: str) -> list[JudgeConfig]:
     for item in raw:
         judges.append(JudgeConfig(
             name=item["name"],
-            url=item["url"],
             model=item["model"],
             api_key_env=item["api_key_env"],
             n=item.get("n", 1),
+            _url=item.get("url"),
+            _url_env=item.get("url_env"),
         ))
     return judges
 
@@ -329,44 +346,46 @@ def truncate(text: str, max_chars: int) -> str:
 
 # ─── Загрузка данных ──────────────────────────────────────────────────────────
 
-def load_generated_results(topic: str) -> dict[str, dict]:
+def load_generated_results(topic: str, results_dir: Path) -> dict[str, dict]:
     """
-    Загружает все сгенерированные survey для данной темы.
+    Загружает все сгенерированные survey для данной темы из results_dir.
     Ключ — system_id, значение — словарь из JSON-файла.
     """
     results = {}
-    if not RESULTS_DIR.exists():
+    if not results_dir.exists():
         return results
-    # slug темы: то же что в base.py
     topic_slug = re.sub(r"[^\w]", "_", topic).strip("_")
-    for f in RESULTS_DIR.glob(f"*__{topic_slug}.json"):
+    for f in results_dir.glob(f"*__{topic_slug}.json"):
         sys_id = f.stem.split("__")[0]
         try:
             with open(f) as fp:
                 data = json.load(fp)
-            if data.get("generated_text"):
+            if data.get("generated_text") or data.get("text"):
                 results[sys_id] = data
         except Exception:
             pass
     return results
 
 
-def load_human_survey(topic: str) -> Optional[dict]:
+def load_human_surveys(topic: str, k: int = 1) -> list[dict]:
     """
-    Загружает human survey для темы из datasets/human_surveys/{topic}.json
-    Возвращает dict с ключами: text, outline (или None если нет файла).
+    Загружает до k случайно выбранных human survey для темы.
+    Если доступных обзоров меньше k — берёт все.
+    Возвращает список dict'ов (может быть пустым).
     """
-    safe = topic.replace("/", "_").replace("\\", "_")
+    import random
+    safe = topic.replace("/", "_").replace("\\", "_").replace(" ", "_")
     path = DATASETS_DIR / f"{safe}.json"
     if not path.exists():
-        return None
+        return []
     with open(path) as f:
         data = json.load(f)
-    # берём первый survey (обычно один на тему)
     surveys = data.get("surveys", [])
     if not surveys:
-        return None
-    return surveys[0]
+        return []
+    if k >= len(surveys):
+        return surveys
+    return random.sample(surveys, k)
 
 
 def get_text_for_eval(survey_data: dict, eval_type: str) -> str:
@@ -387,28 +406,28 @@ def get_text_for_eval(survey_data: dict, eval_type: str) -> str:
 # ─── Оценка ───────────────────────────────────────────────────────────────────
 
 def run_swr(judges: list[JudgeConfig], topic: str,
-            gen_text: str, human_text: str,
+            gen_text: str, human_texts: list[str],
             eval_type: str, system_id: str) -> SWRPairResult:
-    """Score Win Rate: оцениваем generated и human независимо, сравниваем баллы."""
+    """
+    Score Win Rate: оцениваем generated и каждый из human-референсов независимо.
+    Скор generated считается один раз, human_avg усредняется по всем k референсам.
+    """
     result = SWRPairResult(system_id=system_id, topic=topic, eval_type=eval_type)
     desc = EVAL_TYPE_DESCS[eval_type]
 
     for judge in judges:
         client = judge.make_client()
         for i in range(judge.n):
-            # Оцениваем generated
+            # Оцениваем generated (один раз на судью×прогон)
             prompt_gen = SWR_PROMPT.format(
-                topic=topic,
-                eval_type_desc=desc,
-                item_label="Generated survey",
-                text=gen_text,
+                topic=topic, eval_type_desc=desc,
+                item_label="Generated survey", text=gen_text,
             )
             try:
                 resp = call_judge(client, judge.model, prompt_gen)
-                score = parse_score(resp)
                 result.generated_calls.append(JudgeCall(
                     judge_name=judge.name, judge_model=judge.model,
-                    call_index=i, raw_response=resp, score=score,
+                    call_index=i, raw_response=resp, score=parse_score(resp),
                 ))
             except Exception as e:
                 result.generated_calls.append(JudgeCall(
@@ -417,35 +436,41 @@ def run_swr(judges: list[JudgeConfig], topic: str,
                 ))
             time.sleep(0.5)
 
-            # Оцениваем human
-            prompt_hum = SWR_PROMPT.format(
-                topic=topic,
-                eval_type_desc=desc,
-                item_label="Human-written survey",
-                text=human_text,
-            )
-            try:
-                resp = call_judge(client, judge.model, prompt_hum)
-                score = parse_score(resp)
-                result.human_calls.append(JudgeCall(
-                    judge_name=judge.name, judge_model=judge.model,
-                    call_index=i, raw_response=resp, score=score,
-                ))
-            except Exception as e:
-                result.human_calls.append(JudgeCall(
-                    judge_name=judge.name, judge_model=judge.model,
-                    call_index=i, raw_response="", error=str(e),
-                ))
-            time.sleep(0.5)
+            # Оцениваем каждый human-референс, усредняем
+            ref_scores = []
+            for ref_idx, human_text in enumerate(human_texts):
+                prompt_hum = SWR_PROMPT.format(
+                    topic=topic, eval_type_desc=desc,
+                    item_label=f"Human-written survey (ref {ref_idx + 1}/{len(human_texts)})",
+                    text=human_text,
+                )
+                try:
+                    resp = call_judge(client, judge.model, prompt_hum)
+                    score = parse_score(resp)
+                    ref_scores.append(score)
+                    result.human_calls.append(JudgeCall(
+                        judge_name=judge.name, judge_model=judge.model,
+                        call_index=i * len(human_texts) + ref_idx,
+                        raw_response=resp, score=score,
+                    ))
+                except Exception as e:
+                    result.human_calls.append(JudgeCall(
+                        judge_name=judge.name, judge_model=judge.model,
+                        call_index=i * len(human_texts) + ref_idx,
+                        raw_response="", error=str(e),
+                    ))
+                time.sleep(0.5)
 
     return result
 
 
 def run_cwr(judges: list[JudgeConfig], topic: str,
-            gen_text: str, human_text: str,
+            gen_text: str, human_texts: list[str],
             eval_type: str, system_id: str) -> PairResult:
-    """Comparative Win Rate: судья сравнивает оба текста напрямую.
+    """
+    Comparative Win Rate: судья сравнивает generated vs каждый human-референс.
     Generated = Survey A, Human = Survey B.
+    Победитель определяется большинством голосов по всем парам и всем судьям.
     """
     result = PairResult(system_id=system_id, topic=topic,
                         eval_type=eval_type, method="cwr")
@@ -454,25 +479,25 @@ def run_cwr(judges: list[JudgeConfig], topic: str,
     for judge in judges:
         client = judge.make_client()
         for i in range(judge.n):
-            prompt = CWR_PROMPT.format(
-                topic=topic,
-                eval_type_desc=desc,
-                text_a=gen_text,
-                text_b=human_text,
-            )
-            try:
-                resp = call_judge(client, judge.model, prompt, max_tokens=800)
-                winner = parse_winner(resp)
-                result.judge_calls.append(JudgeCall(
-                    judge_name=judge.name, judge_model=judge.model,
-                    call_index=i, raw_response=resp, winner=winner,
-                ))
-            except Exception as e:
-                result.judge_calls.append(JudgeCall(
-                    judge_name=judge.name, judge_model=judge.model,
-                    call_index=i, raw_response="", error=str(e),
-                ))
-            time.sleep(0.5)
+            for ref_idx, human_text in enumerate(human_texts):
+                prompt = CWR_PROMPT.format(
+                    topic=topic, eval_type_desc=desc,
+                    text_a=gen_text, text_b=human_text,
+                )
+                try:
+                    resp = call_judge(client, judge.model, prompt, max_tokens=800)
+                    result.judge_calls.append(JudgeCall(
+                        judge_name=judge.name, judge_model=judge.model,
+                        call_index=i * len(human_texts) + ref_idx,
+                        raw_response=resp, winner=parse_winner(resp),
+                    ))
+                except Exception as e:
+                    result.judge_calls.append(JudgeCall(
+                        judge_name=judge.name, judge_model=judge.model,
+                        call_index=i * len(human_texts) + ref_idx,
+                        raw_response="", error=str(e),
+                    ))
+                time.sleep(0.5)
 
     return result
 
@@ -517,9 +542,13 @@ def main():
                         help="Фильтр тем через запятую (default: все)")
     # Прочее
     parser.add_argument("--out", default=str(EVAL_OUT_DIR),
-                        help=f"Папка для результатов (default: {EVAL_OUT_DIR})")
+                        help=f"Папка для eval-результатов (default: {EVAL_OUT_DIR})")
+    parser.add_argument("--results-dir", default=None,
+                        help="Папка с generated JSON-файлами (default: ROOT/results)")
     parser.add_argument("--resume", action="store_true",
                         help="Пропускать уже посчитанные пары")
+    parser.add_argument("--k-refs", type=int, default=1,
+                        help="Сколько случайных human-референсов брать на тему (default: 1)")
     args = parser.parse_args()
 
     # Проверяем что хоть что-то включено
@@ -532,7 +561,9 @@ def main():
             parser.error(f"Неизвестный тип оценки: '{et}'. Допустимо: outline, content")
 
     # Загружаем судей
-    judges_path = args.judges
+    # Резолвим пути относительно ROOT если не абсолютные
+    results_dir = Path(args.results_dir) if args.results_dir else ROOT_DIR / "results"
+    judges_path = args.judges if Path(args.judges).is_absolute() else ROOT_DIR / args.judges
     if not Path(judges_path).exists():
         parser.error(
             f"Файл судей не найден: {judges_path}\n"
@@ -563,7 +594,8 @@ def main():
 
     print(f"\nМетоды: {methods}")
     print(f"Типы оценки: {eval_types}")
-    print(f"Тем: {len(all_topics)}\n")
+    print(f"Тем: {len(all_topics)}")
+    print(f"Human-референсов на тему: {args.k_refs}\n")
 
     # ── Главный цикл ──────────────────────────────────────────────────────────
     all_swr_results: dict[str, list[SWRPairResult]] = defaultdict(list)
@@ -572,15 +604,17 @@ def main():
     for topic_data in tqdm(all_topics, desc="Темы"):
         topic = topic_data["topic"]
 
-        # Загружаем human survey
-        human = load_human_survey(topic)
-        if human is None:
+        # Загружаем k случайных human-референсов
+        humans = load_human_surveys(topic, k=args.k_refs)
+        if not humans:
             tqdm.write(f"  [SKIP] Нет human survey для '{topic}'. "
                        f"Запусти download_dataset.py")
             continue
+        tqdm.write(f"  [::] human refs: {len(humans)} для '{topic[:40]}'")
+
 
         # Загружаем сгенерированные результаты
-        generated = load_generated_results(topic)
+        generated = load_generated_results(topic, results_dir)
         if not generated:
             tqdm.write(f"  [SKIP] Нет сгенерированных результатов для '{topic}'. "
                        f"Запусти base.py")
@@ -591,11 +625,12 @@ def main():
 
         for sys_id, gen_data in generated.items():
             for eval_type in eval_types:
-                gen_text   = get_text_for_eval(gen_data, eval_type)
-                human_text = get_text_for_eval(human,    eval_type)
+                gen_text    = get_text_for_eval(gen_data, eval_type)
+                human_texts = [get_text_for_eval(h, eval_type) for h in humans]
 
+                safe_topic = re.sub(r'[^\w]', '_', topic)
                 for method in methods:
-                    out_file = out_dir / f"{sys_id}__{re.sub(r'[^\\w]','_',topic)}__{eval_type}__{method}.json"
+                    out_file = out_dir / f"{sys_id}__{safe_topic}__{eval_type}__{method}.json"
 
                     if args.resume and out_file.exists():
                         tqdm.write(f"  [SKIP] {sys_id}/{topic[:30]}/{eval_type}/{method}")
@@ -604,7 +639,7 @@ def main():
                     tqdm.write(f"  [{method.upper()}|{eval_type}] {sys_id} / {topic[:45]}")
 
                     if method == "swr":
-                        res = run_swr(judges, topic, gen_text, human_text,
+                        res = run_swr(judges, topic, gen_text, human_texts,
                                       eval_type, sys_id)
                         verdict = res.verdict
                         score_info = (f"gen={res.generated_avg_score:.1f} "
@@ -616,7 +651,7 @@ def main():
                             json.dump(res.to_dict(), f, ensure_ascii=False, indent=2)
 
                     elif method == "cwr":
-                        res = run_cwr(judges, topic, gen_text, human_text,
+                        res = run_cwr(judges, topic, gen_text, human_texts,
                                       eval_type, sys_id)
                         verdict = res.verdict
                         tqdm.write(f"    → {verdict}")

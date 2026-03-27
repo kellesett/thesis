@@ -474,7 +474,7 @@ def main():
     topics = load_topics(n_topics)
 
     out_dir = Path(args.out)
-    out_dir.mkdir(exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # Прогноз стоимости
     print(f"\nСистемы: {list(selected.keys())}")

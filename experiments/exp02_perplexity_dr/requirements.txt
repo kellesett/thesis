@@ -1,0 +1,10 @@
+# experiments/exp02_perplexity_dr/requirements.txt
+# Зависимости для Perplexity Sonar Deep Research (OpenRouter API)
+openai>=1.0
+python-dotenv
+PyYAML
+tqdm
+requests
+huggingface_hub
+datasets
+pandas
