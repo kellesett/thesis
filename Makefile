@@ -4,7 +4,8 @@
 
 .PHONY: help setup setup-sf base base-clean \
         generate evaluate \
-        generate-sf generate-sf-cpu \
+        generate-sf generate-sf-cpu generate-sgi \
+        convert-autosurvey \
         evaluate-diversity \
         viewer enrich \
         download inspect models models-ping \
@@ -32,9 +33,11 @@ help:
 	@echo "  make base-clean     — пересобрать thesis-base без кэша"
 	@echo ""
 	@echo "  [Генерация]"
-	@echo "  make generate       [DATASET=SurGE] [MODEL=perplexity_dr]"
-	@echo "  make generate-sf    [DATASET=SurGE]  — SurveyForge (GPU)"
-	@echo "  make generate-sf-cpu [DATASET=SurGE] — SurveyForge (CPU, debug)"
+	@echo "  make generate           [DATASET=SurGE] [MODEL=perplexity_dr]"
+	@echo "  make generate-sf        [DATASET=SurGE]  — SurveyForge (GPU)"
+	@echo "  make generate-sf-cpu    [DATASET=SurGE]  — SurveyForge (CPU, debug)"
+	@echo "  make generate-sgi       [DATASET=SurGE]  — SurveyGen-I (CPU)"
+	@echo "  make convert-autosurvey [DATASET=SurGE]  — конвертировать baseline AutoSurvey"
 	@echo ""
 	@echo "  [Оценка]"
 	@echo "  make evaluate           [DATASET=SurGE] [MODEL=perplexity_dr] [METRIC=surge]"
@@ -88,6 +91,19 @@ generate-sf:
 generate-sf-cpu:
 	docker build -f models/surveyforge/Dockerfile -t thesis-gen-surveyforge .
 	docker run --rm $(SF_VOLUMES) thesis-gen-surveyforge --dataset $(DATASET)
+
+## ── SurveyGen-I (CPU) ────────────────────────────────────────────────────────
+
+generate-sgi: base
+	docker build -f models/surveygen_i/Dockerfile -t thesis-gen-surveygen_i .
+	docker run --rm $(VOLUMES) thesis-gen-surveygen_i \
+		python models/surveygen_i/main.py --dataset $(DATASET)
+
+## ── AutoSurvey (конвертация baseline) ───────────────────────────────────────
+
+# Запускается локально (не в Docker — данные уже на диске, не нужен API)
+convert-autosurvey:
+	$(PYTHON) models/autosurvey/main.py --dataset $(DATASET)
 
 ## ── Оценка (SurGE) ───────────────────────────────────────────────────────────
 
@@ -145,4 +161,5 @@ models-ping:
 
 clean:
 	-docker rmi thesis-base thesis-gen-perplexity_dr thesis-gen-surveyforge \
+	    thesis-gen-surveygen_i \
 	    thesis-eval-surge thesis-eval-diversity 2>/dev/null || true

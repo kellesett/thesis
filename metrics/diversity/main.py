@@ -341,18 +341,21 @@ def save_pca_plot(
     if not has_gen and not has_ref:
         return
 
-    # Fit PCA on union of both clouds
-    combined = np.vstack(
-        [x for x in [emb_ref, emb_gen] if len(x) > 0]
-    )
-    n_components = min(2, combined.shape[0], combined.shape[1])
-    pca  = PCA(n_components=n_components)
-    proj = pca.fit_transform(combined)
-
-    # Split projections back
-    n_ref = len(emb_ref) if has_ref else 0
-    proj_ref = proj[:n_ref]           if has_ref else np.zeros((0, 2))
-    proj_gen = proj[n_ref:]           if has_gen else np.zeros((0, 2))
+    # Fit PCA on reference citations only — this anchors the coordinate space
+    # to the ground-truth distribution, which is the same for every model.
+    # Generated citations are then projected with pca.transform(), so all
+    # models' dots live in the same 2D space and can be compared directly.
+    if has_ref:
+        n_components = min(2, emb_ref.shape[0], emb_ref.shape[1])
+        pca      = PCA(n_components=n_components)
+        proj_ref = pca.fit_transform(emb_ref)
+        proj_gen = pca.transform(emb_gen) if has_gen else np.zeros((0, 2))
+    else:
+        # No reference embeddings: fall back to fitting on generated only
+        n_components = min(2, emb_gen.shape[0], emb_gen.shape[1])
+        pca      = PCA(n_components=n_components)
+        proj_ref = np.zeros((0, 2))
+        proj_gen = pca.fit_transform(emb_gen)
 
     # ── Save 2D dots for multi-model comparison ───────────────────────────────
     if dots_save_path is not None:

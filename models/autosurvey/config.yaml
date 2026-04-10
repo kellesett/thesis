@@ -1,0 +1,4 @@
+model_id: autosurvey
+
+# Path to the SurGE baselines Autosurvey directory (relative to repo root)
+baselines_dir: repos/SurGE/baselines/Autosurvey/output

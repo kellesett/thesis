@@ -8,7 +8,7 @@ resume: true                        # пропускать уже сгенери
 backend: openrouter
 
 # Имя модели для SurveyForge — передаётся в outlineWriter и subsectionWriter
-model: minimax/minimax-m2.5
+model: google/gemma-4-31b-it
 
 # ── SurveyForge DB ────────────────────────────────────────────────────────────
 # Пути монтируются через Docker volume; внутри контейнера:
