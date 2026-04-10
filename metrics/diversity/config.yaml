@@ -1,0 +1,20 @@
+evaluator_id: diversity
+
+# ── Embedding model ────────────────────────────────────────────────────────────
+# SPECTER2: обучена на научных статьях через citation graph — лучшая для
+# academic semantic similarity (title + SEP + abstract → 768-dim embedding)
+embedding_model: allenai/specter2_base
+embedding_adapter: allenai/specter2      # proximity adapter
+embedding_batch_size: 16                 # уменьши до 8 если OOM на CPU
+
+# ── Corpus ────────────────────────────────────────────────────────────────────
+# Путь к SurGE corpus.json (монтируется через Docker volume)
+corpus_path: /app/datasets/SurGE/corpus.json
+
+# ── arxiv API ─────────────────────────────────────────────────────────────────
+arxiv_max_retries: 2          # попыток при 429/timeout
+arxiv_retry_delays: [5, 10]   # секунды между попытками
+
+# ── Прочее ────────────────────────────────────────────────────────────────────
+resume: true                  # пропускать уже оценённые генерации
+plot_dpi: 150                 # разрешение PNG

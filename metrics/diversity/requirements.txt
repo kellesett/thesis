@@ -1,0 +1,7 @@
+# metrics/diversity/requirements.txt
+# Только зависимости специфичные для diversity-метрики.
+# Всё остальное (torch, transformers, sklearn, matplotlib, ijson, ...)
+# уже установлено в thesis-base.
+
+# SPECTER2 использует библиотеку `adapters` (не стандартный transformers adapters)
+adapters>=0.2.0
