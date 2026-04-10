@@ -1,0 +1,32 @@
+# docker/Dockerfile.base
+# Базовый образ для всех моделей и метрик (без CUDA).
+# Содержит ТОЛЬКО общие Python-зависимости — исходный код не копируется,
+# чтобы изменения в src/ не инвалидировали кэш этого слоя.
+#
+# Сборка: docker build -f docker/Dockerfile.base -t thesis-base .
+# (запускай из корня репозитория)
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Общие зависимости всех экспериментов.
+# Слой пересобирается только при изменении requirements.base.txt.
+# PyTorch CPU устанавливается отдельно — требует своего index-url,
+# который нельзя смешивать с PyPI в одном вызове pip
+RUN pip install --no-cache-dir torch \
+    --index-url https://download.pytorch.org/whl/cpu
+
+COPY docker/requirements.base.txt ./requirements.base.txt
+RUN pip install --no-cache-dir -r requirements.base.txt
+
+# Пустые папки для данных (монтируются снаружи через EXP_VOLUMES)
+RUN mkdir -p datasets results
+
+# Переменные окружения (переопределяются через --env-file .env)
+ENV OPENROUTER_API_KEY=""
+ENV LOCAL_API_BASE="http://host.docker.internal:8000/v1"
+ENV LOCAL_API_KEY="none"
+ENV LOCAL_MODEL="deepseek-chat"
+ENV HF_TOKEN=""
+ENV PYTHONUNBUFFERED=1

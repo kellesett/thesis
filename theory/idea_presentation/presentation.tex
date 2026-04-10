@@ -1,0 +1,515 @@
+\documentclass[10pt,aspectratio=169]{beamer}
+
+\usepackage[T2A]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[russian]{babel}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{hyperref}
+
+\usetheme{Madrid}
+\usecolortheme{default}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+
+\title[Агентские системы для генерации обзоров]{Исследование эффективности применения\\агентских систем в задаче генерации научных обзоров}
+\subtitle{Обсуждение направлений ВКР}
+\author{}
+\institute{CMC MSU}
+\date{\today}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}{План выступления}
+  \tableofcontents
+\end{frame}
+
+% ============================================================
+\section{Проблематика}
+% ============================================================
+
+\begin{frame}{Историческая рамка}
+  \textbf{2023--2026:} Активное развитие мультиагентных пайплайнов для генерации обзоров (AutoSurvey, SurveyForge, SurveyX, SurveyGen-I).
+
+  \vspace{0.3cm}
+  \textbf{Среди мотиваций архитектурной сложности значимое место занимало:}
+  \begin{itemize}
+    \item Ограниченное контекстное окно LLM ($\sim$4K--32K токенов)
+    \item Невозможность подать большое число источников за один проход
+    \item Декомпозиция задачи как обход ограничения
+  \end{itemize}
+
+  \vspace{0.3cm}
+  \textbf{2025--2026:} контекстные окна выросли на порядок:
+  \begin{itemize}
+    \item Gemini 2.5 Pro --- 2M токенов
+    \item Claude Opus, GPT-5 --- 200K токенов
+    \item В 1M помещается $\sim$100--150 полных научных статей
+  \end{itemize}
+
+  \vspace{0.3cm}
+  \textbf{Следствие:} одна из значимых исходных мотиваций для агентского подхода ослабла.
+\end{frame}
+
+\begin{frame}{Центральный вопрос работы}
+  \begin{block}{Мотивация}
+    Если ограничение, породившее агентские системы, во многом снято --- какие функции у этих систем остаются?
+  \end{block}
+
+  \textbf{Формулировка через концептуальное разложение:}
+
+  \vspace{0.2cm}
+  Мультиагентный пайплайн можно условно разложить на:
+  \begin{itemize}
+    \item \textbf{Поиск} -- Подбор источников по запросу, по которым будет строиться обзор
+    \item \textbf{Синтез} -- генерация текста на основе источников
+  \end{itemize}
+
+  Важно понимать, что в зависимости от протокола взаимодействия агентов эти функции могут быть нечетко разделены.
+
+  \vspace{0.3cm}
+  \textbf{Подвопросы:}
+  \begin{enumerate}
+    \item Является ли агентский подход \emph{только} продвинутым многостадийным поисковиком?
+    \item Или агентность вносит дополнительный вклад в \emph{качество самой генерации}, недостижимый классическими путями?
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{Центральная гипотеза}
+  \textbf{Гипотеза $H_0$ (нулевая):} При компетентной реализации классического бейзлайна с длинным контекстом, разрыв между агентными системами и бейзлайном на стандартной задаче незначителен.
+  \[
+    \text{Quality}(S_{\text{agent}}) \approx \text{Quality}(S_{\text{base}}) \quad \text{при} \quad \text{Cost}(S_{\text{agent}}) \gg \text{Cost}(S_{\text{base}})
+  \]
+
+  \textbf{Гипотеза $H_1$ (альтернативная):} Агентский подход содержит дополнительную ценность.
+
+  Причем ценность может проявляться или усиливаться при усложнении задачи. (назовем гипотезой $H_2$)
+  \[
+    \text{Quality}(S_{\text{multi}}^{\text{hard}}) > \text{Quality}(S_{\text{single}}^{\text{hard}})
+  \]
+
+  \textbf{Структура проверки:}
+  \begin{enumerate}
+    \item Стандартная задача (SurGE, абстракты) $\to$ проверка $H_0$
+    \item Усложнённая задача (SurGE, полные тексты) $\to$ проверка $H_2$
+  \end{enumerate}
+
+\end{frame}
+
+\begin{frame}{Карта направлений в свете гипотезы}
+  \begin{center}
+    \begin{tabular}{p{4cm}|p{8cm}}
+      \toprule
+      \textbf{Направление} & \textbf{Роль в проверке гипотезы} \\
+      \midrule
+      1. Cost-quality систем & Центральная проверка $H_0$ на стандартной задаче \\
+      \midrule
+      2. Baseline & Реализация компетентного классического бейзлайна для проверки $H_0$ \\
+      \midrule
+      3. Полные тексты & Усложнение задачи для проверки $H_2$ \\
+      \midrule
+      4. Dual-Track Critic Memory & Дополнение к основным гипотезам. Борьба с проблемой \emph{Lost In The Middle} \\
+      \midrule
+      5. U-образное управление памятью & Дополнение к основным гипотезам. Улучшение Cost-quality соотношения \\
+      \bottomrule
+    \end{tabular}
+  \end{center}
+
+  \vspace{0.4cm}
+  Направления не равноправны: 1 и 2 центральны, 3 расширяет проверку, 4 и 5 предлагают возможные варианты решения проблем.
+\end{frame}
+
+% ============================================================
+\section{Постановка задачи}
+% ============================================================
+
+\begin{frame}{Общая формулировка}
+  \textbf{Задача.} Построение структурированного обзора $S$ по теме $Q$ на основе научного корпуса $C$ с учётом ограничений формата $F$.
+
+  \vspace{0.3cm}
+  \textbf{Входные объекты:}
+  \begin{itemize}
+    \item Тема $Q$ --- описание предметной области
+    \item Корпус $C = \{p_1, \ldots, p_N\}$, где $p_i = (\text{meta}_i, \text{content}_i)$
+    \item Ограничения $F$ --- объём, структура, стиль
+  \end{itemize}
+
+  \vspace{0.3cm}
+  \textbf{Выходной объект:}
+  \[
+    S = (s_1, s_2, \ldots, s_m), \quad s_i \in \text{Sections with inline citations}
+  \]
+
+  \vspace{0.3cm}
+  \textbf{Искомое отображение:}
+  \[
+    f: (Q, C, F) \to S, \quad \max_f \text{Quality}(S)
+  \]
+\end{frame}
+
+\begin{frame}{Постановка 1A: EndToEnd с факторизацией пайплайна}
+  \textbf{Условие:} retrieval и generation разделимы.
+  \[
+    f = G \circ R, \quad R: (Q, C) \to C_Q \subset C, \quad G: (Q, C_Q, F) \to S
+  \]
+
+  \textbf{Какие системы соответствуют:}
+  \begin{itemize}
+    \item SurveyX -- retrieval полностью отделён, AttributeTree работает с уже найденным
+    \item HiReview -- статический граф цитирования, затем генерация
+    \item LiRA -- FAISS-индекс строится один раз, ревизия не ищет новых статей
+    \item AutoSurvey -- Поиск для каждой подсекции (в рамках генерации подсекции)
+    \item SurveyForge -- Поиск для каждой подсекции (в рамках генерации подсекции)
+  \end{itemize}
+
+  \textbf{Данные:} SurGE (Su et al., 2025): $|C| = 1{,}086{,}992$ публикаций arXiv CS, $|Q| = 205$ тем.
+
+  \textbf{Ограничение:} retrieval recall SurGE $\approx 8\%$ -- верхний предел полноты.
+\end{frame}
+
+\begin{frame}{Постановка 1B: неделимый EndToEnd}
+  \textbf{Не выполнение условия:} во многих системах retrieval и generation переплетены.
+  \[
+    f: (Q, C, F) \to S, \quad \text{retrieval вызывается итеративно внутри } f
+  \]
+
+  \textbf{Какие системы соответствуют:}
+  \begin{itemize}
+    \item AutoSurvey -- Поиск для каждой подсекции
+    \item SurveyForge -- Поиск для каждой подсекции
+    \item SurveyG -- Evaluation Agent после генерации формулирует новые поисковые запросы (до 3 итераций)
+    \item STORM -- retrieval при каждом раунде диалога персон (web search)
+  \end{itemize}
+
+  \textbf{Следствие для эксперимента:} итеративный retrieval -- часто невозможно изолировать от генерации.
+\end{frame}
+
+\begin{frame}{Постановка 2: изолированный synthesis}
+  \textbf{Редуцированная задача:} стадия $R$ устраняется, $C_Q$ фиксируется.
+  \[
+    G: (Q, C_Q, F) \to S
+  \]
+
+  \textbf{Способы построения $C_Q$:}
+  \begin{itemize}
+    \item $C_Q = \text{Refs}(S^*)$ --- ground-truth ссылки эталона
+    \item $C_Q = \text{Refs}(S^*) \cup \text{Noise}$ --- смесь с тематически близким шумом
+  \end{itemize}
+
+  \textbf{Режим представления публикаций (параметр эксперимента):}
+  \begin{itemize}
+    \item Abstract-only: $\text{content}_i = \text{abstract}_i$ (стандартная задача)
+    \item Full-text: $\text{content}_i = \text{full PDF}_i$ (усложнённая задача)
+    \item Гибрид: abstract + intro + conclusion; или abstract + retrieved chunks
+  \end{itemize}
+
+  \textbf{Ключевое преимущество:} изоляция качества synthesis от качества retrieval, что помогает точнее диагностировать вклад агентности в генерацию.
+\end{frame}
+
+\begin{frame}{Критерии качества: четыре оси}
+  Качество $S$ оценивается по четырём независимым осям:
+
+  \vspace{0.4cm}
+  \begin{tabular}{ll}
+    \toprule
+    \textbf{Ось} & \textbf{Что измеряет} \\
+    \midrule
+    Базовое качество & связность, лаконичность, структурная целостность \\
+    Подтверждённость & соответствие фактов цитируемым источникам \\
+    Типовой профиль & распределение видов утверждений по категориям \\
+    Стоимость & кол-во токенов, время на генерацию, денежный эквивалент, число вызовов \\
+    \bottomrule
+  \end{tabular}
+
+  \vspace{0.4cm}
+  Детализация каждой оси --- в следующем разделе.
+\end{frame}
+
+% ============================================================
+\section{Формализация критериев качества}
+% ============================================================
+
+\begin{frame}{Ось 1: базовое качество генерации}
+  \textbf{Сравнение с эталоном $S^*$:}
+  \begin{itemize}
+    \item \textbf{ROUGE-L}$(S, S^*)$ --- для сопоставимости с существующей литературой
+    \item \textbf{BERTScore}$(S, S^*)$ --- семантическое сходство, backbone \texttt{deberta-xlarge-mnli}
+  \end{itemize}
+
+  \vspace{0.3cm}
+  \textbf{LLM-as-judge на основе аспектов из SummEval (Fabbri et al., TACL 2021):}
+  \[
+    \text{G-Eval}_d(S) = \sum_{k=1}^{5} k \cdot P_{\text{LLM}}(\text{score}=k \mid S, \text{rubric}_d)
+  \]
+  где $d \in \{\text{coherence, consistency, fluency, relevance}\}$.
+
+  \vspace{0.3cm}
+  \textbf{Метрики SurGE для сопоставимости с базовыми линиями:}
+  \begin{itemize}
+    \item $SQS$, $SHR$ -- Схожесть структуры доклада с эталоном
+    \item $CQS$ -- Абстрактное качество обзора, оцениваемое LLM по специфичным для задачи критериям
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Ось 2: подтверждённость утверждений (ALCE)}
+  \textbf{ALCE} (Gao et al., EMNLP 2023). Работает на уровне утверждений с inline-ссылками.
+
+  Для утверждения $c$ с цитированиями $\text{Cite}(c) = \{p_1, \ldots, p_k\}$:
+
+  \begin{flalign*}
+    & \text{CitRecall}(c) = \mathbb{I}\left[ \text{NLI}\left(\bigcup_{i} p_i \models c\right) \right] \text{-- подтверждается ли $c$ своими источниками?} \\
+    & \text{Redundant}(p_j, c) = \mathbb{I}\left[ \text{NLI}\left(\bigcup_{i \neq j} p_i \models c\right) \right] \text{-- нужен ли источник $p_j$, или $c$ и без него подтверждено?} \\
+    & \text{CitPrecision}(c) = 1 - \frac{|\{p_j : \text{Redundant}(p_j, c)\}|}{|\text{Cite}(c)|} \text{-- доля действительно необходимых источников} \\
+  \end{flalign*}
+
+  \textbf{Итоговые метрики обзора:}
+  \[
+    \overline{\text{CitRecall}}(S) = \frac{1}{|\mathcal{C}(S)|}\sum_{c} \text{CitRecall}(c)
+    \quad \text{и} \quad
+    \overline{\text{CitPrecision}}(S) = \frac{1}{|\mathcal{C}(S)|}\sum_{c} \text{CitPrecision}(c)
+  \]
+\end{frame}
+
+\begin{frame}{Ось 2: подтверждённость (FActScore)}
+  \textbf{FActScore} (Min et al., EMNLP 2023). Работает на уровне атомарных фактов.
+
+  \vspace{0.3cm}
+  \textbf{Три шага:}
+  \begin{enumerate}
+    \item Декомпозиция: $\text{Decompose}(S) = \{a_1, a_2, \ldots, a_n\}$ через Claimify
+    \item Retrieval: $e_i = \text{Retrieve}(a_i, C_Q)$
+    \item Верификация: $\text{Support}(a_i, e_i) \in \{0, 1\}$ через AlignScore
+  \end{enumerate}
+
+  \vspace{0.3cm}
+  \textbf{Итоговая метрика:}
+  \[
+    \text{FActScore}(S) = \frac{1}{n}\sum_{i=1}^{n} \text{Support}(a_i, e_i)
+  \]
+
+  \vspace{0.3cm}
+  \textbf{AlignScore как backend} (Zha et al., ACL 2023):
+  \begin{itemize}
+    \item RoBERTa-based, 355M параметров (\texttt{alignscore-large})
+    \item Унифицированная функция alignment: NLI + QA + fact verification + STS
+    \item Работает с длинным контекстом через chunking + max-pooling
+    \item Существенно дешевле T5-11B AutoAIS, сопоставимое качество
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Ось 3: типовой профиль утверждений}
+  \textbf{Извлечение:} $\text{Decompose}(S) \to \{a_1, \ldots, a_n\}$ через Claimify.
+
+  \vspace{0.3cm}
+  \textbf{Классификация} $\phi: a_i \to \{A, B, C, D\}$ через LLM-as-judge:
+  \begin{description}
+    \item[A] Общие тематические (следуют из абстракта)
+    \item[B] Методологические уточнения (требуют раздела methods)
+    \item[C] Количественные (конкретные числа из results)
+    \item[D] Критические / сравнительные (discussion, limitations)
+  \end{description}
+
+  \vspace{0.3cm}
+  \textbf{Метрики профиля:}
+  \[
+    \pi_k(S) = \frac{|\{a_i : \phi(a_i) = k\}|}{n}, \quad k \in \{A, B, C, D\}
+  \]
+  \[
+    \text{FActScore}_k(S) = \frac{\sum_{i : \phi(a_i)=k} \text{Support}(a_i, e_i)}{|\{a_i : \phi(a_i) = k\}|}
+  \]
+
+  \vspace{0.3cm}
+  \textbf{Гипотеза} при замене абстрактов$\to$full-text доли $\pi_B, \pi_C$ растут без падения $\text{FActScore}_B, \text{FActScore}_C$, и этот рост сильнее у агентских систем.
+\end{frame}
+
+\begin{frame}{Ось 4: ресурсная стоимость}
+  \textbf{Базовые метрики на один обзор:}
+  \begin{align*}
+    T_{\text{in}}(S) &= \text{input tokens} \\
+    T_{\text{out}}(S) &= \text{output tokens} \\
+    T_{\text{reason}}(S) &= \text{reasoning tokens (если применимо)} \\
+    \text{Cost}(S) &= \alpha \cdot T_{\text{in}} + \beta \cdot T_{\text{out}} + \gamma \cdot T_{\text{reason}} \\
+    \tau(S) &= \text{wall-clock time, seconds} \\
+    K(S) &= \text{число вызовов LLM}
+  \end{align*}
+
+  \vspace{0.2cm}
+  \textbf{Stage breakdown:} все метрики разбиваются по стадиям pipeline
+  \[
+    T_{\text{in}}(S) = T_{\text{in}}^{\text{retr}} + T_{\text{in}}^{\text{outline}} + T_{\text{in}}^{\text{draft}} + T_{\text{in}}^{\text{revise}}
+  \]
+
+  \vspace{0.3cm}
+  \textbf{Интегральная метрика эффективности:}
+  \[
+    \text{CER}_M(S) = \frac{M(S)}{\text{Cost}(S)}
+  \]
+  где $M$ --- любая метрика качества. Визуализация --- кривая Парето в осях (Cost, Quality).
+\end{frame}
+
+% ============================================================
+\section{Направления исследования}
+% ============================================================
+
+\begin{frame}{Направление 1: cost-quality (центральная проверка $H_0$)}
+  \textbf{Проблематика.} В литературе по survey generation систематического cost-quality анализа нет:
+  \begin{itemize}
+    \item SurveyForge --- единичная точка в appendix ($< \$0.50$ на 64K-обзор)
+    \item AutoSurvey --- репортит скорость, не стоимость
+    \item SurveyX, SurveyGen-I --- cost-анализ отсутствует
+    \item Никто не строил кривую Парето для нескольких систем
+  \end{itemize}
+
+  \vspace{0.3cm}
+  \textbf{Актуальность.} Прямо отвечает буквальной формулировке темы и проверяет $H_0$ количественно.
+
+  \vspace{0.3cm}
+  \textbf{Решение.}
+  \begin{itemize}
+    \item Системы: AutoSurvey, SurveyForge/STORM, компетентная одноагентная baseline (направление~2), naive RAG
+    \item Модели: дешёвая (GPT-4o-mini) и дорогая (GPT-4o/Claude)
+    \item Все метрики качества и стоимости (оси~1--4)
+    \item Ablation по компонентам: какие стадии можно удалить без потери качества
+    \item Визуализация: кривая Парето $(\text{Cost}, \text{Quality})$
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Направление 2: компетентный не агентский baseline (вторая половина проверки $H_0$)}
+  \textbf{Проблематика.} Архитектуры AutoSurvey/SurveyForge/SurveyX унаследованы из эпохи малых контекстов. Сегодня RAG генерация с расширенным контекстом возможна, но сравнений в литературе нет.
+
+  \vspace{0.3cm}
+  \textbf{Методологическое требование:} baseline должен быть сильным для честного сравнения.
+
+  \vspace{0.3cm}
+  \textbf{Компоненты компетентной одноагентной baseline:}
+  \begin{itemize}
+    \item Расширенный контекст: весь $C_Q$ за один или несколько вызовов
+    \item Chain-of-though
+    \item Итеративная генерация \emph{большими блоками} с сохранением полного контекста между вызовами
+    \item Prompt engineering
+  \end{itemize}
+
+  \vspace{0.3cm}
+  \textbf{Роль в работе:} сравнение baseline с мультиагентными системами на стандартной задаче (направление~1) --- основной эмпирический тест $H_0$.
+\end{frame}
+
+\begin{frame}{Направление 3: усложнение задачи (проверка $H_2$)}
+  \textbf{Проблематика.} SurGE и публичная версия AutoSurvey работают только с абстрактами. Это юридически-техническое решение, не научное. Модель не видит methods, results, discussion.
+
+  \vspace{0.3cm}
+  \textbf{Логика для $H_2$.} Если $H_0$ подтвердилось (на стандартной задаче разрыва нет), это ещё не закрывает вопрос: возможно, агенты вносят ценность только на более сложных задачах. Полные тексты увеличивают объём и сложность синтеза.
+
+  \vspace{0.3cm}
+  \textbf{Решение: двумерная сетка экспериментов.}
+  \begin{center}
+    \begin{tabular}{lcc}
+      \toprule
+      & \textbf{Abstract-only} & \textbf{Full-text} \\
+      \midrule
+      \textbf{Агентская система} & $E_{11}$ & $E_{12}$ \\
+      \textbf{Одноагентная baseline} & $E_{21}$ & $E_{22}$ \\
+      \bottomrule
+    \end{tabular}
+  \end{center}
+
+  \vspace{0.2cm}
+  \textbf{Ключевой тест:}
+  \[
+    (E_{12} - E_{11}) \overset{?}{>} (E_{22} - E_{21})
+  \]
+  Если левая часть существенно больше --- агенты лучше используют дополнительную сложность $\Rightarrow$ поддержка $H_2$. Если разрыв симметричен --- агентность не даёт уникальной ценности даже в сложных условиях.
+\end{frame}
+
+\begin{frame}{Направление 4: Dual-Track Critic Memory}
+  \textbf{Мотивация:} Улучшение качества агентской генерации за счет модификации механизма памяти для борьбы с проблемами обработки длинных и разнородных контекстов.
+
+  \textbf{Проблематика.} Существующие критики передают обратную связь как единый текст, смешивая фактологические и стилистические правки. Накопление смешанной обратной связи ведет котравлению контекста.
+
+  \textbf{Решение: архитектура с двумя хранилищами.}
+  \[
+    M = M_{\text{epi}} \sqcup M_{\text{proc}}
+  \]
+  \begin{itemize}
+    \item $M_{\text{epi}}$: фактологические корректировки
+    \item $M_{\text{proc}}$: стилистические и структурные правила
+    \item Фаза drafting: контекст $= \text{prompt} \cup M_{\text{epi}}$
+    \item Фаза polishing: контекст $= \text{prompt} \cup M_{\text{proc}}$
+  \end{itemize}
+
+  \textbf{Теоретическая рамка:} Cognitive Load Theory (Sweller) + CoALA (Sumers et al., TMLR 2024).
+\end{frame}
+
+\begin{frame}{Направление 5: U-образное управление памятью}
+  \textbf{Проблематика.} Современные системы расходуют контекстное окно равномерно по фазам генерации, не учитывая, что разные фазы требуют разного объёма поддержки. Это приводит к избыточному расходу токенов и стоимости.
+
+  \textbf{Источник аналогии.} В когнитивной литературе (Коровкин и др., 2018, 2023) наблюдается U-образная динамика загрузки рабочей памяти при решении инсайтных задач: выше на старте и финале, ниже в середине. Это \emph{вдохновляет} гипотезу для агентов, но не доказывает её.
+
+  \textbf{Гипотеза:} U-образное распределение ресурсов даёт экономию суммарной стоимости \emph{без потери качества}:
+  \[
+    \text{Cost}(S_{\text{U}}) < \text{Cost}(S_{\text{flat}}) \quad \text{при} \quad \text{Quality}(S_{\text{U}}) \approx \text{Quality}(S_{\text{flat}})
+  \]
+
+  \vspace{0.3cm}
+  \textbf{Дополнительный аргумент (вторичный):} меньше памяти в середине $\Rightarrow$ меньше проблем с Lost in the Middle (Liu et al., TACL 2024).
+\end{frame}
+
+\begin{frame}{Направление 5: реализация и стратегии сужения}
+  \textbf{Конкретные стратегии сужения контекста в средней фазе:}
+  \begin{itemize}
+    \item Генерация изолированными блоками, с малым количесвом фактологической информации в контексте
+    \item Интеграция с Dual-Track Critic Memory: в середине использовать только $M_{\text{epi}}$, исключая $M_{\text{proc}}$. То есть в середине важны только факты, при объединении вспоминаем про стиль.
+  \end{itemize}
+
+  \vspace{0.3cm}
+  \textbf{Сравнение по двум осям одновременно:}
+  \begin{itemize}
+    \item Стоимость: $\text{Cost}(S_{\text{U}})$ vs $\text{Cost}(S_{\text{flat}})$
+    \item Качество: все метрики осей~1--3
+  \end{itemize}
+
+  \vspace{0.3cm}
+  \textbf{Возможные исходы:}
+  \begin{itemize}
+    \item \emph{Положительный:} экономия без потери качества $\Rightarrow$ U-управление работает
+    \item \emph{Отрицательный:} экономия с ухудшением $\Rightarrow$ средние секции требуют полного контекста
+    \item \emph{Нюансированный:} расхождение метрик $\Rightarrow$ диагностика того, какой тип информации важен в средней фазе
+  \end{itemize}
+\end{frame}
+
+% ============================================================
+\section{Масштаб и планирование}
+% ============================================================
+
+\begin{frame}{Структурная совместимость направлений}
+  \textbf{Эмпирическая группа (1 + 2 + 3).} Разделяют инфраструктуру:
+  \begin{itemize}
+    \item Один набор тем из SurGE
+    \item Один pipeline прогона систем и логирования стоимости
+    \item Один набор метрик оценки
+    \item Различаются только оси анализа
+  \end{itemize}
+
+  \vspace{0.3cm}
+  \textbf{Архитектурная группа (4 + 5).} Содержит расширения:
+  \begin{itemize}
+    \item Реализация поверх AutoSurvey/SurveyForge
+    \item Proof-of-concept масштаб
+    \item Улучшают агентские системы
+  \end{itemize}
+\end{frame}
+
+\begin{frame}
+  \begin{center}
+    \Large \textbf{Спасибо за внимание}
+  \end{center}
+\end{frame}
+
+\end{document}

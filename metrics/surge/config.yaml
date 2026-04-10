@@ -1,0 +1,16 @@
+evaluator_id: surge
+eval_list: [structure_quality, logic, citation_count, corpus_match_rate, coverage, reference_self_cited]
+# sh_recall требует FlagEmbedding/torch, раскомментируй если нужно:
+# eval_list: [sh_recall, structure_quality, logic, citation_count, corpus_match_rate, coverage]
+
+# LLM судья
+judge_model: minimax/minimax-m2.5
+judge_id: minimax_m2                   # короткое имя для имени папки со скорами
+judge_base_url: https://openrouter.ai/api/v1
+judge_api_key_env: OPENROUTER_API_KEY
+judge_comment: run1                    # свободный комментарий, входит в имя папки со скорами
+
+# Embedding-модель для SH-Recall (игнорируется если sh_recall не в eval_list)
+embedding_model: BAAI/bge-large-en-v1.5
+
+resume: true                           # пропускать уже оценённые генерации

@@ -1,0 +1,21 @@
+# experiments/requirements.base.txt
+# Общие зависимости для всех экспериментов exp01–exp03.
+# Устанавливаются в thesis-base, чтобы не пересобираться при изменении кода.
+#
+# FlagEmbedding и torch сюда не входят — только в экспериментах с SH-Recall.
+
+# ── API и сеть ────────────────────────────────────────────────────────────────
+openai>=1.0
+python-dotenv
+requests
+
+# ── Утилиты ───────────────────────────────────────────────────────────────────
+PyYAML
+tqdm
+huggingface_hub
+datasets
+pandas
+
+# ── SurGE evaluation (scipy/numpy нужны informationFuncs и structureFuncs) ───
+scipy
+numpy

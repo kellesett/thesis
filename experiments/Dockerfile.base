@@ -1,7 +1,7 @@
 # experiments/Dockerfile.base
 # Базовый образ для экспериментов exp01–exp03 (без CUDA).
-# Содержит только системные зависимости и исходный код проекта.
-# Python-зависимости устанавливаются в Dockerfile каждого эксперимента.
+# Содержит ТОЛЬКО общие Python-зависимости — исходный код не копируется,
+# чтобы изменения в src/ не инвалидировали кэш этого слоя.
 #
 # Сборка: docker build -f experiments/Dockerfile.base -t thesis-base .
 # (запускай из корня репозитория)
@@ -10,12 +10,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Исходный код (общий для всех экспериментов)
-COPY src/        ./src/
-COPY configs/    ./configs/
-COPY repos/SurveyForge/SurveyBench/ ./repos/SurveyForge/SurveyBench/
+# Общие зависимости всех экспериментов.
+# Слой пересобирается только при изменении requirements.base.txt.
+COPY experiments/requirements.base.txt ./requirements.base.txt
+RUN pip install --no-cache-dir -r requirements.base.txt
 
-# Пустые папки для данных (монтируются снаружи)
+# Пустые папки для данных (монтируются снаружи через EXP_VOLUMES)
 RUN mkdir -p datasets results eval_results
 
 # Переменные окружения (переопределяются через --env-file .env)

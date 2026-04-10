@@ -1,11 +1,5 @@
 # experiments/exp03_gemini_pro/requirements.txt
-# Зависимости для Gemini 2.5 Pro (Google AI / OpenRouter)
-openai>=1.0
-python-dotenv
-PyYAML
-tqdm
-requests
-huggingface_hub
-datasets
-pandas
+# Специфичные зависимости Gemini 2.5 Pro.
+# Общие пакеты установлены в thesis-base (experiments/requirements.base.txt).
+
 google-generativeai>=0.5

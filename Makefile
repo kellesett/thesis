@@ -2,91 +2,119 @@
 # Запускай из корня репозитория.
 # Предварительно: cp .env.example .env && заполни ключи
 
-.PHONY: help setup setup-sf base exp01 exp02 exp03 exp04 \
+.PHONY: help setup setup-sf base base-clean \
+        generate evaluate \
+        generate-sf generate-sf-cpu \
+        evaluate-diversity \
+        viewer enrich \
         download inspect models models-ping \
         sfdb sfdb-check sfmodel clean
 
 PYTHON     = .venv/bin/python
-EXP_VOLUMES = --env-file .env \
-              -v "$(PWD)/results:/app/results" \
-              -v "$(PWD)/eval_results:/app/eval_results" \
-              -v "$(PWD)/datasets:/app/datasets"
+DATASET   ?= SurGE
+MODEL     ?= perplexity_dr
+METRIC    ?= surge
+
+VOLUMES = --env-file .env \
+          -v "$(PWD)/results:/app/results" \
+          -v "$(PWD)/datasets:/app/datasets"
+
 
 ## Справка
 help:
 	@echo ""
 	@echo "  [Окружение]"
-	@echo "  make setup       — .venv + requirements.txt (минимум для локальных команд)"
-	@echo "  make setup-sf    — .venv + requirements exp04 (torch, faiss, sentence-transformers)"
+	@echo "  make setup          — .venv + requirements.txt"
+	@echo "  make setup-sf       — .venv + requirements exp04 (torch, faiss, ...)"
 	@echo ""
-	@echo "  [Docker]"
-	@echo "  make base        — собрать базовый образ thesis-base (для exp01-03)"
-	@echo "  make exp01       — OpenAI Deep Research:   генерация + оценка"
-	@echo "  make exp02       — Perplexity Sonar DR:    генерация + оценка"
-	@echo "  make exp03       — Gemini 2.5 Pro:         генерация + оценка"
-	@echo "  make exp04       — SurveyForge (GPU):      генерация + оценка"
+	@echo "  [Docker — base]"
+	@echo "  make base           — собрать thesis-base (кэшируется)"
+	@echo "  make base-clean     — пересобрать thesis-base без кэша"
+	@echo ""
+	@echo "  [Генерация]"
+	@echo "  make generate       [DATASET=SurGE] [MODEL=perplexity_dr]"
+	@echo "  make generate-sf    [DATASET=SurGE]  — SurveyForge (GPU)"
+	@echo "  make generate-sf-cpu [DATASET=SurGE] — SurveyForge (CPU, debug)"
+	@echo ""
+	@echo "  [Оценка]"
+	@echo "  make evaluate           [DATASET=SurGE] [MODEL=perplexity_dr] [METRIC=surge]"
+	@echo "  make evaluate-diversity [DATASET=SurGE] [MODEL=perplexity_dr]"
 	@echo ""
 	@echo "  [Данные]"
-	@echo "  make download    — скачать датасет U4R/SurveyBench"
-	@echo "  make sfdb        — скачать БД SurveyForge (~6-10 GB)"
-	@echo "  make sfdb-check  — проверить файлы БД SurveyForge"
-	@echo "  make sfmodel     — скачать embedding-модель gte-large-en-v1.5 (~1.7 GB)"
+	@echo "  make download / sfdb / sfdb-check / sfmodel"
 	@echo ""
 	@echo "  [Утилиты]"
-	@echo "  make models      — список моделей на локальном сервере"
-	@echo "  make models-ping — список моделей + пинг каждой"
-	@echo "  make clean       — удалить Docker-образы проекта"
+	@echo "  make enrich / models / models-ping / clean"
 	@echo ""
 
 ## ── Локальное окружение ───────────────────────────────────────────────────────
 
-# Для exp01-03 и локальных утилит (лёгкие зависимости)
 setup:
 	python3 -m venv .venv
 	.venv/bin/pip install --upgrade pip -q
 	.venv/bin/pip install -r requirements.txt
 
-# Для exp04 SurveyForge — устанавливает тяжёлые зависимости (torch, faiss, etc.)
-# Запускай ПОСЛЕ make setup
 setup-sf:
 	.venv/bin/pip install -r experiments/exp04_surveyforge/requirements.txt
 
-## ── Docker ───────────────────────────────────────────────────────────────────
+## ── Docker base ──────────────────────────────────────────────────────────────
 
-# Базовый образ для exp01-03
-# --no-cache гарантирует чистую сборку без устаревших pip-слоёв
+# Собирает базовый образ (пропускает если уже существует)
 base:
-	docker build --no-cache -f experiments/Dockerfile.base -t thesis-base .
+	docker build -f docker/Dockerfile.base -t thesis-base .
 
-## exp01 — OpenAI Deep Research
-exp01: base
-	docker build -f experiments/exp01_openai_dr/Dockerfile -t thesis-exp01 .
-	docker run --rm $(EXP_VOLUMES) thesis-exp01
+# Принудительная пересборка без кэша — используй после правок docker/requirements.base.txt
+base-clean:
+	docker build --no-cache -f docker/Dockerfile.base -t thesis-base .
 
-## exp02 — Perplexity Sonar Deep Research
-exp02: base
-	docker build -f experiments/exp02_perplexity_dr/Dockerfile -t thesis-exp02 .
-	docker run --rm $(EXP_VOLUMES) thesis-exp02
+## ── Генерация ────────────────────────────────────────────────────────────────
 
-## exp03 — Gemini 2.5 Pro
-exp03: base
-	docker build -f experiments/exp03_gemini_pro/Dockerfile -t thesis-exp03 .
-	docker run --rm $(EXP_VOLUMES) thesis-exp03
+generate: base
+	docker build -f models/$(MODEL)/Dockerfile -t thesis-gen-$(MODEL) .
+	docker run --rm $(VOLUMES) thesis-gen-$(MODEL) \
+		python models/$(MODEL)/main.py --dataset $(DATASET)
 
-## exp04 — SurveyForge (GPU, отдельный образ на pytorch/pytorch base)
-# HF кэш монтируется отдельно чтобы не скачивать модель каждый раз
-exp04:
-	docker build -f experiments/exp04_surveyforge/Dockerfile -t thesis-exp04 .
-	docker run --rm --gpus all $(EXP_VOLUMES) \
-		-v "$(PWD)/datasets/hf_cache:/root/.cache/huggingface" \
-		thesis-exp04
+## ── SurveyForge (GPU) ────────────────────────────────────────────────────────
 
-# CPU-вариант exp04 (медленно, только для отладки)
-exp04-cpu:
-	docker build -f experiments/exp04_surveyforge/Dockerfile -t thesis-exp04 .
-	docker run --rm $(EXP_VOLUMES) \
-		-v "$(PWD)/datasets/hf_cache:/root/.cache/huggingface" \
-		thesis-exp04
+SF_VOLUMES = --env-file .env \
+             -v "$(PWD)/datasets:/app/datasets" \
+             -v "$(PWD)/results:/app/results"
+
+generate-sf:
+	docker build -f models/surveyforge/Dockerfile -t thesis-gen-surveyforge .
+	docker run --rm --gpus all $(SF_VOLUMES) thesis-gen-surveyforge --dataset $(DATASET)
+
+# CPU-вариант (медленно, только для отладки)
+generate-sf-cpu:
+	docker build -f models/surveyforge/Dockerfile -t thesis-gen-surveyforge .
+	docker run --rm $(SF_VOLUMES) thesis-gen-surveyforge --dataset $(DATASET)
+
+## ── Оценка (SurGE) ───────────────────────────────────────────────────────────
+
+evaluate: base
+	docker build -f metrics/$(METRIC)/Dockerfile -t thesis-eval-$(METRIC) .
+	docker run --rm $(VOLUMES) thesis-eval-$(METRIC) \
+		python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL)
+
+## ── Оценка (diversity) ───────────────────────────────────────────────────────
+
+# Опционально: кэш HuggingFace чтобы не качать SPECTER2 каждый раз:
+#   DIVERSITY_VOLUMES += -v "$(HOME)/.cache/huggingface:/root/.cache/huggingface"
+
+evaluate-diversity:
+	docker build -f metrics/diversity/Dockerfile -t thesis-eval-diversity .
+	docker run --rm $(VOLUMES) thesis-eval-diversity \
+		--dataset $(DATASET) --model $(MODEL)
+
+## ── Viewer ───────────────────────────────────────────────────────────────────
+
+viewer:
+	$(PYTHON) -m streamlit run app/main.py
+
+## ── Обогащение ссылок ────────────────────────────────────────────────────────
+
+enrich:
+	$(PYTHON) scripts/enrich_references.py --dir $(DATASET)_$(MODEL)
 
 ## ── Данные ───────────────────────────────────────────────────────────────────
 
@@ -102,7 +130,6 @@ sfdb:
 sfdb-check:
 	$(PYTHON) src/utils/download_surveyforge_db.py --check
 
-# Скачать embedding-модель для SurveyForge (~1.7 GB)
 sfmodel:
 	$(PYTHON) src/utils/download_sf_model.py
 
@@ -117,4 +144,5 @@ models-ping:
 ## ── Очистка ──────────────────────────────────────────────────────────────────
 
 clean:
-	-docker rmi thesis-base thesis-exp01 thesis-exp02 thesis-exp03 thesis-exp04 2>/dev/null || true
+	-docker rmi thesis-base thesis-gen-perplexity_dr thesis-gen-surveyforge \
+	    thesis-eval-surge thesis-eval-diversity 2>/dev/null || true

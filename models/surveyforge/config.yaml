@@ -1,0 +1,25 @@
+model_id: surveyforge               # используется в пути results/generations/<dataset_id>_<model_id>/
+n_surveys: 2                        # сколько примеров взять из датасета
+resume: true                        # пропускать уже сгенерированные
+
+# ── LLM backend ───────────────────────────────────────────────────────────────
+# "local"      — локальный OpenAI-compatible сервер (LOCAL_API_BASE, LOCAL_API_KEY в .env)
+# "openrouter" — облачные модели через OpenRouter (OPENROUTER_API_KEY в .env)
+backend: openrouter
+
+# Имя модели для SurveyForge — передаётся в outlineWriter и subsectionWriter
+model: minimax/minimax-m2.5
+
+# ── SurveyForge DB ────────────────────────────────────────────────────────────
+# Пути монтируются через Docker volume; внутри контейнера:
+db_path: /app/datasets/surveyforge_db/database
+survey_outline_path: /app/datasets/surveyforge_db
+embedding_model: /app/datasets/gte-large-en-v1.5
+
+# ── Параметры генерации (из paper: section_num=6, subsection_len=500) ─────────
+section_num: 6
+subsection_len: 500
+outline_reference_num: 1500
+rag_num: 100
+rag_max_out: 60
+refinement: false                   # true = refinement pass (медленнее, качественнее)

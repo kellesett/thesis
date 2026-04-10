@@ -1,0 +1,6 @@
+# experiments/exp02_demo/requirements.txt
+# Специфичные зависимости демо-версии (без torch/FlagEmbedding).
+# Общие пакеты (openai, scipy, numpy и др.) установлены в thesis-base.
+
+# Нет дополнительных зависимостей.
+# FlagEmbedding и torch намеренно исключены — SH-Recall не считается.

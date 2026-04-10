@@ -1,0 +1,22 @@
+experiment: exp02_demo
+description: "Perplexity Sonar Deep Research — демо без torch (Structure_Quality + Logic)"
+
+system: perplexity_dr
+topics: 1
+
+evaluation:
+  methods: [swr, cwr]
+  eval_types: [outline, content]
+  k_refs: 1
+  judges: experiments/exp02_demo/judges.json
+
+# ── SurGE evaluation ──────────────────────────────────────────────────────────
+# SH-Recall исключён — требует FlagEmbedding/torch
+surge:
+  dataset:         surge
+  model_name:      perplexity
+  eval_method:     surge
+  n_surveys:       1
+  eval_list:       [structure_quality, logic]
+  judges:          experiments/exp02_demo/judges.json
+  surveys_path:    datasets/SurGE/surveys.json

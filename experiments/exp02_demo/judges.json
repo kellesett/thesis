@@ -1,0 +1,9 @@
+[
+  {
+    "name": "minimax-m2.5",
+    "url": "https://openrouter.ai/api/v1",
+    "model": "minimax/minimax-m2.5",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "n": 1
+  }
+]

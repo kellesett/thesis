@@ -1,0 +1,26 @@
+# Исключаем из build context всё тяжёлое и ненужное при сборке образов
+
+# Данные — монтируются через volume при запуске
+datasets/
+
+# Результаты — монтируются через volume при запуске
+results/
+
+# Виртуальное окружение
+.venv/
+
+# Кэши Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Git
+.git/
+
+# IDE
+.idea/
+.vscode/
+
+# Env файл с секретами
+.env

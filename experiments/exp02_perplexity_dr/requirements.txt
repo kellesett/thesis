@@ -1,10 +1,6 @@
 # experiments/exp02_perplexity_dr/requirements.txt
-# Зависимости для Perplexity Sonar Deep Research (OpenRouter API)
-openai>=1.0
-python-dotenv
-PyYAML
-tqdm
-requests
-huggingface_hub
-datasets
-pandas
+# Специфичные зависимости Perplexity Sonar Deep Research + полный SurGE (с SH-Recall).
+# Общие пакеты (openai, scipy, numpy и др.) установлены в thesis-base.
+
+# FlagEmbedding: SH-Recall (тянет torch + transformers как зависимости)
+FlagEmbedding

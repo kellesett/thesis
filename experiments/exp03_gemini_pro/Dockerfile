@@ -9,6 +9,9 @@ FROM thesis-base
 COPY experiments/exp03_gemini_pro/requirements.txt ./exp_requirements.txt
 RUN pip install --no-cache-dir -r exp_requirements.txt
 
-COPY experiments/exp03_gemini_pro/ ./experiments/exp03_gemini_pro/
+COPY src/     ./src/
+COPY configs/ ./configs/
+COPY repos/SurveyForge/SurveyBench/ ./repos/SurveyForge/SurveyBench/
+COPY experiments/exp03_gemini_pro/  ./experiments/exp03_gemini_pro/
 
 CMD ["python", "experiments/exp03_gemini_pro/main.py"]

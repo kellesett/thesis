@@ -11,3 +11,5 @@ anthropic
 huggingface_hub
 python-dotenv
 PyYAML
+pandas
+streamlit

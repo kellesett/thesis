@@ -9,3 +9,15 @@ evaluation:
   eval_types: [outline, content]
   k_refs: 1
   judges: experiments/exp02_perplexity_dr/judges.json
+
+# ── SurGE evaluation ──────────────────────────────────────────────────────────
+# Run folder: results/<dataset>_<model_name>_<eval_method>_<timestamp>/
+surge:
+  dataset:         surge
+  model_name:      perplexity       # short label for the results folder name
+  eval_method:     surge
+  n_surveys:       1
+  eval_list:       [sh_recall, structure_quality, logic]
+  judges:          experiments/exp02_perplexity_dr/judges.json
+  surveys_path:    datasets/SurGE/surveys.json
+  embedding_model: BAAI/bge-large-en-v1.5

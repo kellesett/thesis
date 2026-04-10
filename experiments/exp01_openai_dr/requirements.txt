@@ -1,10 +1,5 @@
 # experiments/exp01_openai_dr/requirements.txt
-# Зависимости для OpenAI Deep Research (OpenRouter API)
-openai>=1.0
-python-dotenv
-PyYAML
-tqdm
-requests
-huggingface_hub
-datasets
-pandas
+# Специфичные зависимости OpenAI Deep Research.
+# Общие пакеты установлены в thesis-base (experiments/requirements.base.txt).
+
+# Нет дополнительных зависимостей.

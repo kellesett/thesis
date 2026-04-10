@@ -6,10 +6,12 @@
 
 FROM thesis-base
 
-# Зависимости эксперимента (устанавливаются поверх базового образа)
 COPY experiments/exp01_openai_dr/requirements.txt ./exp_requirements.txt
 RUN pip install --no-cache-dir -r exp_requirements.txt
 
-COPY experiments/exp01_openai_dr/ ./experiments/exp01_openai_dr/
+COPY src/     ./src/
+COPY configs/ ./configs/
+COPY repos/SurveyForge/SurveyBench/ ./repos/SurveyForge/SurveyBench/
+COPY experiments/exp01_openai_dr/   ./experiments/exp01_openai_dr/
 
 CMD ["python", "experiments/exp01_openai_dr/main.py"]
