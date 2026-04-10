@@ -1,232 +1,240 @@
 # Survey Generation Benchmark
 
-Экспериментальная база для магистерской диссертации:
-**"Evaluating effectiveness of agentic systems for scientific survey generation"**
+Исследовательская база магистерской диссертации:
+**«Evaluating effectiveness of agentic systems for scientific survey generation»**
+
+Цель — сравнить несколько систем автоматической генерации научных обзоров на едином бенчмарке и метриках.
 
 ---
 
-## Структура репозитория
+## Архитектура
 
 ```
-├── src/
-│   ├── generate.py       # генерация обзоров (все системы)
-│   ├── evaluate.py       # LLM-judge оценка (SWR + CWR)
-│   └── download.py       # скачка датасета с HuggingFace
-├── experiments/
-│   ├── Dockerfile.base               # базовый Docker-образ
-│   ├── exp01_openai_dr/              # OpenAI o4-mini Deep Research
-│   ├── exp02_perplexity_dr/          # Perplexity Sonar Deep Research
-│   └── exp03_gemini_pro/             # Gemini 2.5 Pro (academic pipeline)
-├── configs/
-│   └── judges.json       # конфиг LLM-судей
-├── repos/                # клонированные репозитории (не в git)
-├── datasets/             # данные (не в git)
-├── results/              # результаты генерации (не в git)
-└── eval_results/         # результаты оценки (не в git)
+thesis/
+├── models/                      # генерирующие системы
+│   ├── perplexity_dr/           #   Perplexity Sonar Deep Research
+│   ├── surveyforge/             #   SurveyForge (RAG + outline pipeline)
+│   ├── surveygen_i/             #   SurveyGen-I (LangGraph async)
+│   └── autosurvey/              #   AutoSurvey (конвертация baseline)
+│
+├── metrics/                     # метрики оценки
+│   ├── surge/                   #   SurGE — LLM-judge (5 осей качества)
+│   └── diversity/               #   Reference diversity (SPECTER2 + PCA)
+│
+├── src/                         # общий код
+│   ├── models/base.py           #   BaseModel ABC
+│   ├── datasets/                #   загрузка датасетов
+│   └── utils/                   #   вспомогательные скрипты
+│
+├── datasets/                    # данные (не в git)
+│   ├── registry.yaml            #   реестр датасетов
+│   └── SurGE/                   #   бенчмарк SurGE
+│
+├── results/                     # результаты (не в git)
+│   ├── generations/             #   <dataset>_<model>/<topic_id>.json
+│   └── scores/                  #   <dataset>_<model>/<metric>/<topic_id>.json
+│
+├── repos/                       # клонированные репозитории (не в git)
+│   ├── SurGE/
+│   ├── SurveyForge/
+│   └── SurveyGen-I/
+│
+├── app/                         # Streamlit viewer
+├── scripts/                     # разовые скрипты
+├── docker/                      # базовый Docker-образ
+│   └── Dockerfile.base
+└── experiments/                 # ⚠️ DEPRECATED — см. ниже
 ```
 
-Каждый эксперимент в `experiments/expXX_name/` содержит:
-- `config.yaml` — параметры: система, топики, методы оценки
-- `main.py` — полный пайплайн: генерация → оценка
-- `Dockerfile` — запуск в изолированном контейнере
+> **`experiments/`** — устаревший формат ранних экспериментов (exp01–exp04). Не используется в текущем пайплайне. Оставлен только для истории.
 
 ---
 
-## Реализованные эксперименты
+## Модели
 
-| ID | Система | Модель | Тип | Статус |
-|----|---------|--------|-----|--------|
-| exp01 | OpenAI Deep Research | `openai/o4-mini-deep-research` | Deep Research | ✅ |
-| exp02 | Perplexity Sonar DR | `perplexity/sonar-deep-research` | Deep Research | ✅ |
-| exp03 | Gemini 2.5 Pro | `google/gemini-2.5-pro` | Academic pipeline | ✅ |
+Каждая модель в `models/<name>/` содержит:
+- `config.yaml` — параметры (model_id, LLM, датасет)
+- `main.py` — класс `XxxModel(BaseModel)` + точка входа
+- `Dockerfile` — изолированный запуск
+- `requirements.txt` — доп. зависимости поверх `thesis-base` (если нужны)
 
-Дополнительные системы, доступные в `src/generate.py`, но без отдельного эксперимента пока:
+| Модель | Система | Подход | API |
+|--------|---------|--------|-----|
+| `perplexity_dr` | Perplexity Sonar Deep Research | Deep Research | OpenRouter |
+| `surveyforge` | SurveyForge | RAG + outline pipeline | OpenRouter / local |
+| `surveygen_i` | SurveyGen-I | LangGraph async | OpenAI / OpenRouter |
+| `autosurvey` | AutoSurvey | конвертация baseline | — |
 
-| ID в коде | Модель | Примечание |
-|-----------|--------|------------|
-| `autosurvey_gpt4o` | `openai/gpt-4o` | Academic pipeline |
-| `autosurvey_local` | `LOCAL_MODEL` из `.env` | Локальный DeepSeek |
+### Формат выходного файла
 
-### Что делает каждый эксперимент
+`results/generations/<dataset>_<model>/<topic_id>.json`
 
-`main.py` запускает два шага последовательно:
+```json
+{
+  "topic":      "Graph Neural Networks",
+  "text":       "## Introduction\n...",
+  "success":    true,
+  "meta": {
+    "model":       "perplexity/sonar-deep-research",
+    "latency_sec": 42.1,
+    "cost_usd":    0.015,
+    "references":  ["2301.00123", "2210.05234"]
+  }
+}
+```
 
-1. **Генерация** (`src/generate.py`) — генерирует обзоры по N темам из SurveyBench. Сохраняет в `results/{experiment}/generated/{system}__{topic}.json`.
+---
 
-2. **Оценка** (`src/evaluate.py`) — сравнивает сгенерированные обзоры с человеческими эталонами двумя методами:
-   - **SWR** (Score Win Rate) — судья независимо ставит балл 0–100 каждому тексту, победитель — у кого выше
-   - **CWR** (Comparative Win Rate) — судья видит оба текста и выбирает лучший напрямую (A / B / TIE)
-   - Оценка по двум измерениям: `outline` (структура) и `content` (полный текст)
-   - Win rate = (wins + 0.5 × ties) / total
+## Метрики
 
-### Датасет — SurveyBench (SurveyForge)
+### SurGE (`metrics/surge/`)
 
-10 тем из области CS:
+LLM-judge оценка по 5 осям качества (Coverage, Relevance, Structure, Synthesis, Consistency).
+Реализован по методологии бенчмарка SurGE.
 
-- 3D Gaussian Splatting
-- 3D Object Detection in Autonomous Driving
-- Evaluation of Large Language Models
-- LLM-based Multi-Agent
-- Generative Diffusion Models
-- Graph Neural Networks
-- Hallucination in Large Language Models
-- Multimodal Large Language Models
-- Retrieval-Augmented Generation for Large Language Models
-- Vision Transformers
+### Diversity (`metrics/diversity/`)
+
+Разнообразие источников на основе эмбеддингов SPECTER2:
+- Новизна ссылок (NR), охват домена, PCA-визуализация
+- PCA обучается на **эталонных** ссылках из датасета — все модели проецируются в одно 2D-пространство
 
 ---
 
 ## Быстрый старт
 
-### 1. Клонировать репо и зависимости
+### 1. Клонировать репозиторий
 
 ```bash
 git clone <this-repo> thesis && cd thesis
 
-# Склонировать SurveyForge (нужен для тем и эталонных ссылок)
-git clone https://github.com/weAIDB/SurveyForge repos/SurveyForge
+# Клонировать внешние репозитории
+git clone https://github.com/weAIDB/SurveyForge   repos/SurveyForge
+git clone https://github.com/weAIDB/SurGE          repos/SurGE
+git clone https://github.com/xxx/SurveyGen-I       repos/SurveyGen-I
 
-# Создать окружение
+# Виртуальное окружение (для локальных утилит)
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Настроить переменные окружения
+### 2. Переменные окружения
 
 ```bash
 cp .env.example .env
-# Заполни .env:
-#   OPENROUTER_API_KEY — ключ OpenRouter (нужен для exp01, exp02, exp03)
-#   HF_TOKEN          — токен HuggingFace (для скачки датасета, если приватный)
 ```
 
-### 3. Скачать датасет (опционально)
+| Переменная | Описание |
+|------------|----------|
+| `OPENROUTER_API_KEY` | OpenRouter — для perplexity_dr, surveyforge |
+| `OPENAI_API_KEY` | OpenAI — для surveygen_i (прямой API) |
+| `HF_TOKEN` | HuggingFace — для скачки датасетов |
+| `LOCAL_API_BASE` | URL локального OpenAI-совместимого сервера |
+| `LOCAL_API_KEY` | Ключ для локального сервера |
+
+### 3. Загрузить данные
 
 ```bash
-# Посмотреть структуру
-make inspect
+make download       # скачать датасет SurGE
+make sfdb           # скачать БД SurveyForge (векторное хранилище)
+make sfmodel        # скачать embedding-модель gte-large-en-v1.5
+```
 
-# Скачать
-make download
-# → datasets/human_surveys/{topic}.json
+### 4. Собрать базовый Docker-образ
+
+```bash
+make base           # собирается один раз, кэшируется
+make base-clean     # принудительная пересборка (после правок в docker/)
 ```
 
 ---
 
-## Запуск экспериментов
-
-### Вариант A — через Make + Docker (рекомендуется)
+## Генерация
 
 ```bash
-# Собрать базовый образ (один раз, или после изменений в src/)
-make base
+# Универсальный запуск
+make generate MODEL=perplexity_dr DATASET=SurGE
+make generate MODEL=surveygen_i   DATASET=SurGE
 
-# Запустить эксперименты
-make exp01   # OpenAI Deep Research
-make exp02   # Perplexity Sonar DR
-make exp03   # Gemini 2.5 Pro
+# Специализированные таргеты
+make generate-sf        DATASET=SurGE   # SurveyForge (GPU)
+make generate-sf-cpu    DATASET=SurGE   # SurveyForge (CPU, для отладки)
+make generate-sgi       DATASET=SurGE   # SurveyGen-I (CPU)
+
+# AutoSurvey — конвертация готовых baseline результатов (без Docker)
+make convert-autosurvey DATASET=SurGE
 ```
 
-Результаты монтируются в `results/` и `eval_results/` на хосте.
-
-### Вариант B — локально без Docker
-
-```bash
-source .venv/bin/activate
-
-# Один эксперимент
-python experiments/exp01_openai_dr/main.py
-
-# Или напрямую — только генерация
-python src/generate.py --systems openai_o4_mini_dr --topics 5
-
-# Только оценка
-python src/evaluate.py --swr --cwr --eval outline,content \
-    --systems openai_o4_mini_dr
-```
+Результаты сохраняются в `results/generations/<DATASET>_<MODEL>/`.
 
 ---
 
-## Настройка конфига эксперимента
-
-Каждый `experiments/expXX/config.yaml`:
-
-```yaml
-experiment: exp01_openai_dr
-system: openai_o4_mini_dr   # ключ из SYSTEMS в src/generate.py
-topics: 5                   # сколько тем из SurveyBench
-
-evaluation:
-  methods: [swr, cwr]                   # методы оценки
-  eval_types: [outline, content]        # что оцениваем
-  judges: configs/judges.json           # путь к конфигу судей
-```
-
-### Конфиг судей (`configs/judges.json`)
-
-Список LLM-судей. Каждый судья вызывается `n` раз, результаты усредняются:
-
-```json
-[
-  {
-    "name": "gemini-flash",
-    "url": "https://openrouter.ai/api/v1",
-    "model": "google/gemini-2.0-flash-001",
-    "api_key_env": "OPENROUTER_API_KEY",
-    "n": 1
-  },
-  {
-    "name": "local-deepseek",
-    "url": "http://localhost:8000/v1",
-    "model": "deepseek-chat",
-    "api_key_env": "LOCAL_API_KEY",
-    "n": 1
-  }
-]
-```
-
----
-
-## Добавить новый эксперимент
+## Оценка
 
 ```bash
-cp -r experiments/exp01_openai_dr experiments/exp04_autosurvey_gpt4o
+# SurGE метрика
+make evaluate           DATASET=SurGE MODEL=perplexity_dr METRIC=surge
+
+# Diversity метрика
+make evaluate-diversity DATASET=SurGE MODEL=perplexity_dr
 ```
 
-Отредактировать `experiments/exp04_autosurvey_gpt4o/config.yaml`:
-
-```yaml
-experiment: exp04_autosurvey_gpt4o
-system: autosurvey_gpt4o
-topics: 5
-evaluation:
-  methods: [swr, cwr]
-  eval_types: [outline, content]
-  judges: configs/judges.json
-```
-
-Добавить в `Makefile`:
-
-```makefile
-exp04: base
-	docker build -f experiments/exp04_autosurvey_gpt4o/Dockerfile -t thesis-exp04 .
-	docker run --rm $(EXP_VOLUMES) thesis-exp04
-```
+Результаты сохраняются в `results/scores/<DATASET>_<MODEL>/`.
 
 ---
 
-## Выходные данные
+## Viewer
 
-```
-results/
-└── exp01_openai_dr/
-    ├── generated/
-    │   ├── openai_o4_mini_dr__Graph_Neural_Networks.json
-    │   └── ...
-    └── eval/
-        ├── swr__openai_o4_mini_dr__Graph_Neural_Networks__outline.json
-        ├── cwr__openai_o4_mini_dr__Graph_Neural_Networks__content.json
-        └── summary.csv    ← итоговая таблица win rates
+Streamlit-приложение для просмотра и сравнения результатов:
+
+```bash
+make viewer
+# → http://localhost:8501
 ```
 
-`summary.csv` содержит win rate по каждой системе / методу / типу оценки.
+Возможности:
+- Просмотр сгенерированных обзоров по темам
+- Сравнение моделей по SurGE-скорам
+- PCA-визуализация diversity с наложением нескольких моделей
+
+---
+
+## BaseModel — добавить новую модель
+
+Все модели наследуются от `src/models/base.py`:
+
+```python
+from src.models.base import BaseModel
+
+class MyModel(BaseModel):
+    def __init__(self):
+        super().__init__(Path(__file__).parent)   # читает config.yaml
+
+    def generate(self, instance: dict) -> dict:
+        # instance: {"id": ..., "topic": ..., "references": [...]}
+        ...
+        return {
+            "text":    survey_text,
+            "success": True,
+            "meta":    {"model": ..., "latency_sec": ..., "references": [...]},
+        }
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", default="SurGE")
+    args = parser.parse_args()
+    MyModel().run(args.dataset)
+```
+
+`BaseModel.run()` обрабатывает датасет, сохраняет результаты и поддерживает `resume`.
+
+---
+
+## Утилиты
+
+```bash
+make models         # проверить список доступных моделей
+make models-ping    # пинг API-эндпоинтов
+make enrich         # обогатить ссылки arxiv-метаданными
+make clean          # удалить Docker-образы
+```
