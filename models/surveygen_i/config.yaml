@@ -1,0 +1,24 @@
+model_id: surveygen_i
+n_surveys: 2
+resume: true
+
+# ── LLM ───────────────────────────────────────────────────────────────────────
+# SurveyGen-I использует OpenAI Responses API (client.responses.create).
+# По умолчанию — прямой OpenAI. Для OpenRouter указать base_url (см. ниже).
+api_key_env: OPENAI_API_KEY
+model: gpt-4o-mini-2024-07-18
+
+# Раскомментировать для OpenRouter (активирует патч на chat.completions):
+# base_url: https://openrouter.ai/api/v1
+# api_key_env: OPENROUTER_API_KEY
+
+# ── Paper search (Semantic Scholar, ключ не нужен) ────────────────────────────
+start_year: 2018
+end_year: 2025
+paper_limit_per_keyword: 30
+expand_top_n_papers: 10
+arxiv_only: false
+
+# ── Pipeline ──────────────────────────────────────────────────────────────────
+citation_trace: true
+enable_outline_update: true
