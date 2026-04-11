@@ -32,6 +32,8 @@ from src.models.base import BaseModel          # cached before SF_CODE takes ove
 from src.datasets import load_dataset as _     # noqa: F401 — force cache of src.datasets
 
 sys.path.insert(0, str(SF_CODE))  # SF_CODE is now first → SurveyForge finds its own src/utils
+# ⚠️  Do NOT reorder the imports above — the caching trick breaks if SF_CODE is inserted before
+#     src.datasets is imported. Linters / auto-sort tools must not touch this block.
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────

@@ -33,3 +33,13 @@ seaborn
 
 # ── Утилиты для данных ────────────────────────────────────────────────────────
 ijson               # streaming больших JSON (corpus.json 1.6 GB)
+
+# ── Метрики группы A / B / C ──────────────────────────────────────────────────
+hdbscan             # кластеризация терминов (A.2)
+spacy               # dep AlignScore + NER pipeline
+
+# ── AlignScore deps (ставим вручную чтобы избежать torch<2 конфликта) ─────────
+nltk
+jsonlines
+pytorch-lightning
+tensorboard

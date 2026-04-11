@@ -18,7 +18,12 @@ RUN pip install --no-cache-dir torch \
     --index-url https://download.pytorch.org/whl/cpu
 
 COPY docker/requirements.base.txt ./requirements.base.txt
-RUN pip install --no-cache-dir -r requirements.base.txt
+COPY repos/AlignScore repos/AlignScore
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && pip install --no-cache-dir -r requirements.base.txt \
+    && pip install --no-cache-dir --no-deps repos/AlignScore \
+    && python -m spacy download en_core_web_sm \
+    && apt-get purge -y build-essential && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 # Пустые папки для данных (монтируются снаружи через EXP_VOLUMES)
 RUN mkdir -p datasets results
@@ -30,3 +35,6 @@ ENV LOCAL_API_KEY="none"
 ENV LOCAL_MODEL="deepseek-chat"
 ENV HF_TOKEN=""
 ENV PYTHONUNBUFFERED=1
+
+# Путь к локальным моделям (монтируется через -v models_cache:/app/models_cache)
+ENV MODELS_CACHE=/app/models_cache

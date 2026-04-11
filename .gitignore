@@ -10,6 +10,7 @@ env/
 datasets/
 results/
 eval_results/
+models_cache/
 
 # Репозитории (клонируются вручную)
 repos/

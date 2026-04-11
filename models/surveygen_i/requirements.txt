@@ -1,29 +1,33 @@
 # SurveyGen-I specific dependencies
-# torch уже в thesis-base, faiss-gpu → faiss-cpu для CPU-контейнера
+# Всё из thesis-base (openai, pandas, numpy, requests, sentence-transformers,
+# tokenizers, datasets, transformers, scikit-learn, etc.) уже установлено —
+# здесь только то, чего нет в базовом образе.
+
+# ── Async утилиты ─────────────────────────────────────────────────────────────
 aiofiles==24.1.0
 aiohttp==3.11.16
+aiolimiter
+tenacity==8.5.0
+
+# ── PDF парсинг ───────────────────────────────────────────────────────────────
 pymupdf==1.25.5
+PyPDF2==3.0.1
+pdfkit==1.0.0
+
+# ── LangChain / LangGraph стек ────────────────────────────────────────────────
 langchain==0.3.23
 langchain_community==0.3.21
 langchain_core==0.3.52
 langchain_openai==0.3.13
 langchain_text_splitters==0.3.8
+langchain-huggingface==0.1.2
 langgraph==0.3.30
-openai==1.74.0
-pandas==2.2.3
-pdfkit==1.0.0
-PyPDF2==3.0.1
-requests==2.32.3
-sentence_transformers==4.1.0
+
+# ── Vector search ─────────────────────────────────────────────────────────────
 faiss-cpu==1.9.0
-numpy==1.26.4
+
+# ── Утилиты ───────────────────────────────────────────────────────────────────
 tabulate==0.9.0
-aiolimiter
-tenacity==8.5.0
 beautifulsoup4
-tokenizers>=0.19.1
-pyarrow==13.0.0
-datasets==2.14.6
 rapidfuzz
 bibtexparser
-langchain-huggingface==0.1.2

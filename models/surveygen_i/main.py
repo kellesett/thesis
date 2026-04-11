@@ -77,6 +77,12 @@ def _patch_llm_service_for_openrouter(base_url: str) -> None:
                 ],
                 temperature=0,
             )
+            if not response.choices:
+                print(
+                    f"[OpenRouter] choices=None | "
+                    f"error={getattr(response, 'error', '?')!r} | "
+                    f"model={getattr(response, 'model', '?')!r}"
+                )
             return _ChatCompletionWrapper(response)
 
     _mod.LlmServiceAsync = PatchedLlmServiceAsync
@@ -175,18 +181,33 @@ class SurveyGenI(BaseModel):
     def generate(self, instance) -> dict:
         """Run the SurveyGen-I pipeline for one instance."""
         import time
+        import traceback
         t0 = time.time()
 
         topic = instance.query
 
-        # Dedicated temp output dir per survey
-        with tempfile.TemporaryDirectory() as tmp:
-            output_dir = Path(tmp) / "sgi_output"
-            result = asyncio.run(self._run_pipeline(topic, str(output_dir)))
+        try:
+            # Dedicated temp output dir per survey
+            with tempfile.TemporaryDirectory() as tmp:
+                output_dir = Path(tmp) / "sgi_output"
+                result = asyncio.run(self._run_pipeline(topic, str(output_dir)))
 
-        latency = round(time.time() - t0, 2)
-        result["meta"]["latency_sec"] = latency
-        return result
+            latency = round(time.time() - t0, 2)
+            result["meta"]["latency_sec"] = latency
+            return result
+
+        except Exception as e:
+            return {
+                "text":    "",
+                "success": False,
+                "meta": {
+                    "model":       self.cfg["model"],
+                    "latency_sec": round(time.time() - t0, 2),
+                    "cost_usd":    None,
+                    "error":       f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
+                    "references":  [],
+                },
+            }
 
     async def _run_pipeline(self, topic: str, output_dir: str) -> dict:
         """Async wrapper around the SurveyGen-I LangGraph pipeline."""

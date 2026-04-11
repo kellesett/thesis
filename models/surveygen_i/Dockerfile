@@ -9,8 +9,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy project code
 COPY src/ ./src/
 COPY models/surveygen_i/ ./models/surveygen_i/
-COPY datasets/registry.yaml ./datasets/registry.yaml
-
 # Copy SurveyGen-I repo (prompts, acm template, pipeline code)
 COPY repos/SurveyGen-I/ ./repos/SurveyGen-I/
 

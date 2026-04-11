@@ -71,6 +71,12 @@ class RunLogger:
     def close(self) -> None:
         self._f.close()
 
+    def __enter__(self) -> "RunLogger":
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate generations with SurGE metrics")
@@ -137,13 +143,14 @@ def main() -> None:
         log_file   = scores_dir / f"{gid}.log.json"
 
         if resume and score_file.exists():
-            print(f"  [SKIP] {gid}")
-            log(f"skip survey {gid}: already scored (resume=true)")
             try:
                 all_results.append(json.loads(score_file.read_text(encoding="utf-8")))
-            except Exception:
-                pass
-            continue
+                print(f"  [SKIP] {gid}")
+                log(f"skip survey {gid}: already scored (resume=true)")
+                continue
+            except Exception as e:
+                print(f"  [WARN] {gid}: corrupt score file, re-evaluating — {e}")
+                log(f"warn survey {gid}: corrupt score file, re-evaluating — {e}")
 
         if not generation.get("success"):
             print(f"  [SKIP] {gid} — generation failed, no text to evaluate")
@@ -241,7 +248,7 @@ def main() -> None:
     print(f"  CSV    → {csv_path}")
 
     log(f"=== run finished: {len(all_results)} evaluated ===")
-    log.close()
+    log.close()   # also reachable via context manager: `with RunLogger(...) as log:`
 
 
 if __name__ == "__main__":

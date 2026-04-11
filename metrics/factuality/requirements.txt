@@ -1,0 +1,3 @@
+# metrics/factuality/requirements.txt
+# Все зависимости уже в thesis-base (alignscore, openai, ijson, transformers).
+# Файл оставлен пустым для единообразия структуры.

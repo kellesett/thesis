@@ -1,0 +1,15 @@
+metric_id: expert
+
+# ── LLM судья (через OpenRouter) ─────────────────────────────────────────────
+judge_model:       openai/gpt-4o-mini
+judge_base_url:    https://openrouter.ai/api/v1
+judge_api_key_env: OPENROUTER_API_KEY
+judge_id:          gpt4o_mini
+judge_comment:     run1
+
+# ── Параметры ─────────────────────────────────────────────────────────────────
+max_retries:       3
+# Параллельные LLM вызовы на один claim (C.1 + C.2 + C.3 + C.4 одновременно)
+llm_concurrency:   4
+
+resume: true

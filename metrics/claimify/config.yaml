@@ -1,0 +1,12 @@
+metric_id: claimify
+
+# LLM для декомпозиции (через OpenRouter)
+judge_model: openai/gpt-4o-mini
+judge_base_url: https://openrouter.ai/api/v1
+judge_api_key_env: OPENROUTER_API_KEY
+
+# Параметры декомпозиции
+max_section_chars: 4000     # чанкование длинных секций
+max_retries: 3              # retry при parse failure
+
+resume: true                # пропускать уже обработанные обзоры

@@ -81,11 +81,17 @@ class PerplexityDR(BaseModel):
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def extract_annotations(self, response) -> list[dict]:
-        """Extract url_citation annotations from response as [{idx, title, url}]."""
+        """Extract url_citation annotations from response as [{idx, title, url}].
+
+        idx is the 1-based position in the FULL annotations array (including
+        non-url_citation entries).  Perplexity embeds citation markers like [1],
+        [2], … in the text by positional index, so this must reflect the full
+        array position — not just the count of url_citations seen so far.
+        """
         annotations = getattr(response.choices[0].message, "annotations", None) or []
         return [
             {
-                "idx":   i + 1,
+                "idx":   i + 1,   # positional index in full annotations list
                 "title": a.url_citation.title,
                 "url":   a.url_citation.url,
             }
@@ -198,6 +204,7 @@ class PerplexityDR(BaseModel):
             }
 
         except Exception as e:
+            import traceback
             return {
                 "text":    "",
                 "success": False,
@@ -205,7 +212,7 @@ class PerplexityDR(BaseModel):
                     "model":                self.model,
                     "latency_sec":          round(time.time() - t0, 2),
                     "cost_usd":             0.0,
-                    "error":                str(e),
+                    "error":                f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
                     "search_domain_filter": self.search_domain_filter or None,
                     "references":           [],
                 },

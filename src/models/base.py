@@ -177,4 +177,7 @@ class BaseModel(ABC):
                 parts.append(f"error={str(meta['error'])[:80]}")
             print(" ".join(parts))
 
+            if not result["success"]:
+                sys.exit(1)
+
         print(f"\nGenerations saved to: {self.out_dir}")

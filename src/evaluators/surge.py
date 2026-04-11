@@ -191,6 +191,12 @@ def _run_metrics(
     from markdownParser import parse_markdown
 
     ctx     = {"metric": None, "paragraph_idx": 0}
+    # Guard: fail fast if SurGE renames the function rather than silently using the unpatched version
+    assert hasattr(structureFuncs,   "chat_openai"), \
+        "structureFuncs.chat_openai not found — SurGE API may have changed"
+    assert hasattr(informationFuncs, "chat_openai"), \
+        "informationFuncs.chat_openai not found — SurGE API may have changed"
+
     patched = _make_chat_openai_patched(judge_model, judge_log, ctx, flush_fn=flush_fn, log_fn=log_fn)
     structureFuncs.chat_openai   = patched
     informationFuncs.chat_openai = patched

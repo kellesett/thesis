@@ -1,0 +1,3 @@
+# metrics/expert/requirements.txt
+# Все зависимости уже в thesis-base (openai, transformers).
+# Файл оставлен пустым для единообразия структуры.

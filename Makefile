@@ -2,14 +2,15 @@
 # Запускай из корня репозитория.
 # Предварительно: cp .env.example .env && заполни ключи
 
-.PHONY: help setup setup-sf base base-clean \
+.PHONY: help setup setup-sf base \
         generate evaluate \
         generate-sf generate-sf-cpu generate-sgi \
         convert-autosurvey \
         evaluate-diversity \
         viewer enrich \
         download inspect models models-ping \
-        sfdb sfdb-check sfmodel clean
+        sfdb sfdb-check sfmodel \
+        download-metric-models clean
 
 PYTHON     = .venv/bin/python
 DATASET   ?= SurGE
@@ -20,6 +21,10 @@ VOLUMES = --env-file .env \
           -v "$(PWD)/results:/app/results" \
           -v "$(PWD)/datasets:/app/datasets"
 
+# Метрики групп A/B/C дополнительно монтируют локальные модели
+METRIC_VOLUMES = $(VOLUMES) \
+          -v "$(PWD)/models_cache:/app/models_cache"
+
 
 ## Справка
 help:
@@ -29,8 +34,8 @@ help:
 	@echo "  make setup-sf       — .venv + requirements exp04 (torch, faiss, ...)"
 	@echo ""
 	@echo "  [Docker — base]"
-	@echo "  make base           — собрать thesis-base (кэшируется)"
-	@echo "  make base-clean     — пересобрать thesis-base без кэша"
+	@echo "  make base              — собрать thesis-base (кэшируется)"
+	@echo "  make base NO_CACHE=1   — пересобрать thesis-base без кэша"
 	@echo ""
 	@echo "  [Генерация]"
 	@echo "  make generate           [DATASET=SurGE] [MODEL=perplexity_dr]"
@@ -40,11 +45,16 @@ help:
 	@echo "  make convert-autosurvey [DATASET=SurGE]  — конвертировать baseline AutoSurvey"
 	@echo ""
 	@echo "  [Оценка]"
-	@echo "  make evaluate           [DATASET=SurGE] [MODEL=perplexity_dr] [METRIC=surge]"
+	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=surge"
+	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=claimify     # кэш claims (нужен для factuality + expert)"
+	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=structural   # A.1 M_contr, A.2 M_term, A.3 M_rep"
+	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=factuality   # B.1 CitCorrect_k"
+	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=expert       # C.1-C.4 M_crit/comp/open/mod"
 	@echo "  make evaluate-diversity [DATASET=SurGE] [MODEL=perplexity_dr]"
 	@echo ""
-	@echo "  [Данные]"
+	@echo "  [Данные / Модели]"
 	@echo "  make download / sfdb / sfdb-check / sfmodel"
+	@echo "  make download-metric-models    — скачать NER/NLI/AlignScore модели в models_cache/"
 	@echo ""
 	@echo "  [Утилиты]"
 	@echo "  make enrich / models / models-ping / clean"
@@ -63,12 +73,10 @@ setup-sf:
 ## ── Docker base ──────────────────────────────────────────────────────────────
 
 # Собирает базовый образ (пропускает если уже существует)
-base:
-	docker build -f docker/Dockerfile.base -t thesis-base .
+NO_CACHE ?= 0
 
-# Принудительная пересборка без кэша — используй после правок docker/requirements.base.txt
-base-clean:
-	docker build --no-cache -f docker/Dockerfile.base -t thesis-base .
+base:
+	docker build $(if $(filter 1,$(NO_CACHE)),--no-cache,) -f docker/Dockerfile.base -t thesis-base .
 
 ## ── Генерация ────────────────────────────────────────────────────────────────
 
@@ -105,12 +113,19 @@ generate-sgi: base
 convert-autosurvey:
 	$(PYTHON) models/autosurvey/main.py --dataset $(DATASET)
 
-## ── Оценка (SurGE) ───────────────────────────────────────────────────────────
+## ── Оценка (универсальный target) ───────────────────────────────────────────
+# Метрики surge/diversity используют VOLUMES (без models_cache).
+# Метрики claimify/structural/factuality/expert используют METRIC_VOLUMES.
+_METRIC_NEEDS_MODELS = claimify structural factuality expert
+_USE_METRIC_VOLUMES  = $(filter $(METRIC),$(_METRIC_NEEDS_MODELS))
 
 evaluate: base
 	docker build -f metrics/$(METRIC)/Dockerfile -t thesis-eval-$(METRIC) .
-	docker run --rm $(VOLUMES) thesis-eval-$(METRIC) \
-		python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL)
+	$(if $(_USE_METRIC_VOLUMES), \
+		docker run --rm $(METRIC_VOLUMES) thesis-eval-$(METRIC) \
+			python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL), \
+		docker run --rm $(VOLUMES) thesis-eval-$(METRIC) \
+			python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL))
 
 ## ── Оценка (diversity) ───────────────────────────────────────────────────────
 
@@ -157,9 +172,16 @@ models:
 models-ping:
 	$(PYTHON) src/utils/check_local.py --ping
 
+## ── Загрузка моделей для метрик ──────────────────────────────────────────────
+
+download-metric-models:
+	$(PYTHON) scripts/download_metric_models.py
+
 ## ── Очистка ──────────────────────────────────────────────────────────────────
 
 clean:
 	-docker rmi thesis-base thesis-gen-perplexity_dr thesis-gen-surveyforge \
 	    thesis-gen-surveygen_i \
-	    thesis-eval-surge thesis-eval-diversity 2>/dev/null || true
+	    thesis-eval-surge thesis-eval-diversity \
+	    thesis-eval-claimify thesis-eval-structural \
+	    thesis-eval-factuality thesis-eval-expert 2>/dev/null || true

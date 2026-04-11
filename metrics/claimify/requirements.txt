@@ -1,0 +1,3 @@
+# metrics/claimify/requirements.txt
+# Все зависимости уже в thesis-base.
+# Файл оставлен пустым для единообразия структуры.
