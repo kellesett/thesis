@@ -1,0 +1,3 @@
+# metrics/veriscore/requirements.txt
+# Все зависимости уже в thesis-base (openai, requests, spacy, pyyaml, tqdm, python-dotenv).
+# Файл оставлен пустым для единообразия структуры.
