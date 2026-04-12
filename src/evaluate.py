@@ -66,6 +66,7 @@ from collections import defaultdict
 from openai import OpenAI
 from tqdm import tqdm
 from dotenv import load_dotenv
+from src.log_setup import setup_logging
 
 load_dotenv()
 
@@ -525,6 +526,7 @@ def compute_win_rate(verdicts: list[str]) -> dict:
 # ─── CLI and entry point ────────────────────────────────────────────────────────
 
 def main():
+    setup_logging("evaluate")
     parser = argparse.ArgumentParser(
         description="LLM-as-Judge evaluation (Score WR + Comparative WR)"
     )

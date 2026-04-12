@@ -33,6 +33,8 @@ logging.basicConfig(level=logging.INFO)
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+from src.log_setup import setup_logging
+
 ARXIV_RE = re.compile(r'arxiv\.org/(?:abs|pdf|html)/(\d{4}\.\d{4,6})')
 
 
@@ -195,6 +197,7 @@ def load_survey_titles(dataset_id: str) -> dict[str, str]:
 
 
 def main() -> None:
+    setup_logging("enrich_refs")
     parser = argparse.ArgumentParser(
         description="Enrich generation references with arxiv canonical titles and self-citation flags"
     )

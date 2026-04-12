@@ -25,13 +25,17 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
+ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT))
+
+from src.log_setup import setup_logging
+
 try:
     from huggingface_hub import snapshot_download, hf_hub_download
 except ImportError:
     logger.error("Install dependencies: pip install huggingface_hub")
     sys.exit(1)
 
-ROOT = Path(__file__).parent.parent
 CACHE = ROOT / "models_cache"
 CACHE.mkdir(exist_ok=True)
 
@@ -104,6 +108,7 @@ def download_model(m: dict) -> None:
 
 def main() -> None:
     """Download all required models for metrics evaluation."""
+    setup_logging("download_models")
     logger.info(f"\nDownloading models to {CACHE}/\n")
     for m in MODELS:
         try:

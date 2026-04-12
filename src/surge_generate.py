@@ -24,6 +24,7 @@ import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
+from src.log_setup import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,7 @@ def load_surge_topics(surveys_path: Path, n: int) -> list[dict]:
 
 
 def main() -> None:
+    setup_logging("surge_generate")
     parser = argparse.ArgumentParser(description="Generate surveys on SurGE topics")
     parser.add_argument("--system",        required=True,
                         help="System ID (key in SYSTEMS dict, e.g. perplexity_dr)")

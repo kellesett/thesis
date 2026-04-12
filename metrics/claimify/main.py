@@ -54,6 +54,8 @@ ROOT   = Path(__file__).parent.parent.parent
 CONFIG = Path(__file__).parent / "config.yaml"
 sys.path.insert(0, str(ROOT))
 
+from src.log_setup import setup_logging
+
 from metrics.claimify.claim_extractor import (
     ClaimExtractor,
     _SEL_COMPLETIONS,
@@ -231,6 +233,7 @@ async def process_survey(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main_async() -> None:
+    setup_logging("claimify")
     parser = argparse.ArgumentParser(description="Claimify — atomic claim extraction")
     parser.add_argument("--dataset", required=True, help="Dataset id (e.g. SurGE)")
     parser.add_argument("--model",   required=True, help="Model id (e.g. perplexity_dr)")

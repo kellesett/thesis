@@ -51,6 +51,9 @@ logger = logging.getLogger(__name__)
 ROOT   = Path(__file__).parent.parent.parent
 REPO   = ROOT / "repos" / "VeriScore"
 CONFIG = Path(__file__).parent / "config.yaml"
+sys.path.insert(0, str(ROOT))
+
+from src.log_setup import setup_logging
 
 
 # ── Config & client ───────────────────────────────────────────────────────────
@@ -315,6 +318,7 @@ def process_survey(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    setup_logging("veriscore")
     parser = argparse.ArgumentParser(description="VeriScore claim extraction")
     parser.add_argument("--dataset", required=True, help="Dataset id (e.g. SurGE)")
     parser.add_argument("--model",   required=True, help="Model id (e.g. perplexity_dr)")

@@ -16,13 +16,14 @@ MODEL   ?= perplexity_dr
 METRIC  ?= surge
 GPU     ?= 0
 
-# Единые volumes для всех контейнеров
+# Shared volumes for all containers
 VOLUMES = --env-file .env \
           -v "$(PWD)/tmp:/tmp" \
           -v "$(PWD)/repos:/app/repos" \
           -v "$(PWD)/datasets:/app/datasets" \
           -v "$(PWD)/results:/app/results" \
           -v "$(PWD)/models_cache:/app/models_cache"
+# results/logs/ is inside the results volume, so logs survive container crashes
 
 _GPU_FLAG = $(if $(filter 1,$(GPU)),--gpus all,)
 
@@ -82,7 +83,7 @@ base:
 ## ── Генерация ────────────────────────────────────────────────────────────────
 
 generate: base
-	mkdir -p tmp models_cache
+	mkdir -p tmp models_cache results/logs
 	docker build -f models/$(MODEL)/Dockerfile -t thesis-gen-$(MODEL) .
 	docker run --rm $(_GPU_FLAG) $(VOLUMES) thesis-gen-$(MODEL) \
 		python models/$(MODEL)/main.py --dataset $(DATASET)
@@ -103,7 +104,7 @@ convert-reference:
 #   -v "$(HOME)/.cache/huggingface:/root/.cache/huggingface"
 
 evaluate: base
-	mkdir -p tmp models_cache
+	mkdir -p tmp models_cache results/logs
 	docker build -f metrics/$(METRIC)/Dockerfile -t thesis-eval-$(METRIC) .
 	docker run --rm $(VOLUMES) thesis-eval-$(METRIC) \
 		python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL)

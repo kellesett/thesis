@@ -27,6 +27,7 @@ import json
 import argparse
 import logging
 from pathlib import Path
+from src.log_setup import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,7 @@ def _extract_outline(text: str) -> str:
 
 
 def main() -> None:
+    setup_logging("download")
     parser = argparse.ArgumentParser(description=f"Download {DATASET_ID} from HuggingFace")
     parser.add_argument("--inspect", action="store_true",
                         help="Show structure of downloaded repo (without parsing)")
@@ -187,12 +189,6 @@ def main() -> None:
     parser.add_argument("--token", default=None,
                         help="HuggingFace token (overrides HF_TOKEN from .env)")
     args = parser.parse_args()
-
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s"
-    )
 
     token = args.token or get_token()
 

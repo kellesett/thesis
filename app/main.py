@@ -7,6 +7,7 @@ import json
 import logging
 import pathlib
 import re
+import sys
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -15,6 +16,12 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 ROOT = pathlib.Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT))
+
+from src.log_setup import setup_logging
+
+setup_logging("app")
+
 GENERATIONS_DIR = ROOT / "results" / "generations"
 SCORES_DIR      = ROOT / "results" / "scores"
 

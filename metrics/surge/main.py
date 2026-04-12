@@ -36,6 +36,7 @@ ROOT   = Path(__file__).parent.parent.parent
 CONFIG = Path(__file__).parent / "config.yaml"
 sys.path.insert(0, str(ROOT))
 
+from src.log_setup import setup_logging
 from src.datasets import load_dataset as load_dataset_cls
 from src.evaluators import load_evaluator
 from src.evaluators.surge import JudgeFailedError
@@ -110,6 +111,7 @@ def main() -> None:
     per-survey scores + judge logs. Supports resume to skip already-scored
     surveys.
     """
+    setup_logging("surge")
     parser = argparse.ArgumentParser(description="Evaluate generations with SurGE metrics")
     parser.add_argument("--dataset", required=True, help="Dataset id (e.g. SurGE)")
     parser.add_argument("--model",   required=True, help="Model id (e.g. perplexity_dr)")

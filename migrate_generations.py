@@ -14,9 +14,15 @@ New format:
 import json
 import logging
 import pathlib
+from pathlib import Path
+
+# Set up sys.path for src imports
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
+
+from src.log_setup import setup_logging
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 SRC = pathlib.Path("results/surge_perplexity_surge/generations")
 DST = pathlib.Path("results/generations/SurGE_perplexity_dr")
@@ -68,6 +74,7 @@ def migrate(old: dict) -> dict | None:
 
 def main() -> None:
     """Migrate old generation files to new unified format with validation and idempotency."""
+    setup_logging("migrate")
     files = sorted(SRC.glob("*.json"))
     if not files:
         logger.info(f"No files found in {SRC}")

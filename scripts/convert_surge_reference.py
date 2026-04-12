@@ -25,6 +25,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
+from src.log_setup import setup_logging
 from src.datasets import load_dataset as load_dataset_cls
 
 
@@ -37,6 +38,7 @@ def load_registry(path: Path) -> dict[str, str]:
 
 def main() -> None:
     """Convert SurGE reference surveys to unified generation format."""
+    setup_logging("convert_surge_ref")
     registry = load_registry(ROOT / "datasets" / "registry.yaml")
     dataset = load_dataset_cls("SurGE", registry["SurGE"])
     instances = list(dataset)

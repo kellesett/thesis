@@ -36,6 +36,7 @@ from pathlib import Path
 
 from openai import OpenAI
 from dotenv import load_dotenv
+from src.log_setup import setup_logging
 
 load_dotenv()
 
@@ -265,6 +266,7 @@ def evaluate_survey(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    setup_logging("surge_evaluate")
     parser = argparse.ArgumentParser(description="Evaluate generated surveys with SurGE metrics")
     parser.add_argument("--surveys-path",    required=True,
                         help="Path to SurGE's surveys.json")
@@ -281,12 +283,6 @@ def main() -> None:
     parser.add_argument("--resume",          action="store_true",
                         help="Skip files that already have a scores JSON")
     args = parser.parse_args()
-
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
 
     eval_list  = [e.strip() for e in args.eval.split(",")]
     gen_dir    = Path(args.gen_dir)

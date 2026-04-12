@@ -49,6 +49,7 @@ ROOT   = Path(__file__).parent.parent.parent
 CONFIG = Path(__file__).parent / "config.yaml"
 sys.path.insert(0, str(ROOT))
 
+from src.log_setup import setup_logging
 from metrics.utils import make_client, load_config
 
 
@@ -598,6 +599,7 @@ def write_summary(results: list[dict], out_path: Path) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    setup_logging("structural")
     parser = argparse.ArgumentParser(description="Structural quality metrics (A.1, A.2, A.3)")
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--model",   required=True)

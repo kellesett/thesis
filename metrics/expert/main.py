@@ -52,6 +52,7 @@ ROOT   = Path(__file__).parent.parent.parent
 CONFIG = Path(__file__).parent / "config.yaml"
 sys.path.insert(0, str(ROOT))
 
+from src.log_setup import setup_logging
 from metrics.utils import make_client, load_config
 
 
@@ -492,6 +493,7 @@ def write_summary(results: list[dict], out_path: Path) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    setup_logging("expert")
     parser = argparse.ArgumentParser(description="Expert writing property metrics (C.1–C.4)")
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--model",   required=True)

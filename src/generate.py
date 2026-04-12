@@ -36,6 +36,7 @@ from openai import OpenAI
 from datasets import load_dataset
 from tqdm import tqdm
 from dotenv import load_dotenv
+from src.log_setup import setup_logging
 
 load_dotenv()
 
@@ -421,6 +422,7 @@ def load_topics(n: int = 10) -> list[dict]:
 # ─── CLI and entry point ──────────────────────────────────────────────────────
 
 def main():
+    setup_logging("generate")
     parser = argparse.ArgumentParser(description="Survey generation benchmark via OpenRouter / local server")
     parser.add_argument("--systems", default="all",
                         help="Systems comma-separated or 'all': openai,perplexity,autosurvey_gpt4o,autosurvey_gemini,autosurvey_local")
