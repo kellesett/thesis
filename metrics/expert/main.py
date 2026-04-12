@@ -29,12 +29,12 @@ Usage (inside Docker):
 import argparse
 import csv
 import json
+import logging
 import math
 import os
 import re
 import sys
 import time
-import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,26 +42,20 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 from openai import OpenAI
+from tqdm import tqdm
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 ROOT   = Path(__file__).parent.parent.parent
 CONFIG = Path(__file__).parent / "config.yaml"
 sys.path.insert(0, str(ROOT))
 
+from metrics.utils import make_client, load_config
+
 
 # ── Config & client ───────────────────────────────────────────────────────────
-
-def load_config() -> dict:
-    with open(CONFIG) as f:
-        return yaml.safe_load(f)
-
-
-def make_client(cfg: dict) -> OpenAI:
-    api_key = os.environ.get(cfg["judge_api_key_env"], "")
-    if not api_key:
-        raise RuntimeError(f"API key not set: env var '{cfg['judge_api_key_env']}'")
-    return OpenAI(api_key=api_key, base_url=cfg["judge_base_url"])
 
 
 # ── Claimify cache guard ──────────────────────────────────────────────────────
@@ -87,8 +81,15 @@ def llm_json(
     system: str,
     user: str,
     max_retries: int,
+    provider: str | None = None,
+    disable_reasoning: bool = False,
 ) -> dict:
     """Call LLM, parse JSON response. Returns {} on persistent failure."""
+    extra_body: dict = {}
+    if provider:
+        extra_body["provider"] = {"order": [provider], "allow_fallbacks": False}
+    if disable_reasoning:
+        extra_body["reasoning"] = {"enabled": False}
     for attempt in range(1, max_retries + 1):
         try:
             resp = client.chat.completions.create(
@@ -98,8 +99,17 @@ def llm_json(
                     {"role": "user",   "content": user},
                 ],
                 temperature=0,
+                extra_body=extra_body or None,
             )
-            raw = resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content
+            if content is None:
+                print(f"[ERROR] OpenRouter None content (finish_reason={resp.choices[0].finish_reason}).\n"
+                      f"Full response: {resp}", file=sys.stderr)
+                raise RuntimeError(
+                    f"OpenRouter returned None content "
+                    f"(finish_reason={resp.choices[0].finish_reason})."
+                )
+            raw = content.strip()
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
             return json.loads(raw)
@@ -136,8 +146,13 @@ Respond with a JSON object:
 {{"is_critical": true | false, "reasoning": "brief explanation", "critical_type": "limitation" | "negative_result" | "contradiction" | "trade_off" | "none"}}"""
 
 
-def judge_criticality(claim: str, client: OpenAI, model: str, max_retries: int) -> dict:
-    return llm_json(client, model, _CRIT_SYS, _CRIT_USER.format(claim=claim[:600]), max_retries)
+def judge_criticality(claim: str, client: OpenAI, model: str, max_retries: int, provider: str | None = None, disable_reasoning: bool = False) -> dict:
+    """Judge whether a claim makes a critical evaluation or judgment.
+
+    Identifies claims that point out limitations, negative results, contradictions,
+    or trade-offs (C.1).
+    """
+    return llm_json(client, model, _CRIT_SYS, _CRIT_USER.format(claim=claim[:600]), max_retries, provider, disable_reasoning)
 
 
 # ── C.2 — Comparativeness ────────────────────────────────────────────────────
@@ -187,15 +202,24 @@ Respond with a JSON object:
 {{"is_valid": true | false, "reasoning": "brief explanation", "invalidity_type": "incomparable_setup" | "different_metrics" | "unsupported_numbers" | "missing_context" | "none"}}"""
 
 
-def judge_comparative(claim: str, client: OpenAI, model: str, max_retries: int) -> dict:
-    return llm_json(client, model, _COMP_SYS, _COMP_USER.format(claim=claim[:600]), max_retries)
+def judge_comparative(claim: str, client: OpenAI, model: str, max_retries: int, provider: str | None = None, disable_reasoning: bool = False) -> dict:
+    """Judge whether a claim makes an explicit comparison between approaches.
+
+    Identifies comparative claims that contrast methods, models, or results (C.2).
+    """
+    return llm_json(client, model, _COMP_SYS, _COMP_USER.format(claim=claim[:600]), max_retries, provider, disable_reasoning)
 
 
-def judge_valid_comparison(claim: str, context: str, client: OpenAI, model: str, max_retries: int) -> dict:
+def judge_valid_comparison(claim: str, context: str, client: OpenAI, model: str, max_retries: int, provider: str | None = None, disable_reasoning: bool = False) -> dict:
+    """Judge validity of a comparative claim given source context.
+
+    Determines if a comparison is fair and properly supported, handling only
+    claims flagged as comparative (C.2).
+    """
     return llm_json(
         client, model, _VALID_SYS,
         _VALID_USER.format(claim=claim[:600], context=context[:800] if context else "Not available"),
-        max_retries,
+        max_retries, provider, disable_reasoning,
     )
 
 
@@ -223,8 +247,12 @@ Respond with a JSON object:
 {{"is_open_question": true | false, "reasoning": "brief explanation", "question_type": "generalization" | "scalability" | "mechanism" | "theoretical" | "empirical" | "none"}}"""
 
 
-def judge_open_question(claim: str, client: OpenAI, model: str, max_retries: int) -> dict:
-    return llm_json(client, model, _OPEN_SYS, _OPEN_USER.format(claim=claim[:600]), max_retries)
+def judge_open_question(claim: str, client: OpenAI, model: str, max_retries: int, provider: str | None = None, disable_reasoning: bool = False) -> dict:
+    """Judge whether a claim formulates an open question or unresolved problem.
+
+    Identifies claims that acknowledge gaps, unknowns, or future directions (C.3).
+    """
+    return llm_json(client, model, _OPEN_SYS, _OPEN_USER.format(claim=claim[:600]), max_retries, provider, disable_reasoning)
 
 
 # ── C.4 — Modality diversity ──────────────────────────────────────────────────
@@ -248,8 +276,12 @@ Respond with a JSON object:
 {{"modality_level": 1 | 2 | 3 | 4 | 5, "reasoning": "brief explanation citing specific hedging markers", "hedging_markers": ["marker_1"] | []}}"""
 
 
-def judge_modality(claim: str, client: OpenAI, model: str, max_retries: int) -> dict:
-    return llm_json(client, model, _MOD_SYS, _MOD_USER.format(claim=claim[:600]), max_retries)
+def judge_modality(claim: str, client: OpenAI, model: str, max_retries: int, provider: str | None = None, disable_reasoning: bool = False) -> dict:
+    """Judge epistemic modality level (confidence) of a claim.
+
+    Classifies claims on a 5-level scale from categorical to explicitly uncertain (C.4).
+    """
+    return llm_json(client, model, _MOD_SYS, _MOD_USER.format(claim=claim[:600]), max_retries, provider, disable_reasoning)
 
 
 # ── Metric aggregation ────────────────────────────────────────────────────────
@@ -272,15 +304,24 @@ def judge_claim(
     model: str,
     max_retries: int,
     source_context: str,
+    provider: str | None = None,
+    disable_reasoning: bool = False,
 ) -> dict:
-    """Run all 4 LLM judges for a single claim. Returns enriched claim dict."""
+    """Run all 4 LLM judges for a single claim. Returns enriched claim dict.
+
+    Parallelizes criticality, comparativeness, open question, and modality judges
+    via ThreadPoolExecutor (4 workers, one per judge). Validity check runs
+    sequentially for claims flagged as comparative.
+    """
     claim = claim_record["claim"]
 
+    # ThreadPoolExecutor with max_workers=4 parallelizes the four judges.
+    # Rate limiting is handled by the OpenAI client's internal queue.
     with ThreadPoolExecutor(max_workers=4) as ex:
-        f_crit  = ex.submit(judge_criticality,  claim, client, model, max_retries)
-        f_comp  = ex.submit(judge_comparative,   claim, client, model, max_retries)
-        f_open  = ex.submit(judge_open_question, claim, client, model, max_retries)
-        f_mod   = ex.submit(judge_modality,      claim, client, model, max_retries)
+        f_crit  = ex.submit(judge_criticality,  claim, client, model, max_retries, provider, disable_reasoning)
+        f_comp  = ex.submit(judge_comparative,   claim, client, model, max_retries, provider, disable_reasoning)
+        f_open  = ex.submit(judge_open_question, claim, client, model, max_retries, provider, disable_reasoning)
+        f_mod   = ex.submit(judge_modality,      claim, client, model, max_retries, provider, disable_reasoning)
 
         crit_res = f_crit.result()
         comp_res = f_comp.result()
@@ -305,7 +346,7 @@ def judge_claim(
 
     # C.2 validity check — only for comparative claims
     if result["is_comparative"]:
-        valid_res = judge_valid_comparison(claim, source_context, client, model, max_retries)
+        valid_res = judge_valid_comparison(claim, source_context, client, model, max_retries, provider, disable_reasoning)
         result["is_valid_comparison"] = valid_res.get("is_valid", False)
         result["invalidity_type"]     = valid_res.get("invalidity_type", "none")
     else:
@@ -358,15 +399,15 @@ def process_survey(
 
     model       = cfg["judge_model"]
     max_retries = cfg.get("max_retries", 3)
+    provider           = cfg.get("judge_provider")           # optional — None means let OpenRouter choose
+    disable_reasoning  = cfg.get("judge_disable_reasoning", False)
     # Shared source context (first reference abstract) for validity checks
     source_ctx  = ""  # enriched per model if corpus available
 
     judged_claims: list[dict] = []
-    for i, claim_record in enumerate(claims):
-        if (i + 1) % 50 == 0:
-            print(f"         {i + 1}/{len(claims)} claims processed...")
+    for claim_record in tqdm(claims, desc="  judging", unit="claim", leave=True):
         try:
-            judged = judge_claim(claim_record, client, model, max_retries, source_ctx)
+            judged = judge_claim(claim_record, client, model, max_retries, source_ctx, provider, disable_reasoning)
             judged_claims.append(judged)
         except Exception as e:
             judged_claims.append({**claim_record, "_judge_error": str(e)})
@@ -476,29 +517,19 @@ def main() -> None:
     print(f"\n[expert] {args.dataset} / {args.model}")
     print(f"         {len(gen_files)} surveys → {out_dir}\n")
 
-    all_results, n_err = [], 0
+    all_results = []
     for gf in gen_files:
-        try:
-            with open(gf) as f:
-                gen = json.load(f)
-        except Exception as e:
-            print(f"  [ERROR] reading {gf.name}: {e}")
-            n_err += 1
-            continue
+        with open(gf) as f:
+            gen = json.load(f)
 
-        try:
-            res = process_survey(gen, claims_dir, out_dir, cfg, client)
-            if res:
-                all_results.append(res)
-        except Exception as e:
-            print(f"  [ERROR] {gf.stem}: {e}")
-            traceback.print_exc()
-            n_err += 1
+        res = process_survey(gen, claims_dir, out_dir, cfg, client)
+        if res:
+            all_results.append(res)
 
     if all_results:
         write_summary(all_results, out_dir)
 
-    print(f"\n[expert] done — ok={len(all_results)}  err={n_err}")
+    print(f"\n[expert] done — ok={len(all_results)}")
 
 
 if __name__ == "__main__":

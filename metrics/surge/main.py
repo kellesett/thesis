@@ -14,13 +14,14 @@ where judge_slug is the judge_model name sanitized for use in a path.
 Usage (inside Docker):
     python metrics/surge/main.py --dataset SurGE --model perplexity_dr
 """
+import argparse
 import csv
 import json
+import logging
 import re
 import sys
 import time
 import traceback
-import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,6 +29,8 @@ import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 ROOT   = Path(__file__).parent.parent.parent
 CONFIG = Path(__file__).parent / "config.yaml"
@@ -44,6 +47,14 @@ def _slug(text: str) -> str:
 
 
 def load_registry(registry_path: Path) -> dict[str, str]:
+    """Load dataset registry from YAML.
+
+    Args:
+        registry_path: Path to registry.yaml file.
+
+    Returns:
+        Dict mapping dataset_id to dataset_path.
+    """
     with open(registry_path, encoding="utf-8") as f:
         reg = yaml.safe_load(f)
     return {entry["id"]: entry["path"] for entry in reg["datasets"]}
@@ -57,11 +68,22 @@ class RunLogger:
     """
 
     def __init__(self, path: Path, echo: bool = False) -> None:
+        """Initialize the logger.
+
+        Args:
+            path: Path to log file.
+            echo: Whether to also print messages to stdout.
+        """
         self._path = path
         self._echo = echo
         self._f    = open(path, "a", encoding="utf-8", buffering=1)  # line-buffered
 
     def __call__(self, message: str) -> None:
+        """Log a message with timestamp.
+
+        Args:
+            message: Message text to log.
+        """
         ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {message}\n"
         self._f.write(line)
@@ -69,16 +91,25 @@ class RunLogger:
             print(line, end="")
 
     def close(self) -> None:
+        """Close the log file."""
         self._f.close()
 
     def __enter__(self) -> "RunLogger":
+        """Enter context manager."""
         return self
 
     def __exit__(self, *_) -> None:
+        """Exit context manager."""
         self.close()
 
 
 def main() -> None:
+    """Run SurGE evaluation over all generations.
+
+    Loads generation JSON files, evaluates with SurGEEvaluator, and saves
+    per-survey scores + judge logs. Supports resume to skip already-scored
+    surveys.
+    """
     parser = argparse.ArgumentParser(description="Evaluate generations with SurGE metrics")
     parser.add_argument("--dataset", required=True, help="Dataset id (e.g. SurGE)")
     parser.add_argument("--model",   required=True, help="Model id (e.g. perplexity_dr)")
@@ -172,9 +203,12 @@ def main() -> None:
 
         def flush_fn(path=log_file, log_ref=judge_log_ref):
             if log_ref:
-                path.write_text(
-                    json.dumps(log_ref, ensure_ascii=False, indent=2), encoding="utf-8"
-                )
+                try:
+                    path.write_text(
+                        json.dumps(log_ref, ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
+                except Exception as e:
+                    logger.exception(f"Failed to write judge log for {gid}")
 
         scores = {}
         t0 = time.time()
@@ -187,6 +221,7 @@ def main() -> None:
             log(f"FAIL survey {gid}: judge exhausted retries — {e_}")
         except Exception as e_:
             print(f"  [ERR]  {e_}")
+            logger.exception(f"Error evaluating survey {gid}")
             log(f"ERROR survey {gid}:\n{traceback.format_exc()}")
 
         duration = round(time.time() - t0, 1)

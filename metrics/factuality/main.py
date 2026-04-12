@@ -25,11 +25,11 @@ Usage (inside Docker):
 import argparse
 import csv
 import json
+import logging
 import os
 import re
 import sys
 import time
-import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,26 +37,17 @@ import ijson
 import yaml
 from dotenv import load_dotenv
 from openai import OpenAI
+from tqdm import tqdm
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 ROOT   = Path(__file__).parent.parent.parent
 CONFIG = Path(__file__).parent / "config.yaml"
 sys.path.insert(0, str(ROOT))
 
-
-# ── Config & client ───────────────────────────────────────────────────────────
-
-def load_config() -> dict:
-    with open(CONFIG) as f:
-        return yaml.safe_load(f)
-
-
-def make_client(cfg: dict) -> OpenAI:
-    api_key = os.environ.get(cfg["judge_api_key_env"], "")
-    if not api_key:
-        raise RuntimeError(f"API key not set: env var '{cfg['judge_api_key_env']}'")
-    return OpenAI(api_key=api_key, base_url=cfg["judge_base_url"])
+from metrics.utils import make_client, load_config
 
 
 # ── Claimify cache guard ──────────────────────────────────────────────────────
@@ -148,6 +139,18 @@ def classify_claim(
     model: str,
     max_retries: int,
 ) -> dict:
+    """Classify a claim into one of four categories (A/B/C/D).
+
+    Args:
+        claim: Atomic claim text.
+        source_context: Paper abstract or source context.
+        client: OpenAI client instance.
+        model: Judge model name.
+        max_retries: Maximum retry attempts for API calls.
+
+    Returns:
+        Dict with "category" (A/B/C/D), "confidence", and optional "error".
+    """
     prompt = _CATEGORY_PROMPT.format(
         claim=claim[:600],
         source_context=source_context[:800] if source_context else "Not available",
@@ -162,7 +165,15 @@ def classify_claim(
                 ],
                 temperature=0,
             )
-            raw = resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content
+            if content is None:
+                print(f"[ERROR] OpenRouter None content (finish_reason={resp.choices[0].finish_reason}).\n"
+                      f"Full response: {resp}", file=sys.stderr)
+                raise RuntimeError(
+                    f"OpenRouter returned None content "
+                    f"(finish_reason={resp.choices[0].finish_reason})."
+                )
+            raw = content.strip()
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
             parsed = json.loads(raw)
@@ -186,9 +197,17 @@ def compute_support_batch(
     alignscore_model,
     threshold: float,
 ) -> list[bool]:
-    """
-    Returns list of booleans: Support(a, e_a) = 1 if AlignScore ≥ threshold.
-    Pairs with no context are treated as unsupported.
+    """Verify citation support for claims using AlignScore.
+
+    Args:
+        claims: List of claim texts.
+        contexts: Parallel list of source contexts (abstracts).
+        alignscore_model: Initialized AlignScore model.
+        threshold: AlignScore threshold for "supported" label.
+
+    Returns:
+        List of booleans: True if Support(claim, context) ≥ threshold, False otherwise.
+        Pairs with no context are treated as unsupported.
     """
     if not claims:
         return []
@@ -245,6 +264,20 @@ def process_survey(
     alignscore_model,
     corpus_index: dict,
 ) -> dict | None:
+    """Evaluate factuality for one survey.
+
+    Args:
+        gen: Generation dict with success, text, query, etc.
+        claims_dir: Path to pre-computed Claimify claims cache.
+        out_path: Output directory for scores.
+        cfg: Config dict with judge_model, thresholds, etc.
+        client: OpenAI client instance.
+        alignscore_model: Initialized AlignScore model.
+        corpus_index: Mapping of paper_id to abstract.
+
+    Returns:
+        Score dict with citation correctness per category, or None on skip.
+    """
     survey_id = gen["id"]
     out_file  = out_path / f"{survey_id}.json"
 
@@ -280,17 +313,18 @@ def process_survey(
     max_retries = cfg.get("max_retries", 3)
 
     # ── Step 1: Classify each claim as A/B/C/D ─────────────────────────────
-    source_ctx = get_source_context({}, gen, corpus_index)
     categorized: list[dict] = []
-    for c in claims:
+    for c in tqdm(claims, desc="  classifying", unit="claim", leave=True):
+        # Per-claim source context: use claim record for more precise lookup
+        source_ctx = get_source_context(c, gen, corpus_index)
         cat_result = classify_claim(
             c["claim"], source_ctx, client, cfg["judge_model"], max_retries
         )
-        categorized.append({**c, **cat_result})
+        categorized.append({**c, **cat_result, "_source_ctx": source_ctx})
 
     # ── Step 2: AlignScore support verification ────────────────────────────
     claim_texts = [c["claim"] for c in categorized]
-    contexts    = [source_ctx] * len(claim_texts)  # shared context per survey
+    contexts    = [c.get("_source_ctx", "") for c in categorized]
     threshold   = cfg.get("alignscore_threshold", 0.5)
 
     supported = compute_support_batch(claim_texts, contexts, alignscore_model, threshold)
@@ -373,7 +407,7 @@ def main() -> None:
     parser.add_argument("--model",   required=True)
     args = parser.parse_args()
 
-    cfg    = load_config()
+    cfg    = load_config(CONFIG)
     client = make_client(cfg)
 
     claims_dir = resolve_claims_dir(args.dataset, args.model)
@@ -397,30 +431,21 @@ def main() -> None:
     print(f"\n[factuality] {args.dataset} / {args.model}")
     print(f"             {len(gen_files)} surveys → {out_dir}\n")
 
-    all_results, n_err = [], 0
+    all_results = []
     for gf in gen_files:
-        try:
-            with open(gf) as f:
-                gen = json.load(f)
-        except Exception as e:
-            print(f"  [ERROR] reading {gf.name}: {e}")
-            n_err += 1
-            continue
+        with open(gf) as f:
+            gen = json.load(f)
 
-        try:
-            res = process_survey(
-                gen, claims_dir, out_dir, cfg, client, alignscore_model, corpus_index
-            )
-            if res:
-                all_results.append(res)
-        except Exception as e:
-            print(f"  [ERROR] {gf.stem}: {e}")
-            traceback.print_exc()
-            n_err += 1
+        res = process_survey(
+            gen, claims_dir, out_dir, cfg, client, alignscore_model, corpus_index
+        )
+        if res:
+            all_results.append(res)
 
     if all_results:
         write_summary(all_results, out_dir)
 
+    n_err = len(gen_files) - len(all_results)
     print(f"\n[factuality] done — ok={len(all_results)}  err={n_err}")
 
 

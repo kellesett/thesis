@@ -37,11 +37,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(ROOT))
@@ -51,8 +54,16 @@ from src.datasets import load_dataset as load_dataset_cls
 
 class BaseModel(ABC):
 
-    def __init__(self, model_dir: Path) -> None:
+    def __init__(self, model_dir: Path, fail_fast: bool = True) -> None:
+        """
+        Initialize base model.
+
+        Args:
+            model_dir: Path to model directory containing config.yaml
+            fail_fast: If True, exit on first generation failure; if False, log and continue
+        """
         self.model_dir = model_dir
+        self.fail_fast = fail_fast
         config_path = model_dir / "config.yaml"
         with open(config_path, encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
@@ -67,8 +78,14 @@ class BaseModel(ABC):
         """
         Generate a survey for one dataset instance.
 
-        Must return:
-            {"text": str, "success": bool, "meta": {references, latency_sec, error, ...}}
+        Args:
+            instance: Dataset instance with id, query, and optionally reference fields
+
+        Returns:
+            Dict with keys:
+            - text: Generated survey text (str)
+            - success: Whether generation succeeded (bool)
+            - meta: Dict with references, latency_sec, error, and model-specific keys
         """
 
     # ── Shared helpers ────────────────────────────────────────────────────────
@@ -140,12 +157,12 @@ class BaseModel(ABC):
                 try:
                     existing = json.loads(out_file.read_text(encoding="utf-8"))
                     if existing.get("success") and existing.get("text"):
-                        print(f"  [SKIP] {instance.id}")
+                        logger.info(f"[SKIP] {instance.id}")
                         continue
                 except Exception:
                     pass
 
-            print(f"  [GEN]  {instance.id} | {instance.query[:70]}")
+            logger.info(f"[GEN]  {instance.id} | {instance.query[:70]}")
 
             result = self.generate(instance)
 
@@ -175,9 +192,12 @@ class BaseModel(ABC):
                 parts.append(f"refs={len(meta['references'])}")
             if meta.get("error"):
                 parts.append(f"error={str(meta['error'])[:80]}")
-            print(" ".join(parts))
+            logger.info(" ".join(parts))
 
             if not result["success"]:
-                sys.exit(1)
+                if self.fail_fast:
+                    sys.exit(1)
+                else:
+                    logger.warning(f"Generation failed for {instance.id}, continuing")
 
-        print(f"\nGenerations saved to: {self.out_dir}")
+        logger.info(f"Generations saved to: {self.out_dir}")

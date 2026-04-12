@@ -33,6 +33,7 @@ Usage (inside Docker):
 import argparse
 import csv
 import json
+import logging
 import re
 import sys
 import time
@@ -48,6 +49,8 @@ import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 ROOT   = Path(__file__).parent.parent.parent
 CONFIG = Path(__file__).parent / "config.yaml"
@@ -159,7 +162,7 @@ def _fetch_arxiv_batch(
     return {}
 
 
-ARXIV_BATCH_SIZE = 10  # arxiv API игнорирует max_results для больших id_list
+ARXIV_BATCH_SIZE = 10  # arxiv API ignores max_results for large id_lists
 
 
 def fetch_arxiv_metadata(
@@ -167,11 +170,11 @@ def fetch_arxiv_metadata(
     max_retries: int = 2,
     retry_delays: list[int] = None,
 ) -> dict[str, tuple[str, str]]:
-    """
-    Fetch {arxiv_id: (title, abstract)} from arxiv export API.
+    """Fetch {arxiv_id: (title, abstract)} from arxiv export API.
 
-    Разбивает запрос на батчи по ARXIV_BATCH_SIZE — arxiv API ненадёжно
-    обрабатывает max_results при большом id_list и молча возвращает только 10.
+    Splits request into batches by ARXIV_BATCH_SIZE because arxiv API
+    unreliably handles max_results with large id_list and silently returns
+    only 10 results instead of respecting the requested count.
     """
     if retry_delays is None:
         retry_delays = [5, 10]
@@ -185,7 +188,7 @@ def fetch_arxiv_metadata(
         batch_results = _fetch_arxiv_batch(batch, max_retries, retry_delays)
         results.update(batch_results)
         if i + ARXIV_BATCH_SIZE < len(arxiv_ids):
-            time.sleep(1)  # вежливая пауза между батчами
+            time.sleep(1)  # courteous delay between batches
 
     return results
 
@@ -193,7 +196,16 @@ def fetch_arxiv_metadata(
 # ── SPECTER2 embedding ────────────────────────────────────────────────────────
 
 def load_specter2(model_name: str, adapter_name: str, device: str):
-    """Load SPECTER2 base model + proximity adapter."""
+    """Load SPECTER2 base model + proximity adapter.
+
+    Args:
+        model_name: HuggingFace model ID for base SPECTER2 model.
+        adapter_name: HuggingFace adapter name for proximity task.
+        device: torch device (e.g., "cuda" or "cpu").
+
+    Returns:
+        Tuple of (tokenizer, model) ready for embedding text.
+    """
     from transformers import AutoTokenizer
     from adapters import AutoAdapterModel
 
@@ -218,11 +230,19 @@ def embed_texts(
     device: str,
     batch_size: int = 16,
 ) -> np.ndarray:
-    """
-    Embed a list of strings with SPECTER2.
+    """Embed a list of strings with SPECTER2.
 
     Expected format: "Title [SEP] Abstract"
-    Returns float32 array of shape (N, 768).
+
+    Args:
+        texts: List of text strings to embed.
+        tokenizer: Tokenizer instance from load_specter2.
+        model: Model instance from load_specter2.
+        device: torch device (e.g., "cuda" or "cpu").
+        batch_size: Processing batch size.
+
+    Returns:
+        Float32 array of shape (N, 768) with embeddings.
     """
     import torch
 
@@ -452,8 +472,23 @@ def evaluate_survey(
     cfg: dict,
     scores_dir: Path,
 ) -> dict:
-    """
-    Full pipeline for one survey.  Returns score dict.
+    """Full evaluation pipeline for one survey.
+
+    Extracts citations from generation, fetches arxiv metadata, embeds both
+    generated and reference citations, computes diversity metrics.
+
+    Args:
+        generation: Generation dict with references and metadata.
+        ref_all_cites: Reference doc_ids from ground truth survey.
+        corpus_abstracts: Mapping of doc_id to (title, abstract).
+        tokenizer: SPECTER2 tokenizer.
+        model: SPECTER2 model.
+        device: torch device.
+        cfg: Config dict with arxiv/embedding settings.
+        scores_dir: Output directory for PCA plots.
+
+    Returns:
+        Score dict with citation_diversity, distribution_shift, and metadata.
     """
     sep = tokenizer.sep_token or "[SEP]"
 
@@ -608,7 +643,7 @@ def main() -> None:
     if needed_doc_ids and corpus_path.exists():
         corpus_abstracts = load_corpus_abstracts(corpus_path, needed_doc_ids)
     elif not corpus_path.exists():
-        print(f"  [WARN] corpus not found at {corpus_path} — distribution_shift will be None")
+        logger.warning(f"Corpus not found at {corpus_path} — distribution_shift will be None")
 
     # ── Load SPECTER2 ─────────────────────────────────────────────────────────
     import torch

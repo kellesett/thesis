@@ -1,10 +1,12 @@
 metric_id: expert
 
 # ── LLM судья (через OpenRouter) ─────────────────────────────────────────────
-judge_model:       openai/gpt-4o-mini
+judge_model:       meta-llama/llama-3.3-70b-instruct:nitro
 judge_base_url:    https://openrouter.ai/api/v1
 judge_api_key_env: OPENROUTER_API_KEY
-judge_id:          gpt4o_mini
+# judge_provider:    groq          # опционально — явно указать провайдера на OpenRouter
+judge_disable_reasoning: true  # отключить reasoning/thinking токены (для моделей типа Qwen3, DeepSeek-R1)
+judge_id:          llama-3.3
 judge_comment:     run1
 
 # ── Параметры ─────────────────────────────────────────────────────────────────

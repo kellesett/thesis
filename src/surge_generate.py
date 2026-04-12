@@ -20,9 +20,12 @@ Usage:
 import os
 import json
 import argparse
+import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
@@ -35,18 +38,29 @@ def load_surge_topics(surveys_path: Path, n: int) -> list[dict]:
     """
     Load the first n surveys from SurGE's surveys.json as generation topics.
     Each entry contains survey_id, topic_id (str), and topic (survey_title).
+
+    Args:
+        surveys_path: Path to surveys.json file
+        n: Number of surveys to load
+
+    Returns:
+        List of dicts with topic_id, topic fields
     """
     with open(surveys_path, encoding="utf-8") as f:
         surveys = json.load(f)
 
     topics = []
     for s in surveys[:n]:
+        # Validate survey data
+        if not s.get("survey_id") or not s.get("survey_title"):
+            logger.warning("Survey missing required fields, skipping")
+            continue
         topics.append({
             "topic_id": str(s["survey_id"]),
             "topic":    s["survey_title"],
         })
 
-    print(f"Loaded {len(topics)} topics from {surveys_path}")
+    logger.info(f"Loaded {len(topics)} topics from {surveys_path}")
     return topics
 
 
@@ -91,32 +105,33 @@ def main() -> None:
         if args.resume and json_file.exists():
             try:
                 data = json.loads(json_file.read_text(encoding="utf-8"))
-                if data.get("generated_text"):
-                    print(f"  [SKIP] {stem}")
+                # Check that generated_text is not just present but also non-empty
+                if data.get("generated_text") and len(data.get("generated_text", "")) > 0:
+                    logger.info(f"[SKIP] {stem}")
                     continue
             except Exception:
                 pass
 
-        print(f"  [GEN]  {stem} | {t['topic'][:60]}")
+        logger.info(f"[GEN]  {stem} | {t['topic'][:60]}")
         result = run_system(client, system_id, config, t["topic_id"], t["topic"])
 
         # Save full result as JSON regardless of success (preserves error info)
         with open(json_file, "w", encoding="utf-8") as f:
             json.dump(result.to_dict(), f, ensure_ascii=False, indent=2)
 
-        if result.success:
+        if result.success and result.generated_text:
             # .md is consumed by SurGE's markdownParser — skip on failed generation
             md_file.write_text(result.generated_text, encoding="utf-8")
 
         status = "OK" if result.success else "FAIL"
-        print(
-            f"    [{status}] {result.word_count} words | "
+        logger.info(
+            f"[{status}] {result.word_count} words | "
             f"${result.cost_usd:.3f} | {result.latency_sec:.1f}s"
         )
         if result.error:
-            print(f"    Error: {result.error}")
+            logger.error(f"Error: {result.error}")
 
-    print(f"\nGenerations saved to: {out_dir}")
+    logger.info(f"Generations saved to: {out_dir}")
 
 
 if __name__ == "__main__":

@@ -4,26 +4,27 @@
 
 .PHONY: help setup setup-sf base \
         generate evaluate \
-        generate-sf generate-sf-cpu generate-sgi \
-        convert-autosurvey \
-        evaluate-diversity \
+        convert-autosurvey convert-reference \
         viewer enrich \
         download inspect models models-ping \
         sfdb sfdb-check sfmodel \
         download-metric-models clean
 
-PYTHON     = .venv/bin/python
-DATASET   ?= SurGE
-MODEL     ?= perplexity_dr
-METRIC    ?= surge
+PYTHON  = .venv/bin/python
+DATASET ?= SurGE
+MODEL   ?= perplexity_dr
+METRIC  ?= surge
+GPU     ?= 0
 
+# Единые volumes для всех контейнеров
 VOLUMES = --env-file .env \
+          -v "$(PWD)/tmp:/tmp" \
+          -v "$(PWD)/repos:/app/repos" \
+          -v "$(PWD)/datasets:/app/datasets" \
           -v "$(PWD)/results:/app/results" \
-          -v "$(PWD)/datasets:/app/datasets"
-
-# Метрики групп A/B/C дополнительно монтируют локальные модели
-METRIC_VOLUMES = $(VOLUMES) \
           -v "$(PWD)/models_cache:/app/models_cache"
+
+_GPU_FLAG = $(if $(filter 1,$(GPU)),--gpus all,)
 
 
 ## Справка
@@ -38,19 +39,19 @@ help:
 	@echo "  make base NO_CACHE=1   — пересобрать thesis-base без кэша"
 	@echo ""
 	@echo "  [Генерация]"
-	@echo "  make generate           [DATASET=SurGE] [MODEL=perplexity_dr]"
-	@echo "  make generate-sf        [DATASET=SurGE]  — SurveyForge (GPU)"
-	@echo "  make generate-sf-cpu    [DATASET=SurGE]  — SurveyForge (CPU, debug)"
-	@echo "  make generate-sgi       [DATASET=SurGE]  — SurveyGen-I (CPU)"
-	@echo "  make convert-autosurvey [DATASET=SurGE]  — конвертировать baseline AutoSurvey"
+	@echo "  make generate MODEL=perplexity_dr  [DATASET=SurGE]"
+	@echo "  make generate MODEL=surveyforge    [DATASET=SurGE] [GPU=1]"
+	@echo "  make generate MODEL=surveygen_i   [DATASET=SurGE]"
+	@echo "  make convert-autosurvey           [DATASET=SurGE]  — baseline (локально, без Docker)"
 	@echo ""
 	@echo "  [Оценка]"
 	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=surge"
-	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=claimify     # кэш claims (нужен для factuality + expert)"
-	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=structural   # A.1 M_contr, A.2 M_term, A.3 M_rep"
-	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=factuality   # B.1 CitCorrect_k"
-	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=expert       # C.1-C.4 M_crit/comp/open/mod"
-	@echo "  make evaluate-diversity [DATASET=SurGE] [MODEL=perplexity_dr]"
+	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=claimify     # извлечение claims (3-stage, нужен для factuality + expert)"
+	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=veriscore   # извлечение claims (альтернатива claimify, быстрее)"
+	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=diversity   # семантическое разнообразие"
+	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=structural  # A.1 M_contr, A.2 M_term, A.3 M_rep"
+	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=factuality  # B.1 CitCorrect_k"
+	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=expert      # C.1-C.4 M_crit/comp/open/mod"
 	@echo ""
 	@echo "  [Данные / Модели]"
 	@echo "  make download / sfdb / sfdb-check / sfmodel"
@@ -81,31 +82,10 @@ base:
 ## ── Генерация ────────────────────────────────────────────────────────────────
 
 generate: base
+	mkdir -p tmp models_cache
 	docker build -f models/$(MODEL)/Dockerfile -t thesis-gen-$(MODEL) .
-	docker run --rm $(VOLUMES) thesis-gen-$(MODEL) \
+	docker run --rm $(_GPU_FLAG) $(VOLUMES) thesis-gen-$(MODEL) \
 		python models/$(MODEL)/main.py --dataset $(DATASET)
-
-## ── SurveyForge (GPU) ────────────────────────────────────────────────────────
-
-SF_VOLUMES = --env-file .env \
-             -v "$(PWD)/datasets:/app/datasets" \
-             -v "$(PWD)/results:/app/results"
-
-generate-sf:
-	docker build -f models/surveyforge/Dockerfile -t thesis-gen-surveyforge .
-	docker run --rm --gpus all $(SF_VOLUMES) thesis-gen-surveyforge --dataset $(DATASET)
-
-# CPU-вариант (медленно, только для отладки)
-generate-sf-cpu:
-	docker build -f models/surveyforge/Dockerfile -t thesis-gen-surveyforge .
-	docker run --rm $(SF_VOLUMES) thesis-gen-surveyforge --dataset $(DATASET)
-
-## ── SurveyGen-I (CPU) ────────────────────────────────────────────────────────
-
-generate-sgi: base
-	docker build -f models/surveygen_i/Dockerfile -t thesis-gen-surveygen_i .
-	docker run --rm $(VOLUMES) thesis-gen-surveygen_i \
-		python models/surveygen_i/main.py --dataset $(DATASET)
 
 ## ── AutoSurvey (конвертация baseline) ───────────────────────────────────────
 
@@ -113,29 +93,20 @@ generate-sgi: base
 convert-autosurvey:
 	$(PYTHON) models/autosurvey/main.py --dataset $(DATASET)
 
-## ── Оценка (универсальный target) ───────────────────────────────────────────
-# Метрики surge/diversity используют VOLUMES (без models_cache).
-# Метрики claimify/structural/factuality/expert используют METRIC_VOLUMES.
-_METRIC_NEEDS_MODELS = claimify structural factuality expert
-_USE_METRIC_VOLUMES  = $(filter $(METRIC),$(_METRIC_NEEDS_MODELS))
+convert-reference:
+	$(PYTHON) scripts/convert_surge_reference.py
+
+## ── Оценка ───────────────────────────────────────────────────────────────────
+# Промежуточные кэши всех метрик живут в ./tmp/, которая монтируется в /tmp.
+# Структура внутри: /tmp/claimify/<run_id>/, /tmp/veriscore/<run_id>/, ...
+# Чтобы кэшировать HuggingFace-модели (diversity/structural/...) добавь:
+#   -v "$(HOME)/.cache/huggingface:/root/.cache/huggingface"
 
 evaluate: base
+	mkdir -p tmp models_cache
 	docker build -f metrics/$(METRIC)/Dockerfile -t thesis-eval-$(METRIC) .
-	$(if $(_USE_METRIC_VOLUMES), \
-		docker run --rm $(METRIC_VOLUMES) thesis-eval-$(METRIC) \
-			python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL), \
-		docker run --rm $(VOLUMES) thesis-eval-$(METRIC) \
-			python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL))
-
-## ── Оценка (diversity) ───────────────────────────────────────────────────────
-
-# Опционально: кэш HuggingFace чтобы не качать SPECTER2 каждый раз:
-#   DIVERSITY_VOLUMES += -v "$(HOME)/.cache/huggingface:/root/.cache/huggingface"
-
-evaluate-diversity:
-	docker build -f metrics/diversity/Dockerfile -t thesis-eval-diversity .
-	docker run --rm $(VOLUMES) thesis-eval-diversity \
-		--dataset $(DATASET) --model $(MODEL)
+	docker run --rm $(VOLUMES) thesis-eval-$(METRIC) \
+		python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL)
 
 ## ── Viewer ───────────────────────────────────────────────────────────────────
 
@@ -184,4 +155,5 @@ clean:
 	    thesis-gen-surveygen_i \
 	    thesis-eval-surge thesis-eval-diversity \
 	    thesis-eval-claimify thesis-eval-structural \
-	    thesis-eval-factuality thesis-eval-expert 2>/dev/null || true
+	    thesis-eval-factuality thesis-eval-expert \
+	    thesis-eval-veriscore 2>/dev/null || true

@@ -22,5 +22,4 @@ COPY metrics/diversity/  ./metrics/diversity/
 
 ENV TRANSFORMERS_CACHE="/root/.cache/huggingface"
 
-ENTRYPOINT ["python", "metrics/diversity/main.py"]
-CMD ["--dataset", "SurGE", "--model", "perplexity_dr"]
+CMD ["python", "metrics/diversity/main.py", "--dataset", "SurGE", "--model", "perplexity_dr"]

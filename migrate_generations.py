@@ -12,7 +12,11 @@ New format:
 """
 
 import json
+import logging
 import pathlib
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 SRC = pathlib.Path("results/surge_perplexity_surge/generations")
 DST = pathlib.Path("results/generations/SurGE_perplexity_dr")
@@ -20,7 +24,26 @@ DST = pathlib.Path("results/generations/SurGE_perplexity_dr")
 DATASET_ID = "SurGE"
 MODEL_ID   = "perplexity_dr"
 
-def migrate(old: dict) -> dict:
+def migrate(old: dict) -> dict | None:
+    """Migrate old generation format to new unified format.
+
+    Args:
+        old: Generation in old format.
+
+    Returns:
+        Generation in new format, or None if required fields are missing.
+
+    Raises:
+        KeyError: If required fields (topic_id, topic) are missing.
+    """
+    # Validate required fields
+    if "topic_id" not in old:
+        logger.warning(f"Skipping record with missing topic_id: {old.get('system_id', 'unknown')}")
+        return None
+    if "topic" not in old:
+        logger.warning(f"Skipping record {old.get('topic_id', 'unknown')} with missing topic")
+        return None
+
     error = old.get("error")
     return {
         "id":         old["topic_id"],
@@ -43,22 +66,43 @@ def migrate(old: dict) -> dict:
         },
     }
 
-def main():
+def main() -> None:
+    """Migrate old generation files to new unified format with validation and idempotency."""
     files = sorted(SRC.glob("*.json"))
     if not files:
-        print(f"No files found in {SRC}")
+        logger.info(f"No files found in {SRC}")
         return
 
     DST.mkdir(parents=True, exist_ok=True)
 
-    for src_path in files:
-        old = json.loads(src_path.read_text())
-        new = migrate(old)
-        dst_path = DST / f"{new['id']}.json"
-        dst_path.write_text(json.dumps(new, ensure_ascii=False, indent=2))
-        print(f"  {src_path.name}  →  {dst_path}")
+    n_migrated = 0
+    n_skipped = 0
 
-    print(f"\nDone: {len(files)} file(s) migrated to {DST}")
+    for src_path in files:
+        try:
+            old = json.loads(src_path.read_text())
+            new = migrate(old)
+
+            if new is None:
+                n_skipped += 1
+                continue
+
+            dst_path = DST / f"{new['id']}.json"
+
+            # Idempotency check: warn if destination already exists
+            if dst_path.exists():
+                logger.warning(f"  {src_path.name}  →  {dst_path} (already exists, skipping)")
+                n_skipped += 1
+                continue
+
+            dst_path.write_text(json.dumps(new, ensure_ascii=False, indent=2))
+            logger.info(f"  {src_path.name}  →  {dst_path}")
+            n_migrated += 1
+        except Exception as e:
+            logger.error(f"Error migrating {src_path.name}: {e}", exc_info=True)
+            n_skipped += 1
+
+    logger.info(f"\nDone: {n_migrated} file(s) migrated, {n_skipped} skipped, output to {DST}")
 
 if __name__ == "__main__":
     main()

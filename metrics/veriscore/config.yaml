@@ -1,17 +1,10 @@
 metric_id: veriscore
 
-# LLM для экстракции и верификации (через OpenRouter)
-judge_model:       openai/gpt-4o-mini
+# LLM для извлечения атомарных claims (через OpenRouter)
+judge_model:       meta-llama/llama-3.3-70b-instruct:nitro
 judge_base_url:    https://openrouter.ai/api/v1
 judge_api_key_env: OPENROUTER_API_KEY
-
-# ── Serper Google Search ──────────────────────────────────────────────────────
-serper_api_key_env: SERPER_KEY_PRIVATE
-search_res_num:     5        # top-k search results per claim
-
-# ── VeriScore label schema ────────────────────────────────────────────────────
-# 3 = supported / contradicted / inconclusive  (default, matches paper)
-# 2 = supported / unsupported
-label_n: 3
+judge_disable_reasoning: true
+judge_max_tokens:         1000
 
 resume: true               # пропускать уже обработанные обзоры

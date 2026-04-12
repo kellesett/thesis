@@ -31,6 +31,7 @@ import json
 import csv
 import time
 import argparse
+import logging
 from pathlib import Path
 
 from openai import OpenAI
@@ -38,73 +39,27 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 ROOT      = Path(__file__).parent.parent
 SURGE_SRC = ROOT / "repos" / "SurGE" / "src"
 
-
-class JudgeFailedError(RuntimeError):
-    """Raised when the LLM judge exhausts all retries for a single paragraph."""
-
-
-# ── SurGE path setup ──────────────────────────────────────────────────────────
-
-def _add_surge_to_path() -> None:
-    """Insert SurGE's src/ into sys.path so its modules can be imported."""
-    path_str = str(SURGE_SRC)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
+# Import JudgeFailedError from exceptions module
+sys.path.insert(0, str(ROOT / "src"))
+from exceptions import JudgeFailedError
 
 
-# ── Judge client ──────────────────────────────────────────────────────────────
-
-def load_judge_client(judges_path: Path) -> tuple[OpenAI, str]:
-    """
-    Parse judges.json and create an OpenAI-compatible client for the first entry.
-    Supports both 'url' (literal base URL) and 'url_env' (env var name) fields.
-    Returns (client, model_name).
-    """
-    judges = json.loads(judges_path.read_text(encoding="utf-8"))
-    j = judges[0]
-
-    if "url" in j:
-        base_url = j["url"]
-    elif "url_env" in j:
-        base_url = os.getenv(j["url_env"])
-        if not base_url:
-            raise SystemExit(f"Env var '{j['url_env']}' is not set")
-    else:
-        base_url = None
-
-    api_key = os.getenv(j["api_key_env"])
-    if not api_key:
-        raise SystemExit(f"Env var '{j['api_key_env']}' is not set")
-
-    return OpenAI(base_url=base_url, api_key=api_key), j["model"]
-
-
-# ── Monkey-patch factory ──────────────────────────────────────────────────────
+# ── Monkey-patch factory (moved from surge.py to avoid duplication) ──────────────
 
 MAX_JUDGE_TRIES = 5
-MAX_RETRY_DELAY  = 32  # секунд, cap для экспоненциального backoff
+MAX_RETRY_DELAY = 32  # seconds, cap for exponential backoff
 
 
 def _make_chat_openai_patched(judge_model: str, log: list, ctx: dict, flush_fn=None):
     """
     Return a drop-in replacement for SurGE's chat_openai functions.
-
-    Uses `judge_model` instead of the hardcoded 'gpt-4o'.
-    Appends one entry to `log` per attempt (not per paragraph):
-      {metric, paragraph_idx, attempt_idx, prompt_preview, raw, score, error}
-
-    `ctx` is a mutable dict shared by the caller:
-      ctx["metric"]        — metric being evaluated (set before each metric)
-      ctx["paragraph_idx"] — which paragraph; incremented only on success
-      (no last_error — error is written directly into each log entry)
-
-    `flush_fn` is an optional callable() invoked after each log.append() so that
-    partial results are persisted to disk even if evaluation is interrupted.
-
-    Raises JudgeFailedError after MAX_JUDGE_TRIES failed attempts on one paragraph.
+    Uses judge_model instead of hardcoded gpt-4o.
+    Appends one entry to log per attempt.
     """
     def chat_openai(prompt: str, client: OpenAI, try_number: int):
         if try_number >= MAX_JUDGE_TRIES:
@@ -175,12 +130,50 @@ def _make_chat_openai_patched(judge_model: str, log: list, ctx: dict, flush_fn=N
             if flush_fn:
                 flush_fn()
             delay = min(2 ** try_number, MAX_RETRY_DELAY)
-            print(f"  [WARN] LLM judge error: {e}")
-            print(f"  [WAIT] retry in {delay}s...")
+            logger.warning(f"LLM judge error: {e}")
+            logger.info(f"Retry in {delay}s...")
             time.sleep(delay)
             return chat_openai(prompt, client, try_number + 1)
 
     return chat_openai
+
+
+# ── SurGE path setup ──────────────────────────────────────────────────────────
+
+def _add_surge_to_path() -> None:
+    """Insert SurGE's src/ into sys.path so its modules can be imported."""
+    path_str = str(SURGE_SRC)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
+
+# ── Judge client ──────────────────────────────────────────────────────────────
+
+def load_judge_client(judges_path: Path) -> tuple[OpenAI, str]:
+    """
+    Parse judges.json and create an OpenAI-compatible client for the first entry.
+    Supports both 'url' (literal base URL) and 'url_env' (env var name) fields.
+    Returns (client, model_name).
+    """
+    judges = json.loads(judges_path.read_text(encoding="utf-8"))
+    j = judges[0]
+
+    if "url" in j:
+        base_url = j["url"]
+    elif "url_env" in j:
+        base_url = os.getenv(j["url_env"])
+        if not base_url:
+            raise SystemExit(f"Env var '{j['url_env']}' is not set")
+    else:
+        base_url = None
+
+    api_key = os.getenv(j["api_key_env"])
+    if not api_key:
+        raise SystemExit(f"Env var '{j['api_key_env']}' is not set")
+
+    return OpenAI(base_url=base_url, api_key=api_key), j["model"]
+
+
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -189,7 +182,13 @@ def load_surveys_map(surveys_path: Path) -> dict[str, dict]:
     """Load surveys.json and index entries by survey_id (cast to str)."""
     with open(surveys_path, encoding="utf-8") as f:
         surveys = json.load(f)
-    return {str(s["survey_id"]): s for s in surveys}
+    surveys_map = {}
+    for s in surveys:
+        if not s.get("survey_id"):
+            logger.warning("Survey missing survey_id, skipping")
+            continue
+        surveys_map[str(s["survey_id"])] = s
+    return surveys_map
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
@@ -207,14 +206,23 @@ def evaluate_survey(
     """
     Run the requested SurGE metrics on one generated .md file.
 
-    `judge_log` is passed in from outside so it remains accessible even if an
-    exception occurs mid-evaluation (caller must not overwrite it on except).
-    Monkey-patches SurGE modules with a logging-aware chat_openai before evaluation.
+    Args:
+        md_path: Path to generated markdown file
+        target_survey: Reference survey dict
+        eval_list: List of metrics to compute
+        flag_model: Embedding model for SH-Recall
+        judge_client: OpenAI client for judge
+        judge_model: Model name for judge
+        judge_log: List to append judge log entries to
+        flush_fn: Optional callback to persist judge_log after each entry
 
-    `flush_fn` is called after each judge log entry is appended — use it to persist
-    partial results to disk so they survive an interrupted evaluation.
+    Returns:
+        Dict with metric_name: score pairs
 
-    Returns scores dict: {metric_name: score}
+    Note:
+        Monkey-patches SurGE modules with logging-aware chat_openai before evaluation.
+        judge_log is passed in from outside so it remains accessible even if an
+        exception occurs mid-evaluation.
     """
     import structureFuncs
     import informationFuncs
@@ -273,6 +281,12 @@ def main() -> None:
     parser.add_argument("--resume",          action="store_true",
                         help="Skip files that already have a scores JSON")
     args = parser.parse_args()
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
 
     eval_list  = [e.strip() for e in args.eval.split(",")]
     gen_dir    = Path(args.gen_dir)
@@ -355,11 +369,11 @@ def main() -> None:
                 judge_log, flush_fn=flush_fn,
             )
         except JudgeFailedError as e:
-            # Судья не смог оценить параграф — прекращаем оценку этого survey
-            print(f"  [FAIL] Evaluation aborted: {e}")
+            # Judge failed to evaluate paragraph — stop evaluation of this survey
+            logger.error(f"Evaluation aborted: {e}")
             scores = {}
         except Exception as e:
-            print(f"  [ERR]  {e}")
+            logger.exception(f"Error during evaluation: {e}")
             scores = {}
 
         result = {
@@ -379,7 +393,7 @@ def main() -> None:
             f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
             for k, v in scores.items()
         )
-        print(f"         {score_str}\n")
+        logger.info(f"Scores: {score_str}")
 
     if not all_results:
         print("No results to summarize.")
@@ -406,8 +420,7 @@ def main() -> None:
             writer.writerow(row)
 
     # ── Print aggregate statistics ────────────────────────────────────────────
-    print(f"\n{'─' * 60}")
-    print(f"  Results: {len(all_results)} survey(s)")
+    logger.info(f"\nResults: {len(all_results)} survey(s)")
     for key in eval_list:
         vals = [
             r["scores"][key] for r in all_results
@@ -415,10 +428,9 @@ def main() -> None:
         ]
         if vals:
             avg = sum(vals) / len(vals)
-            print(f"  {key:<20} avg={avg:.4f}  min={min(vals):.4f}  max={max(vals):.4f}")
-    print(f"{'─' * 60}")
-    print(f"  Scores → {scores_dir}")
-    print(f"  CSV    → {csv_path}")
+            logger.info(f"  {key:<20} avg={avg:.4f}  min={min(vals):.4f}  max={max(vals):.4f}")
+    logger.info(f"Scores → {scores_dir}")
+    logger.info(f"CSV    → {csv_path}")
 
 
 if __name__ == "__main__":

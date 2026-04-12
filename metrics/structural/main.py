@@ -27,6 +27,7 @@ import argparse
 import csv
 import itertools
 import json
+import logging
 import os
 import re
 import sys
@@ -42,23 +43,13 @@ from openai import OpenAI
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 ROOT   = Path(__file__).parent.parent.parent
 CONFIG = Path(__file__).parent / "config.yaml"
 sys.path.insert(0, str(ROOT))
 
-
-# ── Config & client ───────────────────────────────────────────────────────────
-
-def load_config() -> dict:
-    with open(CONFIG) as f:
-        return yaml.safe_load(f)
-
-
-def make_client(cfg: dict) -> OpenAI:
-    api_key = os.environ.get(cfg["judge_api_key_env"], "")
-    if not api_key:
-        raise RuntimeError(f"API key not set: env var '{cfg['judge_api_key_env']}'")
-    return OpenAI(api_key=api_key, base_url=cfg["judge_base_url"])
+from metrics.utils import make_client, load_config
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -184,7 +175,20 @@ def compute_m_contr(
     client: OpenAI,
     cfg: dict,
 ) -> dict:
-    """A.1: cross-section contradiction rate."""
+    """Compute cross-section contradiction rate (A.1).
+
+    Two-stage pipeline: NLI entity-filtered candidate pairs → LLM judge validation.
+
+    Args:
+        sections: List of sections with sentences.
+        ner_pipe: NER pipeline for entity extraction.
+        nli_pipe: NLI pipeline for entailment checking.
+        client: OpenAI client for LLM judge.
+        cfg: Config with thresholds and model name.
+
+    Returns:
+        Dict with m_contr (rate), n_candidates, n_confirmed.
+    """
     nli_threshold  = cfg.get("contr_nli_threshold", 0.5)
     max_candidates = cfg.get("contr_max_candidates", 200)
     model          = cfg["judge_model"]
@@ -241,7 +245,15 @@ def compute_m_contr(
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
             )
-            raw = resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content
+            if content is None:
+                print(f"[ERROR] OpenRouter None content (finish_reason={resp.choices[0].finish_reason}).\n"
+                      f"Full response: {resp}", file=sys.stderr)
+                raise RuntimeError(
+                    f"OpenRouter returned None content "
+                    f"(finish_reason={resp.choices[0].finish_reason})."
+                )
+            raw = content.strip()
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
             parsed = json.loads(raw)
@@ -291,7 +303,20 @@ def compute_m_term(
     client: OpenAI,
     cfg: dict,
 ) -> dict:
-    """A.2: terminological inconsistency rate (exploratory)."""
+    """Compute terminological inconsistency rate (A.2, exploratory).
+
+    NER → SPECTER embedding → HDBSCAN clustering → LLM judge for inconsistency.
+
+    Args:
+        sections: List of sections with sentences.
+        ner_pipe: NER pipeline for entity extraction.
+        specter_model: SPECTER sentence encoder for embeddings.
+        client: OpenAI client for LLM judge.
+        cfg: Config with similarity threshold and cluster settings.
+
+    Returns:
+        Dict with m_term (rate), n_clusters, n_inconsistent, exploratory flag.
+    """
     sim_threshold   = cfg.get("term_similarity_threshold", 0.85)
     min_cluster     = cfg.get("term_min_cluster_size", 2)
     model           = cfg["judge_model"]
@@ -368,7 +393,15 @@ def compute_m_term(
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
             )
-            raw = resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content
+            if content is None:
+                print(f"[ERROR] OpenRouter None content (finish_reason={resp.choices[0].finish_reason}).\n"
+                      f"Full response: {resp}", file=sys.stderr)
+                raise RuntimeError(
+                    f"OpenRouter returned None content "
+                    f"(finish_reason={resp.choices[0].finish_reason})."
+                )
+            raw = content.strip()
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
             parsed = json.loads(raw)
@@ -395,7 +428,19 @@ def compute_m_rep(
     nli_pipe,
     cfg: dict,
 ) -> dict:
-    """A.3: cross-section repetition rate (bi-directional NLI entailment)."""
+    """Compute cross-section repetition rate (A.3).
+
+    SPECTER embedding pre-filter → bi-directional NLI entailment check.
+
+    Args:
+        sections: List of sections with sentences.
+        specter_model: SPECTER sentence encoder for pre-filtering.
+        nli_pipe: NLI pipeline for entailment verification.
+        cfg: Config with similarity and entailment thresholds.
+
+    Returns:
+        Dict with m_rep (rate), n_total_sentences, n_candidates, n_duplicates.
+    """
     from sklearn.metrics.pairwise import cosine_similarity as cos_sim
 
     emb_threshold = cfg.get("rep_embedding_prefilter", 0.7)
@@ -492,19 +537,19 @@ def process_survey(
         contr = compute_m_contr(sections, ner_pipe, nli_pipe, client, cfg)
     except Exception as e:
         contr = {"m_contr": None, "error": str(e)}
-        traceback.print_exc()
+        logger.exception(f"Error computing m_contr for {survey_id}")
 
     try:
         term = compute_m_term(sections, ner_pipe, specter_model, client, cfg)
     except Exception as e:
         term = {"m_term": None, "error": str(e), "exploratory": True}
-        traceback.print_exc()
+        logger.exception(f"Error computing m_term for {survey_id}")
 
     try:
         rep = compute_m_rep(sections, specter_model, nli_pipe, cfg)
     except Exception as e:
         rep = {"m_rep": None, "error": str(e)}
-        traceback.print_exc()
+        logger.exception(f"Error computing m_rep for {survey_id}")
 
     result = {
         "survey_id":  survey_id,
@@ -558,7 +603,7 @@ def main() -> None:
     parser.add_argument("--model",   required=True)
     args = parser.parse_args()
 
-    cfg    = load_config()
+    cfg    = load_config(CONFIG)
     client = make_client(cfg)
 
     print("\n[structural] Loading models...")
@@ -581,29 +626,20 @@ def main() -> None:
     print(f"\n[structural] {args.dataset} / {args.model}")
     print(f"             {len(gen_files)} surveys → {out_dir}\n")
 
-    all_results, n_err = [], 0
+    all_results = []
     for gf in gen_files:
-        try:
-            with open(gf) as f:
-                gen = json.load(f)
-        except Exception as e:
-            print(f"  [ERROR] reading {gf.name}: {e}")
-            n_err += 1
-            continue
+        with open(gf) as f:
+            gen = json.load(f)
 
-        try:
-            res = process_survey(gen, out_dir, cfg, ner_pipe, nli_pipe, specter_model, client)
-            if res:
-                all_results.append(res)
-        except Exception as e:
-            print(f"  [ERROR] {gf.stem}: {e}")
-            traceback.print_exc()
-            n_err += 1
+        res = process_survey(gen, out_dir, cfg, ner_pipe, nli_pipe, specter_model, client)
+        if res:
+            all_results.append(res)
 
     if all_results:
         write_summary(all_results, out_dir)
 
     ok = len(all_results)
+    n_err = len(gen_files) - ok
     print(f"\n[structural] done — ok={ok}  err={n_err}")
 
 

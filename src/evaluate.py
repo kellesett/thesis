@@ -1,33 +1,33 @@
 """
-Оценка сгенерированных survey через LLM-as-Judge по методологии SurveyForge.
+Evaluate generated surveys using LLM-as-Judge following the SurveyForge methodology.
 
-Два режима оценки (включаются флагами):
-  --swr   Score Win Rate      — судья независимо оценивает каждый текст (0-100),
-                                победитель = у кого балл выше
-  --cwr   Comparative Win Rate — судья видит оба текста рядом и выбирает лучший напрямую
+Two evaluation modes (enabled via flags):
+  --swr   Score Win Rate      — judge independently scores each text (0-100),
+                                winner = higher score
+  --cwr   Comparative Win Rate — judge sees both texts side-by-side and chooses the better one directly
 
-Если ни один флаг не передан — ничего не считается.
+If no flag is provided — no evaluation is performed.
 
-Что оценивается:
-  --eval outline   — сравнение структуры/оглавления (быстро, дёшево)
-  --eval content   — сравнение полного текста (дорого, медленно)
-  --eval outline,content — оба
+What to evaluate:
+  --eval outline   — compare structure/outline (fast, cheap)
+  --eval content   — compare full text (expensive, slow)
+  --eval outline,content — both
 
-Конфиг судей — JSON-файл (--judges judges.json):
+Judge config — JSON file (--judges judges.json):
 [
   {
-    "name": "claude",                             # произвольное имя для логов
+    "name": "claude",                             # arbitrary name for logs
     "url": "https://openrouter.ai/api/v1",
     "model": "anthropic/claude-sonnet-4-5",
-    "api_key_env": "OPENROUTER_API_KEY",          # имя переменной из .env
-    "n": 1                                        # сколько раз звать эту модель
+    "api_key_env": "OPENROUTER_API_KEY",          # env variable name
+    "n": 1                                        # how many times to call this model
   },
   {
     "name": "gemini_flash",
     "url": "https://openrouter.ai/api/v1",
     "model": "google/gemini-2.5-flash",
     "api_key_env": "OPENROUTER_API_KEY",
-    "n": 2                                        # 2 прогона → усредняем
+    "n": 2                                        # 2 runs → average them
   },
   {
     "name": "local",
@@ -38,17 +38,17 @@
   }
 ]
 
-Примеры запуска:
-  # Score Win Rate по outline, судья — Gemini Flash
+Example usage:
+  # Score Win Rate by outline, judge is Gemini Flash
   python 03_evaluate.py --swr --eval outline --judges judges.json
 
-  # Оба метода по контенту, судья — Claude
+  # Both methods by content, judge is Claude
   python 03_evaluate.py --swr --cwr --eval content --judges judges_claude.json
 
-  # Всё сразу (дорого!)
+  # Everything at once (expensive!)
   python 03_evaluate.py --swr --cwr --eval outline,content --judges judges.json
 
-  # Resume: пропустить уже посчитанные
+  # Resume: skip already-computed pairs
   python 03_evaluate.py --swr --eval outline --judges judges.json --resume
 """
 
@@ -57,6 +57,7 @@ import json
 import re
 import time
 import argparse
+import logging
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -68,33 +69,35 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 ROOT_DIR      = Path(__file__).parent.parent
 DATASETS_DIR  = ROOT_DIR / "datasets" / "human_surveys"
 EVAL_OUT_DIR  = ROOT_DIR / "eval_results"
 
-# Максимальная длина текста передаваемого судье (в символах)
-# outline — короткий, content — обрезаем до разумного размера
+# Maximum length of text passed to judge (in characters)
+# outline — short, content — truncate to reasonable size
 MAX_OUTLINE_CHARS = 3_000
 MAX_CONTENT_CHARS = 12_000
 
 
-# ─── Конфиг судей ─────────────────────────────────────────────────────────────
+# ─── Judge config ─────────────────────────────────────────────────────────────
 
 @dataclass
 class JudgeConfig:
     name: str
     model: str
     api_key_env: str
-    n: int = 1                      # сколько раз вызывать
-    _url: Optional[str] = None      # прямой URL (поле url в JSON)
-    _url_env: Optional[str] = None  # имя env-переменной с URL (поле url_env в JSON)
+    n: int = 1                      # how many times to call
+    _url: Optional[str] = None      # direct URL (field url in JSON)
+    _url_env: Optional[str] = None  # env var name with URL (field url_env in JSON)
 
     @property
     def api_key(self) -> str:
         key = os.getenv(self.api_key_env)
         if not key:
             raise EnvironmentError(
-                f"Переменная {self.api_key_env} не задана в .env (судья '{self.name}')"
+                f"Environment variable {self.api_key_env} is not set in .env (judge '{self.name}')"
             )
         return key
 
@@ -105,10 +108,10 @@ class JudgeConfig:
             val = os.getenv(self._url_env)
             if not val:
                 raise EnvironmentError(
-                    f"Переменная {self._url_env} не задана в .env (судья '{self.name}')"
+                    f"Environment variable {self._url_env} is not set in .env (judge '{self.name}')"
                 )
             return val
-        raise ValueError(f"Судья '{self.name}': укажи 'url' или 'url_env' в judges.json")
+        raise ValueError(f"Judge '{self.name}': specify 'url' or 'url_env' in judges.json")
 
     @property
     def url(self) -> str:
@@ -309,7 +312,8 @@ def parse_score(text: str) -> Optional[int]:
     m = re.search(r"SCORE:\s*(\d+)", text, re.IGNORECASE)
     if m:
         return max(0, min(100, int(m.group(1))))
-    nums = re.findall(r"\b(\d{1,3})\b", text)
+    # Fallback: only match valid 0-10 scores to avoid matching arbitrary large numbers
+    nums = re.findall(r"\b(10|[0-9])\b", text)
     if nums:
         return max(0, min(100, int(nums[-1])))
     return None
@@ -328,7 +332,7 @@ def parse_winner(text: str) -> Optional[str]:
 
 
 def extract_outline(text: str) -> str:
-    """Извлекает заголовки секций из markdown-текста."""
+    """Extract section headers from markdown text."""
     lines = []
     for line in text.splitlines():
         s = line.strip()
@@ -344,12 +348,12 @@ def truncate(text: str, max_chars: int) -> str:
     return text[:max_chars] + f"\n\n[... truncated at {max_chars} chars ...]"
 
 
-# ─── Загрузка данных ──────────────────────────────────────────────────────────
+# ─── Data loading ──────────────────────────────────────────────────────────────
 
 def load_generated_results(topic: str, results_dir: Path) -> dict[str, dict]:
     """
-    Загружает все сгенерированные survey для данной темы из results_dir.
-    Ключ — system_id, значение — словарь из JSON-файла.
+    Load all generated surveys for a given topic from results_dir.
+    Key is system_id, value is dict from JSON file.
     """
     results = {}
     if not results_dir.exists():
@@ -369,9 +373,9 @@ def load_generated_results(topic: str, results_dir: Path) -> dict[str, dict]:
 
 def load_human_surveys(topic: str, k: int = 1) -> list[dict]:
     """
-    Загружает до k случайно выбранных human survey для темы.
-    Если доступных обзоров меньше k — берёт все.
-    Возвращает список dict'ов (может быть пустым).
+    Load up to k randomly selected human surveys for a topic.
+    If fewer surveys are available than k, take all of them.
+    Return list of dicts (may be empty).
     """
     import random
     safe = topic.replace("/", "_").replace("\\", "_").replace(" ", "_")
@@ -389,28 +393,28 @@ def load_human_surveys(topic: str, k: int = 1) -> list[dict]:
 
 
 def get_text_for_eval(survey_data: dict, eval_type: str) -> str:
-    """Возвращает нужный кусок текста в зависимости от типа оценки."""
+    """Return the appropriate text snippet based on evaluation type."""
     text = survey_data.get("text", "") or survey_data.get("generated_text", "")
     outline = survey_data.get("outline", "")
 
     if eval_type == "outline":
         if outline:
             return truncate(outline, MAX_OUTLINE_CHARS)
-        # Если нет готового outline — извлекаем из текста
+        # If no ready-made outline, extract from text
         return extract_outline(text)
 
     # content
     return truncate(text, MAX_CONTENT_CHARS)
 
 
-# ─── Оценка ───────────────────────────────────────────────────────────────────
+# ─── Evaluation ───────────────────────────────────────────────────────────────────
 
 def run_swr(judges: list[JudgeConfig], topic: str,
             gen_text: str, human_texts: list[str],
             eval_type: str, system_id: str) -> SWRPairResult:
     """
-    Score Win Rate: оцениваем generated и каждый из human-референсов независимо.
-    Скор generated считается один раз, human_avg усредняется по всем k референсам.
+    Score Win Rate: evaluate generated and each human reference independently.
+    Generated score is computed once; human_avg is averaged over all k references.
     """
     result = SWRPairResult(system_id=system_id, topic=topic, eval_type=eval_type)
     desc = EVAL_TYPE_DESCS[eval_type]
@@ -468,9 +472,9 @@ def run_cwr(judges: list[JudgeConfig], topic: str,
             gen_text: str, human_texts: list[str],
             eval_type: str, system_id: str) -> PairResult:
     """
-    Comparative Win Rate: судья сравнивает generated vs каждый human-референс.
+    Comparative Win Rate: judge compares generated vs each human reference.
     Generated = Survey A, Human = Survey B.
-    Победитель определяется большинством голосов по всем парам и всем судьям.
+    Winner is determined by majority vote across all pairs and all judges.
     """
     result = PairResult(system_id=system_id, topic=topic,
                         eval_type=eval_type, method="cwr")
@@ -502,12 +506,12 @@ def run_cwr(judges: list[JudgeConfig], topic: str,
     return result
 
 
-# ─── Win Rate агрегация ───────────────────────────────────────────────────────
+# ─── Win rate aggregation ───────────────────────────────────────────────────────
 
 def compute_win_rate(verdicts: list[str]) -> dict:
     """
-    Win rate по формуле SurveyForge: (wins + 0.5 * ties) / total
-    Возвращает также wins, ties, loses, total.
+    Win rate according to SurveyForge formula: (wins + 0.5 * ties) / total
+    Also returns wins, ties, loses, total.
     """
     wins  = verdicts.count("win")
     loses = verdicts.count("lose")
@@ -518,67 +522,67 @@ def compute_win_rate(verdicts: list[str]) -> dict:
             "loses": loses, "total": total}
 
 
-# ─── CLI и точка входа ────────────────────────────────────────────────────────
+# ─── CLI and entry point ────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
         description="LLM-as-Judge evaluation (Score WR + Comparative WR)"
     )
-    # Методы оценки
+    # Evaluation methods
     parser.add_argument("--swr", action="store_true",
-                        help="Включить Score Win Rate")
+                        help="Enable Score Win Rate")
     parser.add_argument("--cwr", action="store_true",
-                        help="Включить Comparative Win Rate")
-    # Что оцениваем
+                        help="Enable Comparative Win Rate")
+    # What to evaluate
     parser.add_argument("--eval", default="outline",
-                        help="Что оценивать: outline, content, или outline,content")
-    # Конфиг судей
+                        help="What to evaluate: outline, content, or outline,content")
+    # Judge config
     parser.add_argument("--judges", default=str(ROOT_DIR / "configs" / "judges.json"),
-                        help="Путь к JSON-файлу с конфигом судей (default: judges.json)")
-    # Фильтры
+                        help="Path to JSON file with judge config (default: judges.json)")
+    # Filters
     parser.add_argument("--systems", default=None,
-                        help="Фильтр систем через запятую (default: все)")
+                        help="Filter systems by comma-separated list (default: all)")
     parser.add_argument("--topics", default=None,
-                        help="Фильтр тем через запятую (default: все)")
-    # Прочее
+                        help="Filter topics by comma-separated list (default: all)")
+    # Other
     parser.add_argument("--out", default=str(EVAL_OUT_DIR),
-                        help=f"Папка для eval-результатов (default: {EVAL_OUT_DIR})")
+                        help=f"Directory for eval results (default: {EVAL_OUT_DIR})")
     parser.add_argument("--results-dir", default=None,
-                        help="Папка с generated JSON-файлами (default: ROOT/results)")
+                        help="Directory with generated JSON files (default: ROOT/results)")
     parser.add_argument("--resume", action="store_true",
-                        help="Пропускать уже посчитанные пары")
+                        help="Skip already-computed pairs")
     parser.add_argument("--k-refs", type=int, default=1,
-                        help="Сколько случайных human-референсов брать на тему (default: 1)")
+                        help="How many random human references to use per topic (default: 1)")
     args = parser.parse_args()
 
-    # Проверяем что хоть что-то включено
+    # Check that at least one method is enabled
     if not args.swr and not args.cwr:
-        parser.error("Укажи хотя бы один метод: --swr и/или --cwr")
+        parser.error("Specify at least one method: --swr and/or --cwr")
 
     eval_types = [e.strip() for e in args.eval.split(",")]
     for et in eval_types:
         if et not in ("outline", "content"):
-            parser.error(f"Неизвестный тип оценки: '{et}'. Допустимо: outline, content")
+            parser.error(f"Unknown evaluation type: '{et}'. Allowed: outline, content")
 
-    # Загружаем судей
-    # Резолвим пути относительно ROOT если не абсолютные
+    # Load judges
+    # Resolve paths relative to ROOT if not absolute
     results_dir = Path(args.results_dir) if args.results_dir else ROOT_DIR / "results"
     judges_path = args.judges if Path(args.judges).is_absolute() else ROOT_DIR / args.judges
     if not Path(judges_path).exists():
         parser.error(
-            f"Файл судей не найден: {judges_path}\n"
-            "Создай judges.json или укажи путь через --judges"
+            f"Judge file not found: {judges_path}\n"
+            "Create judges.json or specify path via --judges"
         )
     judges = load_judges(judges_path)
-    print(f"Судьи ({len(judges)}):")
+    logger.info(f"Judges ({len(judges)}):")
     for j in judges:
-        print(f"  {j.name}: {j.model} @ {j.url}  (n={j.n})")
+        logger.info(f"  {j.name}: {j.model} @ {j.url}  (n={j.n})")
 
-    # Фильтры
+    # Filters
     sys_filter   = set(args.systems.split(",")) if args.systems else None
     topic_filter = set(args.topics.split(","))  if args.topics  else None
 
-    # Собираем список тем
+    # Gather list of topics
     import sys as _sys; _sys.path.insert(0, str(ROOT_DIR / "src"))
     from generate import load_topics, SURVEYBENCH_DIR
     all_topics = load_topics(n=10)
@@ -592,32 +596,32 @@ def main():
     if args.swr: methods.append("swr")
     if args.cwr: methods.append("cwr")
 
-    print(f"\nМетоды: {methods}")
-    print(f"Типы оценки: {eval_types}")
-    print(f"Тем: {len(all_topics)}")
-    print(f"Human-референсов на тему: {args.k_refs}\n")
+    logger.info(f"Methods: {methods}")
+    logger.info(f"Evaluation types: {eval_types}")
+    logger.info(f"Topics: {len(all_topics)}")
+    logger.info(f"Human references per topic: {args.k_refs}")
 
-    # ── Главный цикл ──────────────────────────────────────────────────────────
+    # ── Main loop ──────────────────────────────────────────────────────────────
     all_swr_results: dict[str, list[SWRPairResult]] = defaultdict(list)
     all_cwr_results: dict[str, list[PairResult]]    = defaultdict(list)
 
-    for topic_data in tqdm(all_topics, desc="Темы"):
+    for topic_data in tqdm(all_topics, desc="Topics"):
         topic = topic_data["topic"]
 
-        # Загружаем k случайных human-референсов
+        # Load k random human references
         humans = load_human_surveys(topic, k=args.k_refs)
         if not humans:
-            tqdm.write(f"  [SKIP] Нет human survey для '{topic}'. "
-                       f"Запусти download_dataset.py")
+            tqdm.write(f"  [SKIP] No human survey for '{topic}'. "
+                       f"Run download_dataset.py")
             continue
-        tqdm.write(f"  [::] human refs: {len(humans)} для '{topic[:40]}'")
+        tqdm.write(f"  [::] human refs: {len(humans)} for '{topic[:40]}'")
 
 
-        # Загружаем сгенерированные результаты
+        # Load generated results
         generated = load_generated_results(topic, results_dir)
         if not generated:
-            tqdm.write(f"  [SKIP] Нет сгенерированных результатов для '{topic}'. "
-                       f"Запусти base.py")
+            tqdm.write(f"  [SKIP] No generated results for '{topic}'. "
+                       f"Run base.py")
             continue
 
         if sys_filter:
@@ -659,12 +663,12 @@ def main():
                         with open(out_file, "w", encoding="utf-8") as f:
                             json.dump(res.to_dict(), f, ensure_ascii=False, indent=2)
 
-    # ── Итоговые таблицы ──────────────────────────────────────────────────────
+    # ── Summary tables ────────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
 
     if args.swr and all_swr_results:
         print("\nScore Win Rate (SWR):")
-        print(f"{'Система':<28} {'Тип':>8} {'WR':>6} {'Gen':>6} {'Hum':>6} {'W/T/L':>10}")
+        print(f"{'System':<28} {'Type':>8} {'WR':>6} {'Gen':>6} {'Hum':>6} {'W/T/L':>10}")
         print("-" * 70)
         for sys_id, results in sorted(all_swr_results.items()):
             for et in eval_types:
@@ -683,7 +687,7 @@ def main():
 
     if args.cwr and all_cwr_results:
         print("\nComparative Win Rate (CWR):")
-        print(f"{'Система':<28} {'Тип':>8} {'WR':>6} {'W/T/L':>10}")
+        print(f"{'System':<28} {'Type':>8} {'WR':>6} {'W/T/L':>10}")
         print("-" * 70)
         for sys_id, results in sorted(all_cwr_results.items()):
             for et in eval_types:
@@ -695,7 +699,7 @@ def main():
                 wrl = f"{stats['wins']}/{stats['ties']}/{stats['loses']}"
                 print(f"{sys_id:<28} {et:>8} {stats['win_rate']:>6.1%} {wrl:>10}")
 
-    print(f"\nРезультаты сохранены в: {out_dir}/")
+    print(f"\nResults saved to: {out_dir}/")
     _save_summary(all_swr_results, all_cwr_results, eval_types, out_dir)
 
 
@@ -743,7 +747,7 @@ def _save_summary(swr: dict, cwr: dict, eval_types: list[str], out_dir: Path):
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
-    print(f"Сводная таблица: {path}")
+    print(f"Summary table: {path}")
 
 
 if __name__ == "__main__":

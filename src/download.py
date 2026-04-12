@@ -1,21 +1,21 @@
 """
-Скачивает датасет U4R/SurveyBench с HuggingFace и сохраняет в datasets/.
+Download the U4R/SurveyBench dataset from HuggingFace and save to datasets/.
 
-Датасет хранит файлы (markdown/PDF/etc.) — не стандартный parquet-формат,
-поэтому используем snapshot_download для получения всего репозитория,
-затем разбираем файлы вручную.
+The dataset stores files (markdown/PDF/etc.) — not standard parquet format,
+so we use snapshot_download to get the entire repository,
+then parse files manually.
 
-Установка:
+Installation:
     pip install huggingface_hub
 
-Запуск:
-    python src/download.py               # скачать и разобрать
-    python src/download.py --inspect     # показать структуру скачанного репо
-    python src/download.py --raw         # только скачать без разбора
+Usage:
+    python src/download.py               # download and parse
+    python src/download.py --inspect     # show structure of downloaded repo
+    python src/download.py --raw         # only download without parsing
 
-Выходные файлы:
+Output files:
     datasets/
-    ├── raw/                     # оригинальные файлы из HuggingFace репо
+    ├── raw/                     # original files from HuggingFace repo
     └── human_surveys/
         ├── Graph_Neural_Networks.json
         └── ...
@@ -25,7 +25,10 @@ import os
 import re
 import json
 import argparse
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 try:
     from dotenv import load_dotenv
@@ -39,8 +42,8 @@ RAW_DIR    = ROOT_DIR / "datasets" / "raw"
 OUT_DIR    = ROOT_DIR / "datasets" / "human_surveys"
 
 
-# Маппинг папок/тегов репозитория → наши ID тем (SurveyBench topics.txt)
-# Заполним после --inspect, пока эвристика по имени файла
+# Mapping folders/tags in repository → our topic IDs (SurveyBench topics.txt)
+# We'll populate after --inspect; for now use heuristic based on filename
 TOPIC_ALIASES = {
     "3d_gaussian":       "3D Gaussian Splatting",
     "gaussian_splatting":"3D Gaussian Splatting",
@@ -68,10 +71,10 @@ def get_token() -> str | None:
 
 
 def snapshot(token: str | None = None) -> Path:
-    """Скачивает весь репозиторий датасета в datasets/raw/."""
+    """Download entire dataset repository to datasets/raw/."""
     from huggingface_hub import snapshot_download
 
-    print(f"Скачиваем {DATASET_ID} → {RAW_DIR} ...")
+    logger.info(f"Downloading {DATASET_ID} to {RAW_DIR}...")
     path = snapshot_download(
         repo_id=DATASET_ID,
         repo_type="dataset",
@@ -79,23 +82,23 @@ def snapshot(token: str | None = None) -> Path:
         token=token,
         ignore_patterns=["*.git*", ".gitattributes"],
     )
-    print(f"[OK] Скачано в {path}")
+    logger.info(f"Downloaded to {path}")
     return Path(path)
 
 
 def inspect(raw_path: Path) -> None:
-    """Печатает дерево скачанного репозитория."""
-    print(f"\nСтруктура {raw_path}:")
+    """Print directory tree of downloaded repository."""
+    logger.info(f"\nStructure of {raw_path}:")
     for p in sorted(raw_path.rglob("*")):
         if ".git" in p.parts:
             continue
         indent = "  " * (len(p.relative_to(raw_path).parts) - 1)
         size = f"  ({p.stat().st_size // 1024} KB)" if p.is_file() else ""
-        print(f"{indent}{'[+] ' if p.is_dir() else '[-] '}{p.name}{size}")
+        logger.info(f"{indent}{'[+] ' if p.is_dir() else '[-] '}{p.name}{size}")
 
 
 def guess_topic(path: Path) -> str | None:
-    """Пытается определить тему по пути/имени файла."""
+    """Try to determine topic by path/filename."""
     key = path.stem.lower().replace("-", "_").replace(" ", "_")
     parent = path.parent.name.lower().replace("-", "_").replace(" ", "_")
     for token in [key, parent]:
@@ -106,10 +109,10 @@ def guess_topic(path: Path) -> str | None:
 
 
 def parse_and_save(raw_path: Path) -> None:
-    """Разбирает скачанные файлы и сохраняет в datasets/human_surveys/."""
+    """Parse downloaded files and save to datasets/human_surveys/."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Собираем все текстовые файлы
+    # Gather all text files
     text_extensions = {".md", ".txt", ".json"}
     files = [p for p in raw_path.rglob("*")
              if p.is_file()
@@ -117,7 +120,7 @@ def parse_and_save(raw_path: Path) -> None:
              and ".git" not in p.parts
              and p.name not in ("README.md", "LICENSE", "NOTICE")]
 
-    print(f"\nНайдено {len(files)} текстовых файлов")
+    logger.info(f"\nFound {len(files)} text files")
 
     by_topic: dict[str, list[dict]] = {}
     unmatched: list[Path] = []
@@ -138,7 +141,7 @@ def parse_and_save(raw_path: Path) -> None:
         else:
             unmatched.append(f)
 
-    # Сохраняем по темам
+    # Save by topic
     saved = []
     for topic, surveys in sorted(by_topic.items()):
         safe = re.sub(r"[^\w]", "_", topic).strip("_")
@@ -147,13 +150,13 @@ def parse_and_save(raw_path: Path) -> None:
             json.dump({"topic": topic, "surveys": surveys}, fp,
                       ensure_ascii=False, indent=2)
         saved.append(safe)
-        print(f"  >> {out_file.name}  ({len(surveys)} survey(s))")
+        logger.info(f"  >> {out_file.name}  ({len(surveys)} survey(s))")
 
     if unmatched:
-        print(f"\n[??] Не удалось определить тему для {len(unmatched)} файлов:")
+        logger.warning(f"\nCould not determine topic for {len(unmatched)} files:")
         for f in unmatched:
-            print(f"     {f.relative_to(raw_path)}")
-        print("  → Добавь маппинг в TOPIC_ALIASES в src/download.py")
+            logger.warning(f"     {f.relative_to(raw_path)}")
+        logger.warning("  → Add mapping to TOPIC_ALIASES in src/download.py")
 
     meta = {
         "dataset_id": DATASET_ID,
@@ -163,27 +166,33 @@ def parse_and_save(raw_path: Path) -> None:
     with open(ROOT_DIR / "datasets" / "metadata.json", "w") as fp:
         json.dump(meta, fp, ensure_ascii=False, indent=2)
 
-    print(f"\n[OK] Готово. Тем сохранено: {len(saved)}")
+    logger.info(f"\nDone. Topics saved: {len(saved)}")
     if unmatched:
-        print("   Запусти --inspect чтобы посмотреть структуру и уточнить TOPIC_ALIASES")
+        logger.info("   Run --inspect to see structure and refine TOPIC_ALIASES")
 
 
 def _extract_outline(text: str) -> str:
-    """Вытаскивает markdown-заголовки как outline."""
+    """Extract markdown headers as outline."""
     headers = [line.strip() for line in text.splitlines()
                if line.startswith("#")]
     return "\n".join(headers[:30])
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=f"Скачать {DATASET_ID} с HuggingFace")
+    parser = argparse.ArgumentParser(description=f"Download {DATASET_ID} from HuggingFace")
     parser.add_argument("--inspect", action="store_true",
-                        help="Показать структуру скачанного репо (без разбора)")
+                        help="Show structure of downloaded repo (without parsing)")
     parser.add_argument("--raw", action="store_true",
-                        help="Только скачать, не разбирать по темам")
+                        help="Only download without parsing by topics")
     parser.add_argument("--token", default=None,
-                        help="HuggingFace токен (переопределяет HF_TOKEN из .env)")
+                        help="HuggingFace token (overrides HF_TOKEN from .env)")
     args = parser.parse_args()
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
 
     token = args.token or get_token()
 

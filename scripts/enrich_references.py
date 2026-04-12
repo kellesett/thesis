@@ -17,6 +17,7 @@ Usage:
 """
 import argparse
 import json
+import logging
 import re
 import sys
 import time
@@ -25,6 +26,9 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from models.perplexity_dr.main import replace_or_append_references
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -36,6 +40,13 @@ def fetch_arxiv_titles(arxiv_ids: list[str], max_retries: int = 2) -> dict[str, 
     """Batch-fetch canonical titles from arxiv API. Returns {arxiv_id: title}.
 
     Retries on 429 (rate limit): waits 5s then 10s before giving up.
+
+    Args:
+        arxiv_ids: List of arxiv IDs (e.g., ["2301.00001", "2301.00002"]).
+        max_retries: Maximum number of retry attempts on rate limit.
+
+    Returns:
+        Dictionary mapping arxiv ID to canonical title, or empty dict on failure.
     """
     if not arxiv_ids:
         return {}
@@ -43,21 +54,21 @@ def fetch_arxiv_titles(arxiv_ids: list[str], max_retries: int = 2) -> dict[str, 
         f"https://export.arxiv.org/api/query"
         f"?id_list={','.join(arxiv_ids)}&max_results={len(arxiv_ids)}"
     )
-    print(f"\n    [arxiv] GET {url[:80]}...", flush=True)
+    logger.info(f"\n    [arxiv] GET {url[:80]}...")
     delay = 5
     for attempt in range(max_retries):
-        print(f"    [arxiv] attempt {attempt + 1}/{max_retries} ...", end=" ", flush=True)
+        logger.info(f"    [arxiv] attempt {attempt + 1}/{max_retries} ...", end=" ")
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "thesis-research/1.0"})
             with urllib.request.urlopen(req, timeout=30) as resp:
                 status = resp.status
                 xml_data = resp.read()
-            print(f"HTTP {status}, {len(xml_data)} bytes received")
+            logger.info(f"HTTP {status}, {len(xml_data)} bytes received")
 
             ns   = {"atom": "http://www.w3.org/2005/Atom"}
             root = ET.fromstring(xml_data)
             entries = root.findall("atom:entry", ns)
-            print(f"    [arxiv] parsed {len(entries)} entries")
+            logger.info(f"    [arxiv] parsed {len(entries)} entries")
 
             result = {}
             for entry in entries:
@@ -68,30 +79,30 @@ def fetch_arxiv_titles(arxiv_ids: list[str], max_retries: int = 2) -> dict[str, 
                     bare_id = re.sub(r'v\d+$', '', raw_id)
                     title   = " ".join(title_el.text.split())
                     result[bare_id] = title
-            print(f"    [arxiv] matched {len(result)}/{len(arxiv_ids)} IDs to titles")
+            logger.info(f"    [arxiv] matched {len(result)}/{len(arxiv_ids)} IDs to titles")
             return result
 
         except urllib.error.HTTPError as e:
-            print(f"HTTP {e.code} {e.reason}")
+            logger.error(f"HTTP {e.code} {e.reason}")
             if e.code == 429 and attempt < max_retries - 1:
                 next_delay = delay * 2
-                print(f"    [429] rate limited, waiting {delay}s before retry...", flush=True)
+                logger.info(f"    [429] rate limited, waiting {delay}s before retry...")
                 time.sleep(delay)
                 delay = next_delay
             else:
-                print(f"    [WARN] giving up after HTTP {e.code}")
+                logger.warning(f"    [WARN] giving up after HTTP {e.code}")
                 return {}
         except urllib.error.URLError as e:
-            print(f"URLError: {e.reason}")
-            print(f"    [WARN] network error, giving up")
+            logger.error(f"URLError: {e.reason}")
+            logger.warning(f"    [WARN] network error, giving up")
             return {}
         except ET.ParseError as e:
-            print(f"XML parse error: {e}")
-            print(f"    [WARN] bad response from arxiv, giving up")
+            logger.error(f"XML parse error: {e}")
+            logger.warning(f"    [WARN] bad response from arxiv, giving up")
             return {}
         except Exception as e:
-            print(f"{type(e).__name__}: {e}")
-            print(f"    [WARN] unexpected error, giving up")
+            logger.error(f"{type(e).__name__}: {e}")
+            logger.warning(f"    [WARN] unexpected error, giving up")
             return {}
     return {}
 
@@ -160,7 +171,14 @@ def enrich_file(path: Path, survey_title: str | None = None) -> bool:
 
 
 def load_survey_titles(dataset_id: str) -> dict[str, str]:
-    """Return {survey_id: survey_title} for a given dataset, or {} if not available."""
+    """Return {survey_id: survey_title} for a given dataset, or {} if not available.
+
+    Args:
+        dataset_id: Dataset identifier (e.g., 'SurGE').
+
+    Returns:
+        Dictionary mapping survey ID to survey title, or empty dict on error.
+    """
     try:
         import yaml
         from src.datasets import load_dataset as load_ds
@@ -172,7 +190,7 @@ def load_survey_titles(dataset_id: str) -> dict[str, str]:
         ds = load_ds(dataset_id, registry[dataset_id])
         return {str(inst.id): inst.meta.get("survey_title", "") for inst in ds}
     except Exception as e:
-        print(f"  [WARN] Could not load dataset '{dataset_id}': {e}")
+        logger.warning(f"  [WARN] Could not load dataset '{dataset_id}': {e}")
         return {}
 
 
@@ -192,7 +210,7 @@ def main() -> None:
 
     for gen_dir in dirs:
         if not gen_dir.exists():
-            print(f"Directory not found: {gen_dir}")
+            logger.error(f"Directory not found: {gen_dir}")
             continue
 
         gen_files = sorted(f for f in gen_dir.glob("*.json") if re.fullmatch(r'\d+\.json', f.name))
@@ -203,35 +221,38 @@ def main() -> None:
         dataset_id = gen_dir.name.split("_")[0]
         survey_titles = load_survey_titles(dataset_id)
 
-        print(f"\n{gen_dir.name} ({len(gen_files)} files, dataset={dataset_id})")
+        logger.info(f"\n{gen_dir.name} ({len(gen_files)} files, dataset={dataset_id})")
         for gen_file in gen_files:
-            with open(gen_file) as f:
-                gid = json.load(f).get("id")
-            survey_title = survey_titles.get(str(gid))
-
-            print(f"  {gen_file.name} ... ", end="", flush=True)
-            modified = enrich_file(gen_file, survey_title=survey_title)
-            if modified:
-                self_cited = json.loads(gen_file.read_text())["meta"].get("reference_self_cited")
-                flag = " ⚠ self-cited!" if self_cited else ""
-                print(f"enriched{flag}")
-                time.sleep(1)  # be polite to arxiv API
-            else:
-                # Even if titles were already fetched, re-check self-citation flag
+            try:
                 with open(gen_file) as f:
-                    gen = json.load(f)
-                if survey_title and "reference_self_cited" not in gen.get("meta", {}):
-                    from src.evaluators.citation import detect_self_citation
-                    refs = gen["meta"].get("references", [])
-                    self_cited = detect_self_citation(refs, survey_title)
-                    gen["meta"]["reference_self_cited"] = self_cited
-                    gen_file.write_text(json.dumps(gen, ensure_ascii=False, indent=2))
+                    gid = json.load(f).get("id")
+                survey_title = survey_titles.get(str(gid))
+
+                logger.info(f"  {gen_file.name} ... ", end="")
+                modified = enrich_file(gen_file, survey_title=survey_title)
+                if modified:
+                    self_cited = json.loads(gen_file.read_text())["meta"].get("reference_self_cited")
                     flag = " ⚠ self-cited!" if self_cited else ""
-                    print(f"flag added{flag}")
+                    logger.info(f"enriched{flag}")
+                    time.sleep(1)  # be polite to arxiv API
                 else:
-                    self_cited = gen.get("meta", {}).get("reference_self_cited")
-                    flag = " ⚠ self-cited!" if self_cited else ""
-                    print(f"skipped{flag}")
+                    # Even if titles were already fetched, re-check self-citation flag
+                    with open(gen_file) as f:
+                        gen = json.load(f)
+                    if survey_title and "reference_self_cited" not in gen.get("meta", {}):
+                        from src.evaluators.citation import detect_self_citation
+                        refs = gen["meta"].get("references", [])
+                        self_cited = detect_self_citation(refs, survey_title)
+                        gen["meta"]["reference_self_cited"] = self_cited
+                        gen_file.write_text(json.dumps(gen, ensure_ascii=False, indent=2))
+                        flag = " ⚠ self-cited!" if self_cited else ""
+                        logger.info(f"flag added{flag}")
+                    else:
+                        self_cited = gen.get("meta", {}).get("reference_self_cited")
+                        flag = " ⚠ self-cited!" if self_cited else ""
+                        logger.info(f"skipped{flag}")
+            except Exception as e:
+                logger.error(f"  Error processing {gen_file.name} (ID {gid}): {e}", exc_info=True)
 
 
 if __name__ == "__main__":

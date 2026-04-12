@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
 """
 scripts/download_metric_models.py
-Загружает локально все модели, необходимые для метрик structural / factuality / expert.
-Запускай один раз из корня репозитория:
+Downloads all models required for structural / factuality / expert metrics locally.
+Run once from the repository root:
 
     python scripts/download_metric_models.py
 
-Модели сохраняются в models_cache/ и монтируются в Docker через volume.
-Итоговый размер: ~2.4 GB (см. таблицу ниже).
+Models are saved in models_cache/ and mounted in Docker via volume.
+Total size: ~2.4 GB (see table below).
 
-  fleonce--iter-scierc-scideberta-full    ~740 MB  (NER, группа A)
-  microsoft--deberta-v2-xlarge-mnli       ~900 MB  (NLI, группы A/B/C)
-  yzha--AlignScore-large                  ~355 MB  (factuality support, группы B/C)
-  sentence-transformers--allenai-specter  ~400 MB  (embedding pre-filter, группа A)
+  fleonce--iter-scierc-scideberta-full    ~740 MB  (NER, Group A)
+  microsoft--deberta-v2-xlarge-mnli       ~900 MB  (NLI, Groups A/B/C)
+  yzha--AlignScore-large                  ~355 MB  (factuality support, Groups B/C)
+  sentence-transformers--allenai-specter  ~400 MB  (embedding pre-filter, Group A)
 
-Примечание: AlignScore ожидает checkpoint-файл .ckpt, а не HuggingFace safetensors.
-После скачивания файл будет лежать в:
+Note: AlignScore expects a .ckpt checkpoint file, not HuggingFace safetensors.
+After download, the file will be in:
   models_cache/yzha--AlignScore-large/AlignScore-large.ckpt
 """
+import logging
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 
 try:
     from huggingface_hub import snapshot_download, hf_hub_download
 except ImportError:
-    print("Установи зависимости: pip install huggingface_hub")
+    logger.error("Install dependencies: pip install huggingface_hub")
     sys.exit(1)
 
 ROOT = Path(__file__).parent.parent
@@ -62,16 +66,21 @@ MODELS = [
 
 
 def download_model(m: dict) -> None:
+    """Download a model from HuggingFace Hub to models_cache/.
+
+    Args:
+        m: Model configuration dict with repo_id, local, desc, fn (snapshot or single_file).
+    """
     local_dir = CACHE / m["local"]
     local_dir.mkdir(exist_ok=True)
 
     if m["fn"] == "snapshot":
-        # Проверяем, не скачана ли уже модель
+        # Check if model is already downloaded
         existing = list(local_dir.glob("*.safetensors")) + list(local_dir.glob("*.bin"))
         if existing:
-            print(f"  ✓ {m['local']} — уже скачана, пропускаем")
+            logger.info(f"  ✓ {m['local']} — already downloaded, skipping")
             return
-        print(f"  ↓ {m['local']} ({m['desc']}) ...")
+        logger.info(f"  ↓ {m['local']} ({m['desc']}) ...")
         snapshot_download(
             repo_id=m["repo_id"],
             local_dir=str(local_dir),
@@ -81,28 +90,29 @@ def download_model(m: dict) -> None:
     elif m["fn"] == "single_file":
         target = local_dir / m["filename"]
         if target.exists():
-            print(f"  ✓ {m['local']}/{m['filename']} — уже скачан, пропускаем")
+            logger.info(f"  ✓ {m['local']}/{m['filename']} — already downloaded, skipping")
             return
-        print(f"  ↓ {m['local']}/{m['filename']} ({m['desc']}) ...")
+        logger.info(f"  ↓ {m['local']}/{m['filename']} ({m['desc']}) ...")
         hf_hub_download(
             repo_id=m["repo_id"],
             filename=m["filename"],
             local_dir=str(local_dir),
         )
 
-    print(f"  ✓ {m['local']} — готово")
+    logger.info(f"  ✓ {m['local']} — done")
 
 
 def main() -> None:
-    print(f"\nЗагрузка моделей в {CACHE}/\n")
+    """Download all required models for metrics evaluation."""
+    logger.info(f"\nDownloading models to {CACHE}/\n")
     for m in MODELS:
         try:
             download_model(m)
         except Exception as e:
-            print(f"  ✗ Ошибка при загрузке {m['local']}: {e}")
-            print("    Попробуй ещё раз или скачай вручную с HuggingFace.")
-    print("\nГотово. Убедись что models_cache/ смонтирована в Docker:")
-    print("  -v $(PWD)/models_cache:/app/models_cache\n")
+            logger.error(f"  ✗ Error downloading {m['local']}: {e}")
+            logger.error("    Try again or download manually from HuggingFace.")
+    logger.info("\nDone. Make sure models_cache/ is mounted in Docker:")
+    logger.info("  -v $(PWD)/models_cache:/app/models_cache\n")
 
 
 if __name__ == "__main__":

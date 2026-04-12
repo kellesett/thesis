@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 metrics/claimify/main.py
-Atomic claim decomposition for generated surveys.
+Atomic claim extraction for generated surveys using the Claimify pipeline.
 
-Splits each survey into sections, then uses an LLM to extract atomic claims
-per section. Results are saved to:
+Implements Metropolitansky & Larson, ACL 2025 (arXiv:2502.10855):
+  Sentence Splitting → Selection → Disambiguation → Decomposition
 
+Results are saved to:
   results/scores/<dataset_id>_<model_id>_claims/<survey_id>.json
 
 Format:
@@ -14,10 +15,10 @@ Format:
     "dataset_id": "SurGE",
     "model_id":   "perplexity_dr",
     "query":      "...",
-    "n_sections": 8,
-    "n_claims":   312,
+    "n_sentences": 142,
+    "n_claims":    312,
     "claims": [
-      {"claim_id": 0, "claim": "...", "section": "Introduction", "source_sentence": "..."},
+      {"claim_id": 0, "claim": "...", "source_sentence": "..."},
       ...
     ],
     "judge_model": "openai/gpt-4o-mini",
@@ -30,313 +31,268 @@ Usage (inside Docker):
     python metrics/claimify/main.py --dataset SurGE --model perplexity_dr
 """
 import argparse
+import asyncio
 import json
+import logging
 import os
 import re
 import sys
-import time
-import traceback
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AsyncOpenAI
+from tqdm import tqdm
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 ROOT   = Path(__file__).parent.parent.parent
 CONFIG = Path(__file__).parent / "config.yaml"
 sys.path.insert(0, str(ROOT))
 
+from metrics.claimify.claim_extractor import (
+    ClaimExtractor,
+    _SEL_COMPLETIONS,
+    _DIS_COMPLETIONS,
+)
+from metrics.utils import load_config
 
-# ── Config & client ───────────────────────────────────────────────────────────
 
-def load_config() -> dict:
-    with open(CONFIG) as f:
-        return yaml.safe_load(f)
+# ── Client creation ───────────────────────────────────────────────────────────
 
+def make_client(cfg: dict) -> AsyncOpenAI:
+    """Create AsyncOpenAI client for Claimify pipeline.
 
-def make_client(cfg: dict) -> OpenAI:
-    api_key = os.environ.get(cfg["judge_api_key_env"], "")
+    Args:
+        cfg: Configuration dict with judge_api_key_env and judge_base_url.
+
+    Returns:
+        Initialized AsyncOpenAI client.
+
+    Raises:
+        RuntimeError: If API key environment variable not set.
+    """
+    api_key_env = cfg.get("judge_api_key_env")
+    if not api_key_env:
+        raise RuntimeError("Config missing 'judge_api_key_env'")
+    api_key = os.environ.get(api_key_env, "")
     if not api_key:
         raise RuntimeError(
-            f"API key not set: env var '{cfg['judge_api_key_env']}'"
+            f"API key not set: env var '{api_key_env}'"
         )
-    return OpenAI(api_key=api_key, base_url=cfg["judge_base_url"])
-
-
-# ── Markdown section splitter ─────────────────────────────────────────────────
-
-_HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
-
-
-def split_sections(text: str) -> list[dict]:
-    """
-    Split Markdown survey text into sections.
-    Returns list of {"title": str, "text": str}.
-    Sections with fewer than 100 chars of content are skipped.
-    """
-    headings = list(_HEADING_RE.finditer(text))
-    sections = []
-
-    for i, m in enumerate(headings):
-        title  = m.group(2).strip()
-        start  = m.end()
-        end    = headings[i + 1].start() if i + 1 < len(headings) else len(text)
-        body   = text[start:end].strip()
-
-        # Skip short / empty bodies (e.g. sub-headings with no content)
-        if len(body) < 100:
-            continue
-
-        sections.append({"title": title, "text": body})
-
-    # If no headings found, treat whole text as one section
-    if not sections:
-        sections = [{"title": "Full text", "text": text.strip()}]
-
-    return sections
-
-
-def chunk_section(section: dict, max_chars: int) -> list[dict]:
-    """
-    Split a long section into chunks of ≤ max_chars for safe LLM processing.
-    Splits on paragraph boundaries where possible.
-    """
-    text = section["text"]
-    if len(text) <= max_chars:
-        return [section]
-
-    chunks = []
-    paragraphs = re.split(r"\n{2,}", text)
-    current, buf = "", []
-    for para in paragraphs:
-        if len(current) + len(para) + 2 <= max_chars:
-            buf.append(para)
-            current += para + "\n\n"
-        else:
-            if buf:
-                chunks.append({"title": section["title"], "text": current.strip()})
-            buf   = [para]
-            current = para + "\n\n"
-    if buf:
-        chunks.append({"title": section["title"], "text": current.strip()})
-
-    return chunks
-
-
-# ── LLM decomposition ─────────────────────────────────────────────────────────
-
-_SYSTEM_PROMPT = (
-    "You are an expert at decomposing scientific survey text into atomic claims. "
-    "An atomic claim is a single, self-contained factual assertion that cannot be "
-    "further broken down without losing meaning. Each claim must be a complete sentence."
-)
-
-_USER_TEMPLATE = """\
-Extract all atomic claims from the following section of a scientific survey.
-
-Section title: "{section_title}"
-
-Text:
-\"\"\"{text}\"\"\"
-
-Rules:
-- Each claim must be a single, self-contained sentence expressing one fact or assertion
-- Strip inline citation markers like [1], [Author et al., 2023], etc. — do NOT include them
-- Do NOT paraphrase beyond what the text says; stay faithful to the original meaning
-- Headings, figure captions, and reference lists are NOT claims — skip them
-- Abbreviations should be kept as-is (e.g. "BERT" not "Bidirectional Encoder Representations from Transformers")
-
-Return a JSON array (and nothing else):
-[
-  {{"claim": "...", "source_sentence": "..."}},
-  ...
-]
-where "source_sentence" is the verbatim sentence (or short passage) the claim was drawn from."""
-
-
-def decompose_section(
-    section: dict,
-    client: OpenAI,
-    model: str,
-    max_retries: int,
-) -> list[dict]:
-    """Call LLM to extract atomic claims from one section chunk."""
-    prompt = _USER_TEMPLATE.format(
-        section_title=section["title"],
-        text=section["text"][:4000],  # hard cap for safety
-    )
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user",   "content": prompt},
-                ],
-                temperature=0,
-            )
-            raw = resp.choices[0].message.content.strip()
-
-            # Strip markdown code fences if present
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-
-            claims = json.loads(raw)
-            if not isinstance(claims, list):
-                raise ValueError("Expected JSON array")
-            return claims
-
-        except (json.JSONDecodeError, ValueError) as e:
-            if attempt < max_retries:
-                time.sleep(2 ** attempt)
-            else:
-                print(f"    [WARN] parse failed after {max_retries} attempts: {e}")
-                return []
-        except Exception as e:
-            if attempt < max_retries:
-                time.sleep(2 ** attempt)
-            else:
-                print(f"    [WARN] LLM call failed: {e}")
-                return []
-
-    return []
+    return AsyncOpenAI(api_key=api_key, base_url=cfg["judge_base_url"])
 
 
 # ── Per-survey processing ─────────────────────────────────────────────────────
 
-def process_survey(
+def _make_bars(desc: str, total: int | None, unit: str) -> "tqdm":
+    return tqdm(total=total, desc=desc, unit=unit, leave=True, dynamic_ncols=True)
+
+
+async def process_survey(
     gen: dict,
     out_path: Path,
+    tmp_path: Path,
     cfg: dict,
-    client: OpenAI,
+    extractor: ClaimExtractor,
+    surveys_bar,
 ) -> dict | None:
+    """Run Claimify pipeline on one survey, stage by stage.
+
+    Intermediate results are cached in tmp_path/<survey_id>/.
+    Stages: Selection → Disambiguation → Decomposition.
+
+    Args:
+        gen: Generation dict with "id", "text", "query", "success", etc.
+        out_path: Output directory for final claims JSON.
+        tmp_path: Temporary directory for intermediate stage caches.
+        cfg: Configuration dict with model, max_concurrent, etc.
+        extractor: Initialized ClaimExtractor instance.
+        surveys_bar: tqdm progress bar for survey tracking.
+
+    Returns:
+        Summary dict with claims and metadata, or None on skip/error.
     """
-    Decompose one survey into atomic claims and save to out_path.
-    Returns summary dict or None on skip/error.
-    """
-    survey_id = gen["id"]
+    survey_id = str(gen["id"])
     out_file  = out_path / f"{survey_id}.json"
 
     if cfg.get("resume") and out_file.exists():
         try:
             with open(out_file) as f:
                 existing = json.load(f)
-            print(f"  [SKIP] {survey_id} — {existing['n_claims']} claims already saved")
+            tqdm.write(f"  [SKIP] {survey_id} — {existing['n_claims']} claims already saved", file=sys.stderr)
             return existing
         except Exception:
-            print(f"  [WARN] {survey_id} — corrupt cache, re-processing")
+            logger.warning(f"{survey_id} — corrupt cache, re-processing")
+            tqdm.write(f"  [WARN] {survey_id} — corrupt cache, re-processing", file=sys.stderr)
 
     if not gen.get("success", False):
-        print(f"  [SKIP] {survey_id} — generation not successful")
+        logger.info(f"{survey_id} — generation not successful, skipping")
+        tqdm.write(f"  [SKIP] {survey_id} — generation not successful", file=sys.stderr)
         return None
 
     text = gen.get("text", "").strip()
     if not text:
-        print(f"  [SKIP] {survey_id} — empty text")
+        logger.info(f"{survey_id} — empty text, skipping")
+        tqdm.write(f"  [SKIP] {survey_id} — empty text", file=sys.stderr)
         return None
 
-    print(f"  [PROC] {survey_id} | {gen.get('query', '')[:60]}")
+    question       = gen.get("query", "")
+    max_concurrent = cfg.get("max_concurrent", 5)
+    survey_tmp     = tmp_path / survey_id
+    survey_tmp.mkdir(parents=True, exist_ok=True)
 
-    sections = split_sections(text)
-    max_chars = cfg.get("max_section_chars", 4000)
-    max_retries = cfg.get("max_retries", 3)
+    sel_cache = survey_tmp / "selection.json"
+    dis_cache = survey_tmp / "disambiguation.json"
 
-    all_claims: list[dict] = []
-    claim_id = 0
+    tqdm.write(f"  [PROC] {survey_id} | {question[:70]}", file=sys.stderr)
 
-    for section in sections:
-        chunks = chunk_section(section, max_chars)
-        for chunk in chunks:
-            raw_claims = decompose_section(
-                chunk, client, cfg["judge_model"], max_retries
-            )
-            for c in raw_claims:
-                if isinstance(c, dict) and c.get("claim"):
-                    all_claims.append({
-                        "claim_id":       claim_id,
-                        "claim":          c["claim"].strip(),
-                        "section":        section["title"],
-                        "source_sentence": c.get("source_sentence", "").strip(),
-                    })
-                    claim_id += 1
+    sentences = extractor.split_sentences(text)
+    n         = len(sentences)
+
+    # ── Stage 2: Selection ─────────────────────────────────────────────────────
+    if sel_cache.exists():
+        tqdm.write(f"         [cache] selection ({sel_cache})", file=sys.stderr)
+        selected = json.loads(sel_cache.read_text())
+    else:
+        sel_sent_bar = _make_bars("  sel sents", total=n,                   unit="sent")
+        sel_llm_bar  = _make_bars("  sel LLM  ", total=n * _SEL_COMPLETIONS, unit="call")
+        selected = await extractor.run_selection(
+            question, sentences, max_concurrent,
+            bars={"sel_sent": sel_sent_bar, "sel_llm": sel_llm_bar},
+        )
+        sel_sent_bar.close()
+        sel_llm_bar.close()
+        sel_cache.write_text(json.dumps(selected, ensure_ascii=False))
+
+    n_selected = sum(1 for s in selected if s is not None)
+    tqdm.write(f"         sel: {n_selected}/{n} sentences passed", file=sys.stderr)
+
+    # ── Stage 3: Disambiguation ────────────────────────────────────────────────
+    if dis_cache.exists():
+        tqdm.write(f"         [cache] disambiguation ({dis_cache})", file=sys.stderr)
+        disambiguated = json.loads(dis_cache.read_text())
+    else:
+        dis_sent_bar = _make_bars("  dis sents", total=n_selected,                   unit="sent")
+        dis_llm_bar  = _make_bars("  dis LLM  ", total=n_selected * _DIS_COMPLETIONS, unit="call")
+        disambiguated = await extractor.run_disambiguation(
+            question, sentences, selected, max_concurrent,
+            bars={"dis_sent": dis_sent_bar, "dis_llm": dis_llm_bar},
+        )
+        dis_sent_bar.close()
+        dis_llm_bar.close()
+        dis_cache.write_text(json.dumps(disambiguated, ensure_ascii=False))
+
+    n_disambiguated = sum(1 for s in disambiguated if s is not None)
+    tqdm.write(f"         dis: {n_disambiguated}/{n_selected} sentences passed", file=sys.stderr)
+
+    # ── Stage 4: Decomposition ─────────────────────────────────────────────────
+    dec_sent_bar = _make_bars("  dec sents", total=n_disambiguated, unit="sent")
+    dec_llm_bar  = _make_bars("  dec LLM  ", total=n_disambiguated, unit="call")
+    claims_nested = await extractor.run_decomposition(
+        question, sentences, disambiguated, max_concurrent,
+        bars={"dec_sent": dec_sent_bar, "dec_llm": dec_llm_bar},
+    )
+    dec_sent_bar.close()
+    dec_llm_bar.close()
+
+    claims_raw = [c for claims in claims_nested for c in claims]
+    claims = [
+        {"claim_id": i, "claim": c, "source_sentence": ""}
+        for i, c in enumerate(claims_raw)
+    ]
 
     result = {
         "survey_id":   survey_id,
         "dataset_id":  gen["dataset_id"],
         "model_id":    gen["model_id"],
-        "query":       gen.get("query", ""),
-        "n_sections":  len(sections),
-        "n_claims":    len(all_claims),
-        "claims":      all_claims,
+        "query":       question,
+        "n_sentences": n,
+        "n_selected":  n_selected,
+        "n_disambiguated": n_disambiguated,
+        "n_claims":    len(claims),
+        "claims":      claims,
         "judge_model": cfg["judge_model"],
+        "pipeline":    "claimify",
         "timestamp":   datetime.now(timezone.utc).isoformat(),
     }
 
     with open(out_file, "w") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
-    print(f"         → {len(all_claims)} claims from {len(sections)} sections")
+    tqdm.write(f"         → {len(claims)} claims", file=sys.stderr)
     return result
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Atomic claim decomposition")
+async def main_async() -> None:
+    parser = argparse.ArgumentParser(description="Claimify — atomic claim extraction")
     parser.add_argument("--dataset", required=True, help="Dataset id (e.g. SurGE)")
     parser.add_argument("--model",   required=True, help="Model id (e.g. perplexity_dr)")
     args = parser.parse_args()
 
-    cfg    = load_config()
-    client = make_client(cfg)
+    cfg       = load_config(CONFIG)
+    client    = make_client(cfg)
+    extractor = ClaimExtractor(client, model_name=cfg["judge_model"])
 
     gen_dir = ROOT / "results" / "generations" / f"{args.dataset}_{args.model}"
     if not gen_dir.exists():
-        print(f"[ERROR] Generation dir not found: {gen_dir}", file=sys.stderr)
+        logger.error(f"Generation dir not found: {gen_dir}")
         sys.exit(1)
 
     out_dir = ROOT / "results" / "scores" / f"{args.dataset}_{args.model}_claims"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     gen_files = sorted(gen_dir.glob("*.json"))
-    # Exclude _raw.json and _old.json side-files
     gen_files = [f for f in gen_files if not re.search(r"_(raw|old)\.json$", f.name)]
 
     print(f"\n[claimify] {args.dataset} / {args.model}")
-    print(f"           {len(gen_files)} surveys → {out_dir}\n")
+    print(f"           {len(gen_files)} surveys → {out_dir}")
+    print(f"           model: {cfg['judge_model']}")
+    print(f"           max_concurrent: {cfg.get('max_concurrent', 5)}\n")
 
-    n_ok, n_skip, n_err = 0, 0, 0
+    run_id   = f"{args.dataset}_{args.model}"
+    tmp_path = Path("/tmp") / "claimify" / run_id
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    tqdm.write(f"           tmp:  {tmp_path}\n", file=sys.stderr)
+
+    n_ok, n_skip = 0, 0
     total_claims = 0
 
+    surveys_bar = tqdm(
+        total=len(gen_files), desc="surveys", unit="survey",
+        leave=True, dynamic_ncols=True,
+    )
+
     for gf in gen_files:
-        try:
-            with open(gf) as f:
-                gen = json.load(f)
-        except Exception as e:
-            print(f"  [ERROR] reading {gf.name}: {e}")
-            n_err += 1
-            continue
+        surveys_bar.set_postfix_str(gf.stem)
+        with open(gf) as f:
+            gen = json.load(f)
 
-        try:
-            result = process_survey(gen, out_dir, cfg, client)
-            if result is None:
-                n_skip += 1
-            else:
-                n_ok += 1
-                total_claims += result["n_claims"]
-        except Exception as e:
-            print(f"  [ERROR] {gf.stem}: {e}")
-            traceback.print_exc()
-            n_err += 1
+        result = await process_survey(gen, out_dir, tmp_path, cfg, extractor, surveys_bar)
+        if result is None:
+            n_skip += 1
+        else:
+            n_ok += 1
+            total_claims += result["n_claims"]
+            surveys_bar.set_postfix_str(f"{gf.stem} → {result['n_claims']} claims")
+        surveys_bar.update(1)
 
-    print(f"\n[claimify] done — ok={n_ok} skip={n_skip} err={n_err}")
+    surveys_bar.close()
+
+    print(f"\n[claimify] done — ok={n_ok} skip={n_skip}")
     print(f"           total claims: {total_claims}")
     if n_ok > 0:
         print(f"           avg per survey: {total_claims // n_ok}")
+
+
+def main() -> None:
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":

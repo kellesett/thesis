@@ -18,6 +18,8 @@ import re
 import sys
 import time
 import tempfile
+import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +28,9 @@ from openai import OpenAI
 from src.datasets.base import BaseDataset
 from .base import BaseEvaluator
 from .citation import CitationEvaluator, build_title_index
+
+logger = logging.getLogger(__name__)
+_surge_lock = threading.Lock()
 
 ROOT      = Path(__file__).parent.parent.parent
 SURGE_SRC = ROOT / "repos" / "SurGE" / "src"
@@ -192,44 +197,44 @@ def _run_metrics(
 
     ctx     = {"metric": None, "paragraph_idx": 0}
     # Guard: fail fast if SurGE renames the function rather than silently using the unpatched version
-    assert hasattr(structureFuncs,   "chat_openai"), \
-        "structureFuncs.chat_openai not found — SurGE API may have changed"
-    assert hasattr(informationFuncs, "chat_openai"), \
-        "informationFuncs.chat_openai not found — SurGE API may have changed"
+    if not hasattr(structureFuncs, "chat_openai"):
+        raise ImportError("SurGE source not found at structureFuncs.chat_openai — SurGE API may have changed")
+    if not hasattr(informationFuncs, "chat_openai"):
+        raise ImportError("SurGE source not found at informationFuncs.chat_openai — SurGE API may have changed")
 
     patched = _make_chat_openai_patched(judge_model, judge_log, ctx, flush_fn=flush_fn, log_fn=log_fn)
-    structureFuncs.chat_openai   = patched
-    informationFuncs.chat_openai = patched
+    with _surge_lock:
+        structureFuncs.chat_openai   = patched
+        informationFuncs.chat_openai = patched
+        psg_node = parse_markdown(str(md_path))
+        scores   = {}
 
-    psg_node = parse_markdown(str(md_path))
-    scores   = {}
+        if "sh_recall" in eval_list:
+            if log_fn: log_fn("metric start  sh_recall")
+            scores["sh_recall"] = structureFuncs.eval_SHRecall(
+                target_survey, psg_node, flag_model
+            )
+            if log_fn: log_fn(f"metric done   sh_recall = {scores['sh_recall']}")
 
-    if "sh_recall" in eval_list:
-        if log_fn: log_fn("metric start  sh_recall")
-        scores["sh_recall"] = structureFuncs.eval_SHRecall(
-            target_survey, psg_node, flag_model
-        )
-        if log_fn: log_fn(f"metric done   sh_recall = {scores['sh_recall']}")
+        if "structure_quality" in eval_list:
+            if log_fn: log_fn("metric start  structure_quality")
+            ctx["metric"]        = "structure_quality"
+            ctx["paragraph_idx"] = 0
+            scores["structure_quality"] = structureFuncs.eval_structure_quality_client(
+                target_survey, psg_node, judge_client
+            )
+            if log_fn: log_fn(f"metric done   structure_quality = {scores['structure_quality']}")
 
-    if "structure_quality" in eval_list:
-        if log_fn: log_fn("metric start  structure_quality")
-        ctx["metric"]        = "structure_quality"
-        ctx["paragraph_idx"] = 0
-        scores["structure_quality"] = structureFuncs.eval_structure_quality_client(
-            target_survey, psg_node, judge_client
-        )
-        if log_fn: log_fn(f"metric done   structure_quality = {scores['structure_quality']}")
-
-    if "logic" in eval_list:
-        if log_fn: log_fn("metric start  logic")
-        ctx["metric"]        = "logic"
-        ctx["paragraph_idx"] = 0
-        content_blocks = informationFuncs.get_content_list(psg_node)
-        if content_blocks:
-            scores["logic"] = informationFuncs.eval_logic_client(psg_node, judge_client)
-        else:
-            scores["logic"] = None
-        if log_fn: log_fn(f"metric done   logic = {scores['logic']}")
+        if "logic" in eval_list:
+            if log_fn: log_fn("metric start  logic")
+            ctx["metric"]        = "logic"
+            ctx["paragraph_idx"] = 0
+            content_blocks = informationFuncs.get_content_list(psg_node)
+            if content_blocks:
+                scores["logic"] = informationFuncs.eval_logic_client(psg_node, judge_client)
+            else:
+                scores["logic"] = None
+            if log_fn: log_fn(f"metric done   logic = {scores['logic']}")
 
     return scores
 
@@ -290,8 +295,17 @@ class SurGEEvaluator(BaseEvaluator):
     def evaluate(self, generation: dict, flush_fn=None, log_fn=None) -> dict:
         """
         Evaluate one unified generation dict.
-        flush_fn — optional callback for incremental judge_log persistence.
-        log_fn   — optional callable(str) for human-readable run logging.
+
+        Args:
+            generation: Dict with "id" and "text" keys
+            flush_fn: Optional callback for incremental judge_log persistence
+            log_fn: Optional callable(str) for human-readable run logging
+
+        Returns:
+            Dict with "scores" and "judge_log" keys
+
+        Raises:
+            JudgeFailedError: If the LLM judge fails after max retries
         """
         instance = self.dataset.get_by_id(generation["id"])
         target_survey = instance.meta  # full SurGE survey dict

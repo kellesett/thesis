@@ -25,5 +25,4 @@ COPY models/surveyforge/ ./models/surveyforge/
 RUN mkdir -p datasets/surveyforge_db datasets/gte-large-en-v1.5 \
              datasets/SurGE results
 
-ENTRYPOINT ["python", "models/surveyforge/main.py"]
-CMD ["--dataset", "SurGE"]
+CMD ["python", "models/surveyforge/main.py", "--dataset", "SurGE"]
