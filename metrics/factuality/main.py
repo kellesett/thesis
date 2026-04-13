@@ -139,6 +139,8 @@ def classify_claim(
     client: OpenAI,
     model: str,
     max_retries: int,
+    disable_reasoning: bool = False,
+    provider: str | None = None,
 ) -> dict:
     """Classify a claim into one of four categories (A/B/C/D).
 
@@ -148,6 +150,8 @@ def classify_claim(
         client: OpenAI client instance.
         model: Judge model name.
         max_retries: Maximum retry attempts for API calls.
+        disable_reasoning: Disable thinking tokens (Qwen3, DeepSeek-R1).
+        provider: Optional OpenRouter provider override.
 
     Returns:
         Dict with "category" (A/B/C/D), "confidence", and optional "error".
@@ -156,6 +160,12 @@ def classify_claim(
         claim=claim[:600],
         source_context=source_context[:800] if source_context else "Not available",
     )
+    extra_body: dict = {}
+    if provider:
+        extra_body["provider"] = {"order": [provider], "allow_fallbacks": False}
+    if disable_reasoning:
+        extra_body["reasoning"] = {"enabled": False}
+
     for attempt in range(1, max_retries + 1):
         try:
             resp = client.chat.completions.create(
@@ -165,6 +175,7 @@ def classify_claim(
                     {"role": "user",   "content": prompt},
                 ],
                 temperature=0,
+                extra_body=extra_body or None,
             )
             content = resp.choices[0].message.content
             if content is None:
@@ -311,7 +322,9 @@ def process_survey(
 
     print(f"  [PROC] {survey_id} | {gen.get('query', '')[:60]} | {len(claims)} claims")
     t0 = time.time()
-    max_retries = cfg.get("max_retries", 3)
+    max_retries        = cfg.get("max_retries", 3)
+    disable_reasoning  = not cfg.get("judge_reasoning", True)
+    provider           = cfg.get("judge_provider") or None
 
     # ── Step 1: Classify each claim as A/B/C/D ─────────────────────────────
     categorized: list[dict] = []
@@ -319,7 +332,9 @@ def process_survey(
         # Per-claim source context: use claim record for more precise lookup
         source_ctx = get_source_context(c, gen, corpus_index)
         cat_result = classify_claim(
-            c["claim"], source_ctx, client, cfg["judge_model"], max_retries
+            c["claim"], source_ctx, client, cfg["judge_model"], max_retries,
+            disable_reasoning=disable_reasoning,
+            provider=provider,
         )
         categorized.append({**c, **cat_result, "_source_ctx": source_ctx})
 

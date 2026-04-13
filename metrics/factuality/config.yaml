@@ -7,6 +7,8 @@ alignscore_ckpt: /app/models_cache/yzha--AlignScore-large/AlignScore-large.ckpt
 judge_model:       qwen/qwen3-32b
 judge_base_url:    https://openrouter.ai/api/v1
 judge_api_key_env: OPENROUTER_API_KEY
+judge_provider:    alibaba        # опционально — явно указать провайдера
+judge_reasoning:   false          # отключить thinking токены
 judge_id:          qwen3
 judge_comment:     run1
 
