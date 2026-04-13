@@ -3,7 +3,6 @@
 # above threshold sorted by similarity descending.
 
 import numpy as np
-from tqdm import tqdm
 
 
 def generate_candidates(
@@ -11,14 +10,17 @@ def generate_candidates(
     embedder,
     threshold: float = 0.6,
     batch_size: int = 32,
+    pbar=None,
 ) -> list[dict]:
     """Encode all sentences and return cross-section pairs above similarity threshold.
 
     Args:
-        sections: List of {"title": str, "sentences": list[str]}.
-        embedder: SentenceTransformer model (already loaded, reused from M_rep).
-        threshold: Cosine similarity threshold for candidate selection.
+        sections:   List of {"title": str, "sentences": list[str]}.
+        embedder:   SentenceTransformer model (already loaded, reused from M_rep).
+        threshold:  Cosine similarity threshold for candidate selection.
         batch_size: Encoding batch size.
+        pbar:       Optional tqdm bar. Must be reset to the correct total before calling.
+                    Updated once per pair; postfix set to "→ N sel" on completion.
 
     Returns:
         List of candidate dicts sorted by similarity descending:
@@ -46,21 +48,23 @@ def generate_candidates(
 
     candidates = []
     n = len(flat)
-    n_pairs = n * (n - 1) // 2
-    with tqdm(total=n_pairs, desc="  1/5 SPECTER pairs", leave=False, unit="pair") as pbar:
-        for i in range(n):
-            for j in range(i + 1, n):
+    for i in range(n):
+        for j in range(i + 1, n):
+            if pbar is not None:
                 pbar.update(1)
-                if flat[i]["section"] == flat[j]["section"]:
-                    continue  # same section pairs excluded
-                sim = float(sims[i, j])
-                if sim >= threshold:
-                    candidates.append({
-                        "s1":         flat[i]["text"],
-                        "t1":         flat[i]["section"],
-                        "s2":         flat[j]["text"],
-                        "t2":         flat[j]["section"],
-                        "similarity": round(sim, 4),
-                    })
+            if flat[i]["section"] == flat[j]["section"]:
+                continue  # same section pairs excluded
+            sim = float(sims[i, j])
+            if sim >= threshold:
+                candidates.append({
+                    "s1":         flat[i]["text"],
+                    "t1":         flat[i]["section"],
+                    "s2":         flat[j]["text"],
+                    "t2":         flat[j]["section"],
+                    "similarity": round(sim, 4),
+                })
+
+    if pbar is not None:
+        pbar.set_postfix_str(f"→ {len(candidates)} sel")
 
     return sorted(candidates, key=lambda x: x["similarity"], reverse=True)

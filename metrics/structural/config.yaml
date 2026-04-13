@@ -8,15 +8,16 @@ specter_model_path: /app/models_cache/sentence-transformers--allenai-specter
 judge_model:       qwen/qwen3-32b
 judge_base_url:    https://openrouter.ai/api/v1
 judge_api_key_env: OPENROUTER_API_KEY
-# judge_provider:    alibaba        # опционально — явно указать провайдера
-judge_reasoning:   false           # отключить thinking токены
+judge_provider:    alibaba        # опционально — явно указать провайдера
+judge_reasoning:     false          # отключить thinking токены
+judge_log_reasoning: false          # не включать поле reasoning в JSON-схему промпта (~10x меньше output токенов)
 judge_id:          qwen3
 judge_comment:     run1
 
 # ── A.1 — Противоречия (новый pipeline) ──────────────────────────────────────
 similarity_threshold:   0.6    # cosine similarity порог для кандидатов (SPECTER)
 embedding_batch_size:   32     # batch size для SPECTER кодирования
-concurrency:            25     # параллельные LLM вызовы (topic filter + contradiction)
+judge_workers:          25     # параллельные LLM вызовы (topic filter + contradiction)
 max_retries:            3      # retry попыток на LLM вызов
 cache_dir:              /tmp/structural/cache   # diskcache директория (том tmp)
 

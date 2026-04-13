@@ -24,6 +24,7 @@ setup_logging("app")
 
 GENERATIONS_DIR = ROOT / "results" / "generations"
 SCORES_DIR      = ROOT / "results" / "scores"
+HYPEROPT_DIR    = ROOT / "results" / "hyperopt"
 
 st.set_page_config(page_title="Thesis Viewer", layout="wide")
 
@@ -905,6 +906,148 @@ def page_comparison() -> None:
                 st.plotly_chart(fig, width="stretch")
 
 
+# ── Page: HyperOpt ────────────────────────────────────────────────────────────
+
+def _sim_badge(sim: float) -> str:
+    """Colored HTML badge for a similarity value (red→green gradient)."""
+    # interpolate red(0.5) → yellow(0.7) → green(0.9)
+    t = max(0.0, min(1.0, (sim - 0.5) / 0.4))
+    if t < 0.5:
+        r, g = 239, int(83 + t * 2 * (238 - 83))
+        b = 50
+    else:
+        r, g = int(239 - (t - 0.5) * 2 * (239 - 102)), 195
+        b = int(50 + (t - 0.5) * 2 * (58 - 50))
+    color = f"rgb({r},{g},{b})"
+    return (
+        f'<span style="background:{color};color:#111;padding:2px 8px;'
+        f'border-radius:4px;font-weight:600;font-size:0.9em">{sim:.3f}</span>'
+    )
+
+
+def _kde(values: list[float], x: "np.ndarray", bandwidth: float = 0.025) -> "np.ndarray":
+    """Gaussian KDE via numpy — no scipy/seaborn dependency."""
+    import numpy as np
+    arr = np.array(values)
+    return np.array([
+        float(np.sum(np.exp(-0.5 * ((xi - arr) / bandwidth) ** 2))
+              / (len(arr) * bandwidth * (2 * 3.14159265358979) ** 0.5))
+        for xi in x
+    ])
+
+
+def page_hyperopt_specter_thr() -> None:
+    import numpy as np
+
+    path = HYPEROPT_DIR / "specter_thr.json"
+    if not path.exists():
+        st.info(
+            "No data yet. Run the helper script first:\n\n"
+            "```bash\n"
+            "python scripts/structural_specter_thr.py \\\n"
+            "    --gen-dir results/generations/<dataset>_<model> \\\n"
+            "    --specter models_cache/sentence-transformers--allenai-specter\n"
+            "```"
+        )
+        return
+
+    try:
+        all_pairs: list[dict] = json.loads(path.read_text())
+    except Exception as e:
+        st.error(f"Failed to load specter_thr.json: {e}")
+        return
+
+    if not all_pairs:
+        st.warning("specter_thr.json is empty.")
+        return
+
+    sims    = [p["similarity"] for p in all_pairs]
+    surveys = sorted({p["survey_id"] for p in all_pairs})
+
+    # ── KDE plot (numpy + plotly, no extra deps) ───────────────────────────────
+    x    = np.linspace(0.45, 0.95, 300)
+    dens = _kde(sims, x)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x, y=dens,
+        mode="lines",
+        line=dict(color="#42a5f5", width=2),
+        fill="tozeroy",
+        fillcolor="rgba(66,165,245,0.2)",
+        name="KDE",
+    ))
+    fig.update_layout(
+        height=220,
+        margin=dict(l=10, r=10, t=10, b=40),
+        xaxis=dict(title="Cosine similarity", range=[0.45, 0.95]),
+        yaxis=dict(title="Density"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    st.caption(
+        f"**{len(all_pairs)} pairs** · **{len(surveys)} surveys** · "
+        f"range {min(sims):.3f} – {max(sims):.3f}"
+    )
+
+    st.divider()
+
+    # ── Sorted expandable pair list ────────────────────────────────────────────
+    for i, pair in enumerate(all_pairs):  # already sorted ascending by script
+        sim    = pair["similarity"]
+        sec_i  = pair.get("section_i", "?")
+        sec_j  = pair.get("section_j", "?")
+        survey = pair.get("survey_id", "—")
+        s1     = pair.get("s1", "")
+        s2     = pair.get("s2", "")
+
+        label = (
+            f"{_sim_badge(sim)} &nbsp;"
+            f"<span style='color:#888;font-size:0.82em'>"
+            f"{sec_i} → {sec_j} &nbsp;·&nbsp; <code>{survey}</code>"
+            f"</span>"
+        )
+
+        with st.expander(f"sim={sim:.3f}  ·  {sec_i} → {sec_j}", expanded=False):
+            st.markdown(label, unsafe_allow_html=True)
+            col_l, col_r = st.columns(2)
+            with col_l:
+                st.markdown(
+                    f"<div style='background:#1e1e2e;border-radius:6px;padding:10px 14px'>"
+                    f"<div style='font-size:0.75em;color:#aaa;margin-bottom:4px'>📂 {sec_i}</div>"
+                    f"<div style='font-size:0.93em;line-height:1.5'>{s1}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            with col_r:
+                st.markdown(
+                    f"<div style='background:#1e2e1e;border-radius:6px;padding:10px 14px'>"
+                    f"<div style='font-size:0.75em;color:#aaa;margin-bottom:4px'>📂 {sec_j}</div>"
+                    f"<div style='font-size:0.93em;line-height:1.5'>{s2}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+
+def page_hyperopt() -> None:
+    st.header("HyperOpt")
+
+    tools = ["specter_thr"]
+    tool  = st.sidebar.selectbox("Tool", tools, key="hp_tool")
+    st.sidebar.divider()
+
+    if tool == "specter_thr":
+        st.subheader("SPECTER similarity threshold calibration")
+        st.markdown(
+            "Browse sampled sentence pairs at each similarity bucket to calibrate "
+            "`similarity_threshold` in `metrics/structural/config.yaml`."
+        )
+        page_hyperopt_specter_thr()
+
+
 # ── Routing ────────────────────────────────────────────────────────────────────
 
 # Reset nav indices when switching pages
@@ -918,7 +1061,8 @@ def _on_page_change() -> None:
 
 
 page = st.sidebar.radio(
-    "View", ["Generations", "Evaluations", "PointsMetrics", "AggregatedMetrics"],
+    "View",
+    ["Generations", "Evaluations", "PointsMetrics", "AggregatedMetrics", "HyperOpt"],
     index=0, on_change=_on_page_change
 )
 st.sidebar.divider()
@@ -929,5 +1073,7 @@ elif page == "PointsMetrics":
     page_comparison()
 elif page == "AggregatedMetrics":
     page_aggregated_metrics()
+elif page == "HyperOpt":
+    page_hyperopt()
 else:
     page_evaluations()

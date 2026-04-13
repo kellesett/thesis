@@ -16,7 +16,7 @@ Two sentences do NOT discuss the same subject if they:
 - Cover different stages of a pipeline (e.g., training vs inference) without explicit connection
 
 Respond with a JSON object:
-{{"same_subject": true or false, "reasoning": "brief explanation"}}
+{schema}
 
 ---
 
@@ -24,6 +24,9 @@ Sentence 1: "{s1}"
 
 Sentence 2: "{s2}"
 """
+
+TOPIC_FILTER_SCHEMA_FULL    = '{{"same_subject": true or false, "reasoning": "brief explanation"}}'
+TOPIC_FILTER_SCHEMA_COMPACT = '{{"same_subject": true or false}}'
 
 CONTRADICTION_PROMPT = """A contradiction exists when two statements from a scientific survey make incompatible claims about the same entity, method, result, or phenomenon. Note carefully:
 - Different formulations of the same fact are NOT contradictions
@@ -36,7 +39,7 @@ CONTRADICTION_PROMPT = """A contradiction exists when two statements from a scie
 Your task: determine whether the two statements below contradict each other.
 
 Respond with a JSON object:
-{{"is_contradiction": true or false, "reasoning": "brief explanation", "contradiction_type": "factual" | "methodological" | "quantitative" | "pragmatic" | "none"}}
+{schema}
 
 ---
 
@@ -46,3 +49,6 @@ Statement 1 (from section "{section_i}"):
 Statement 2 (from section "{section_j}"):
 "{s2}"
 """
+
+CONTRADICTION_SCHEMA_FULL    = '{{"is_contradiction": true or false, "reasoning": "brief explanation", "contradiction_type": "factual" | "methodological" | "quantitative" | "pragmatic" | "none"}}'
+CONTRADICTION_SCHEMA_COMPACT = '{{"is_contradiction": true or false, "contradiction_type": "factual" | "methodological" | "quantitative" | "pragmatic" | "none"}}'

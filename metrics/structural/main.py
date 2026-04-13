@@ -142,6 +142,8 @@ def compute_m_rep(
     nli_pipe,
     cfg: dict,
     stage_dir: Path,
+    rep_bar=None,
+    nli_bar=None,
 ) -> dict:
     """Compute cross-section repetition rate (A.3).
 
@@ -151,11 +153,13 @@ def compute_m_rep(
     Each stage loads from disk if its output file already exists (resume support).
 
     Args:
-        sections:     List of sections with sentences.
+        sections:      List of sections with sentences.
         specter_model: SPECTER sentence encoder for pre-filtering.
-        nli_pipe:     NLI pipeline for entailment verification.
-        cfg:          Config with similarity and entailment thresholds.
-        stage_dir:    Directory for intermediate JSON files.
+        nli_pipe:      NLI pipeline for entailment verification.
+        cfg:           Config with similarity and entailment thresholds.
+        stage_dir:     Directory for intermediate JSON files.
+        rep_bar:       Optional tqdm bar for stage 4 (SPECTER pair iteration).
+        nli_bar:       Optional tqdm bar for stage 5 (NLI check).
 
     Returns:
         Dict with m_rep (rate), n_total_sentences, n_candidates, n_duplicates.
@@ -175,34 +179,49 @@ def compute_m_rep(
     ]
     n_total = len(all_sents)
     if n_total < 2:
+        for bar in [rep_bar, nli_bar]:
+            if bar is not None:
+                bar.reset(total=1)
+                bar.update(1)
+                bar.set_postfix_str("n/a (< 2 sentences)")
         return {"m_rep": 0.0, "n_total_sentences": n_total, "n_candidates": 0, "n_duplicates": 0}
 
     texts  = [s for s, _ in all_sents]
     titles = [t for _, t in all_sents]
+    n_pairs = n_total * (n_total - 1) // 2
 
     # ── Stage 4 — SPECTER rep candidates ─────────────────────────────────────
     cands_file = stage_dir / "candidates.json"
     if cands_file.exists():
         rep_candidates = json.loads(cands_file.read_text())
+        if rep_bar is not None:
+            rep_bar.reset(total=n_pairs)
+            rep_bar.update(n_pairs)
+            rep_bar.set_postfix_str(f"→ {len(rep_candidates)} sel (cached)")
     else:
         embs = specter_model.encode(texts, batch_size=64, show_progress_bar=False)
         sims = cos_sim(embs, embs)
 
+        if rep_bar is not None:
+            rep_bar.reset(total=n_pairs)
+
         rep_candidates = []
-        n_pairs = n_total * (n_total - 1) // 2
-        with tqdm(total=n_pairs, desc="  4/5 rep SPECTER", leave=False, unit="pair") as pbar:
-            for i in range(n_total):
-                for j in range(i + 1, n_total):
-                    pbar.update(1)
-                    if titles[i] == titles[j]:
-                        continue
-                    if sims[i, j] >= emb_threshold:
-                        rep_candidates.append({
-                            "i": i, "j": j,
-                            "s1": texts[i], "s2": texts[j],
-                            "section_i": titles[i], "section_j": titles[j],
-                            "similarity": round(float(sims[i, j]), 4),
-                        })
+        for i in range(n_total):
+            for j in range(i + 1, n_total):
+                if rep_bar is not None:
+                    rep_bar.update(1)
+                if titles[i] == titles[j]:
+                    continue
+                if sims[i, j] >= emb_threshold:
+                    rep_candidates.append({
+                        "i": i, "j": j,
+                        "s1": texts[i], "s2": texts[j],
+                        "section_i": titles[i], "section_j": titles[j],
+                        "similarity": round(float(sims[i, j]), 4),
+                    })
+
+        if rep_bar is not None:
+            rep_bar.set_postfix_str(f"→ {len(rep_candidates)} sel")
 
         cands_file.write_text(json.dumps(rep_candidates, ensure_ascii=False))
 
@@ -210,22 +229,35 @@ def compute_m_rep(
     dup_file = stage_dir / "duplicates.json"
     if dup_file.exists():
         dup_results = json.loads(dup_file.read_text())
+        n_dup = sum(1 for r in dup_results if r.get("is_duplicate"))
+        if nli_bar is not None:
+            n_cands = max(len(rep_candidates), 1)
+            nli_bar.reset(total=n_cands)
+            nli_bar.update(n_cands)
+            nli_bar.set_postfix_str(f"{n_dup}/{len(rep_candidates)} dup (cached)")
     else:
+        if nli_bar is not None:
+            nli_bar.reset(total=max(len(rep_candidates), 1))
+
         dup_results = []
-        with tqdm(total=len(rep_candidates), desc="  5/5 NLI", leave=False, unit="pair") as pbar:
-            for cand in rep_candidates:
-                try:
-                    fwd = nli_scores(nli_pipe, cand["s1"], cand["s2"])
-                    bwd = nli_scores(nli_pipe, cand["s2"], cand["s1"])
-                    is_dup = (
-                        fwd.get("ENTAILMENT", 0) >= nli_threshold and
-                        bwd.get("ENTAILMENT", 0) >= nli_threshold
-                    )
-                    dup_results.append({**cand, "is_duplicate": is_dup})
-                except Exception:
-                    raise
-                finally:
-                    pbar.update(1)
+        n_dup = 0
+        for cand in rep_candidates:
+            try:
+                fwd = nli_scores(nli_pipe, cand["s1"], cand["s2"])
+                bwd = nli_scores(nli_pipe, cand["s2"], cand["s1"])
+                is_dup = (
+                    fwd.get("ENTAILMENT", 0) >= nli_threshold and
+                    bwd.get("ENTAILMENT", 0) >= nli_threshold
+                )
+                dup_results.append({**cand, "is_duplicate": is_dup})
+                if is_dup:
+                    n_dup += 1
+            except Exception:
+                raise
+            finally:
+                if nli_bar is not None:
+                    nli_bar.update(1)
+                    nli_bar.set_postfix_str(f"{n_dup}/{nli_bar.n} dup")
 
         dup_file.write_text(json.dumps(dup_results, ensure_ascii=False))
 
@@ -256,6 +288,11 @@ def process_survey(
     cache,
     stage_base: Path,
     hparams_id: str,
+    specter_bar=None,
+    topic_bar=None,
+    contr_bar=None,
+    rep_bar=None,
+    nli_bar=None,
 ) -> dict | None:
     survey_id  = gen["id"]
     dataset_id = gen["dataset_id"]
@@ -266,48 +303,53 @@ def process_survey(
         try:
             with open(out_file) as f:
                 existing = json.load(f)
-            print(f"  [SKIP] {survey_id} — already scored")
+            tqdm.write(f"  [SKIP] {survey_id} — already scored")
             return existing
         except Exception:
-            print(f"  [WARN] {survey_id} — corrupt cache, re-processing")
+            tqdm.write(f"  [WARN] {survey_id} — corrupt cache, re-processing")
 
     if not gen.get("success", False):
-        print(f"  [SKIP] {survey_id} — generation not successful")
+        tqdm.write(f"  [SKIP] {survey_id} — generation not successful")
         return None
 
     text = gen.get("text", "").strip()
     if not text:
-        print(f"  [SKIP] {survey_id} — empty text")
+        tqdm.write(f"  [SKIP] {survey_id} — empty text")
         return None
 
-    print(f"  [PROC] {survey_id} | {gen.get('query', '')[:60]}")
     t0 = time.time()
 
     sections = split_sections(text)
     n_sents  = sum(len(s["sentences"]) for s in sections)
-    print(f"         {len(sections)} sections, {n_sents} sentences")
+    tqdm.write(f"  [PROC] {survey_id} | {len(sections)} sec / {n_sents} sent")
 
     contr_stage_dir = stage_base / "contradiction" / dataset_id / model_id / hparams_id / survey_id
     rep_stage_dir   = stage_base / "repetition"    / dataset_id / model_id / hparams_id / survey_id
 
     try:
-        contr = compute_m_contr(survey_id, sections, specter_model, client, cfg, cache, contr_stage_dir)
+        contr = compute_m_contr(
+            survey_id, sections, specter_model, client, cfg, cache, contr_stage_dir,
+            specter_bar=specter_bar, topic_bar=topic_bar, contr_bar=contr_bar,
+        )
     except Exception:
         logger.exception(f"Error computing m_contr for {survey_id}")
         raise
 
     try:
-        rep = compute_m_rep(sections, specter_model, nli_pipe, cfg, rep_stage_dir)
+        rep = compute_m_rep(
+            sections, specter_model, nli_pipe, cfg, rep_stage_dir,
+            rep_bar=rep_bar, nli_bar=nli_bar,
+        )
     except Exception:
         logger.exception(f"Error computing m_rep for {survey_id}")
         raise
 
     result = {
-        "survey_id":  survey_id,
-        "dataset_id": gen["dataset_id"],
-        "model_id":   gen["model_id"],
-        "query":      gen.get("query", ""),
-        "n_sections": len(sections),
+        "survey_id":   survey_id,
+        "dataset_id":  gen["dataset_id"],
+        "model_id":    gen["model_id"],
+        "query":       gen.get("query", ""),
+        "n_sections":  len(sections),
         "n_sentences": n_sents,
         **{f"contr_{k}": v for k, v in contr.items()},
         **{f"rep_{k}":   v for k, v in rep.items()},
@@ -318,8 +360,8 @@ def process_survey(
     with open(out_file, "w") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
-    print(
-        f"         m_contr={contr.get('m_contr')}  "
+    tqdm.write(
+        f"         ✓ m_contr={contr.get('m_contr')}  "
         f"(cands={contr.get('n_candidates_stage1')} "
         f"topic={contr.get('n_after_topic_filter')} "
         f"confirmed={contr.get('n_contradictions')})  "
@@ -384,17 +426,43 @@ def main() -> None:
     gen_files = sorted(gen_dir.glob("*.json"))
     gen_files = [f for f in gen_files if not re.search(r"_(raw|old)\.json$", f.name)]
 
-    print(f"\n[structural] {args.dataset} / {args.model}")
-    print(f"             {len(gen_files)} surveys → {out_dir}\n")
+    tqdm.write(f"\n[structural] {args.dataset} / {args.model}")
+    tqdm.write(f"             {len(gen_files)} surveys → {out_dir}\n")
+
+    # ── Progress bars (all leave=True, reset between surveys) ─────────────────
+    # position=5 = top line, position=0 = bottom line
+    survey_bar  = tqdm(total=len(gen_files), desc="Surveys         ", position=0, leave=True, unit="survey")
+    specter_bar = tqdm(total=1, desc="  1/5 SPECTER   ", position=1, leave=True, unit="pair")
+    topic_bar   = tqdm(total=1, desc="  2/5 topic flt ", position=2, leave=True, unit="pair")
+    contr_bar   = tqdm(total=1, desc="  3/5 contr chk ", position=3, leave=True, unit="pair")
+    rep_bar     = tqdm(total=1, desc="  4/5 rep SPECTER", position=4, leave=True, unit="pair")
+    nli_bar     = tqdm(total=1, desc="  5/5 NLI       ", position=5, leave=True, unit="pair")
 
     all_results = []
-    for gf in gen_files:
-        with open(gf) as f:
-            gen = json.load(f)
+    try:
+        for gf in gen_files:
+            with open(gf) as f:
+                gen = json.load(f)
 
-        res = process_survey(gen, out_dir, cfg, nli_pipe, specter_model, client, cache, stage_base, hparams_id)
-        if res:
-            all_results.append(res)
+            survey_bar.set_postfix_str(gen.get("query", "")[:55])
+
+            res = process_survey(
+                gen, out_dir, cfg, nli_pipe, specter_model, client, cache,
+                stage_base, hparams_id,
+                specter_bar=specter_bar, topic_bar=topic_bar, contr_bar=contr_bar,
+                rep_bar=rep_bar, nli_bar=nli_bar,
+            )
+            survey_bar.update(1)
+            if res:
+                all_results.append(res)
+
+            # Reset inner bars — clears postfix so next survey starts fresh
+            for bar in [specter_bar, topic_bar, contr_bar, rep_bar, nli_bar]:
+                bar.reset(total=1)
+                bar.set_postfix_str("")
+    finally:
+        for bar in [nli_bar, rep_bar, contr_bar, topic_bar, specter_bar, survey_bar]:
+            bar.close()
 
     if all_results:
         write_summary(all_results, out_dir)

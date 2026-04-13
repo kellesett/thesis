@@ -11,6 +11,7 @@ judge_id:          qwen3
 judge_comment:     run1
 
 # ── AlignScore ────────────────────────────────────────────────────────────────
+alignscore_enabled:    false  # false = пропустить AlignScore, считать только LLM-категоризацию
 alignscore_batch_size: 16
 alignscore_threshold:  0.5    # P(support) порог для Support(a, e_a) = 1
 

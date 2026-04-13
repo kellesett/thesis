@@ -323,34 +323,41 @@ def process_survey(
         )
         categorized.append({**c, **cat_result, "_source_ctx": source_ctx})
 
-    # ── Step 2: AlignScore support verification ────────────────────────────
-    claim_texts = [c["claim"] for c in categorized]
-    contexts    = [c.get("_source_ctx", "") for c in categorized]
-    threshold   = cfg.get("alignscore_threshold", 0.5)
-
-    supported = compute_support_batch(claim_texts, contexts, alignscore_model, threshold)
-
-    for c, sup in zip(categorized, supported):
-        c["supported"] = sup
+    # ── Step 2: AlignScore support verification (optional) ────────────────
+    if alignscore_model is not None:
+        claim_texts = [c["claim"] for c in categorized]
+        contexts    = [c.get("_source_ctx", "") for c in categorized]
+        threshold   = cfg.get("alignscore_threshold", 0.5)
+        supported   = compute_support_batch(claim_texts, contexts, alignscore_model, threshold)
+        for c, sup in zip(categorized, supported):
+            c["supported"] = sup
+    else:
+        for c in categorized:
+            c["supported"] = None
 
     # ── Step 3: Compute CitCorrect_k per category ──────────────────────────
+    alignscore_enabled = alignscore_model is not None
     categories = ["A", "B", "C", "D"]
     cit_correct: dict[str, float | None] = {}
     cit_counts:  dict[str, dict]         = {}
 
     for k in categories:
         subset = [c for c in categorized if c["category"] == k]
-        if not subset:
+        if not subset or not alignscore_enabled:
             cit_correct[k] = None
-            cit_counts[k]  = {"n": 0, "n_supported": 0}
+            cit_counts[k]  = {"n": len(subset), "n_supported": None}
             continue
         n_sup = sum(1 for c in subset if c["supported"])
         cit_correct[k] = round(n_sup / len(subset), 4)
         cit_counts[k]  = {"n": len(subset), "n_supported": n_sup}
 
     overall_n   = len(categorized)
-    overall_sup = sum(1 for c in categorized if c["supported"])
-    cit_correct_overall = round(overall_sup / overall_n, 4) if overall_n else None
+    if alignscore_enabled:
+        overall_sup = sum(1 for c in categorized if c["supported"])
+        cit_correct_overall = round(overall_sup / overall_n, 4) if overall_n else None
+    else:
+        overall_sup         = None
+        cit_correct_overall = None
 
     result = {
         "survey_id":    survey_id,
@@ -359,6 +366,7 @@ def process_survey(
         "query":        gen.get("query", ""),
         "n_claims":     overall_n,
         "n_supported":  overall_sup,
+        "alignscore_enabled":  alignscore_enabled,
         "cit_correct_overall": cit_correct_overall,
         "cit_correct_A": cit_correct["A"],
         "cit_correct_B": cit_correct["B"],
@@ -374,12 +382,16 @@ def process_survey(
     with open(out_file, "w") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
-    print(
-        f"         CitCorrect: overall={cit_correct_overall}  "
-        f"A={cit_correct['A']}  B={cit_correct['B']}  "
-        f"C={cit_correct['C']}  D={cit_correct['D']}  "
-        f"({result['latency_sec']}s)"
-    )
+    if alignscore_enabled:
+        print(
+            f"         CitCorrect: overall={cit_correct_overall}  "
+            f"A={cit_correct['A']}  B={cit_correct['B']}  "
+            f"C={cit_correct['C']}  D={cit_correct['D']}  "
+            f"({result['latency_sec']}s)"
+        )
+    else:
+        cat_dist = "  ".join(f"{k}={cit_counts[k]['n']}" for k in ["A", "B", "C", "D"])
+        print(f"         Categories: {cat_dist}  (AlignScore disabled, {result['latency_sec']}s)")
     return result
 
 
@@ -414,9 +426,13 @@ def main() -> None:
 
     claims_dir = resolve_claims_dir(args.dataset, args.model)
 
+    alignscore_enabled = cfg.get("alignscore_enabled", True)
+
     print("\n[factuality] Loading models...")
-    alignscore_model = load_alignscore(cfg)
-    corpus_index     = build_corpus_index(args.dataset)
+    alignscore_model = load_alignscore(cfg) if alignscore_enabled else None
+    if not alignscore_enabled:
+        print("  AlignScore disabled — running LLM categorization only")
+    corpus_index = build_corpus_index(args.dataset)
 
     gen_dir = ROOT / "results" / "generations" / f"{args.dataset}_{args.model}"
     if not gen_dir.exists():

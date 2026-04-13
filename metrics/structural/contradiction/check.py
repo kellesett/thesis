@@ -5,10 +5,13 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
-from tqdm import tqdm
 
-from .llm_utils import llm_json_cached
-from .prompts import CONTRADICTION_PROMPT
+from .llm_utils import TokenCounter, llm_json_cached
+from .prompts import (
+    CONTRADICTION_PROMPT,
+    CONTRADICTION_SCHEMA_COMPACT,
+    CONTRADICTION_SCHEMA_FULL,
+)
 
 
 def _check_one(
@@ -19,8 +22,12 @@ def _check_one(
     disable_reasoning: bool,
     provider: str | None,
     cache,
+    token_counter: TokenCounter | None,
+    log_reasoning: bool,
 ) -> dict:
+    schema = CONTRADICTION_SCHEMA_FULL if log_reasoning else CONTRADICTION_SCHEMA_COMPACT
     prompt = CONTRADICTION_PROMPT.format(
+        schema=schema,
         section_i=pair["t1"],
         s1=pair["s1"][:400],
         section_j=pair["t2"],
@@ -30,6 +37,7 @@ def _check_one(
         client, model, prompt,
         pair["s1"], pair["s2"], "contradiction",
         cache, max_retries, disable_reasoning, provider,
+        token_counter=token_counter,
     )
     return {
         **pair,
@@ -45,14 +53,20 @@ def run_contradiction_check(
     client: OpenAI,
     cfg: dict,
     cache,
+    pbar=None,
+    token_counter: TokenCounter | None = None,
+    log_reasoning: bool = True,
 ) -> list[dict]:
     """Run contradiction check on topic-filtered pairs in parallel.
 
     Args:
-        pairs: Candidates with same_subject=True from run_topic_filter().
-        client: OpenAI client.
-        cfg: Config dict.
-        cache: diskcache.Cache instance.
+        pairs:         Candidates with same_subject=True from run_topic_filter().
+        client:        OpenAI client.
+        cfg:           Config dict.
+        cache:         diskcache.Cache instance.
+        pbar:          Optional tqdm bar (must be reset to len(pairs) before call).
+                       Updated once per completed pair; postfix shows live stats.
+        token_counter: Optional shared TokenCounter for live token tracking.
 
     Returns:
         List of pairs enriched with is_contradiction, reasoning, contradiction_type.
@@ -62,21 +76,30 @@ def run_contradiction_check(
     max_retries       = cfg.get("max_retries", 3)
     disable_reasoning = not cfg.get("judge_reasoning", True)
     provider          = cfg.get("judge_provider")
-    concurrency       = cfg.get("concurrency", 25)
+    concurrency       = cfg.get("judge_workers", 25)
 
     results: list[dict | None] = [None] * len(pairs)
+    n_confirmed = 0
+
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
         futures = {
             ex.submit(
                 _check_one, pair, client, model,
                 max_retries, disable_reasoning, provider, cache,
+                token_counter, log_reasoning,
             ): i
             for i, pair in enumerate(pairs)
         }
-        with tqdm(total=len(pairs), desc="  3/5 contradiction", leave=False, unit="pair") as pbar:
-            for future in as_completed(futures):
-                i = futures[future]
-                results[i] = future.result()
+        for future in as_completed(futures):
+            i = futures[future]
+            results[i] = future.result()
+            if results[i].get("is_contradiction") and results[i].get("status") != "failed":
+                n_confirmed += 1
+            if pbar is not None:
                 pbar.update(1)
+                postfix = f"{n_confirmed}/{pbar.n} confirmed"
+                if token_counter is not None:
+                    postfix += f" | {token_counter.fmt()}"
+                pbar.set_postfix_str(postfix)
 
     return results
