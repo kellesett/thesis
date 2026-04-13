@@ -79,11 +79,14 @@ def download_model(m: dict) -> None:
     local_dir.mkdir(exist_ok=True)
 
     if m["fn"] == "snapshot":
-        # Check if model is already downloaded
-        existing = list(local_dir.glob("*.safetensors")) + list(local_dir.glob("*.bin"))
-        if existing:
+        # Check if model is fully downloaded (weights AND tokenizer config must both exist)
+        has_weights    = bool(list(local_dir.glob("*.safetensors")) + list(local_dir.glob("*.bin")))
+        has_tokenizer  = (local_dir / "tokenizer_config.json").exists()
+        if has_weights and has_tokenizer:
             logger.info(f"  ✓ {m['local']} — already downloaded, skipping")
             return
+        if has_weights and not has_tokenizer:
+            logger.info(f"  ↺ {m['local']} — weights found but tokenizer missing, re-downloading")
         logger.info(f"  ↓ {m['local']} ({m['desc']}) ...")
         snapshot_download(
             repo_id=m["repo_id"],

@@ -1,24 +1,24 @@
 metric_id: structural
 
 # ── Локальные модели (монтируются через volume models_cache:/app/models_cache) ──
-ner_model_path:     /app/models_cache/fleonce--iter-scierc-scideberta-full
 nli_model_path:     /app/models_cache/microsoft--deberta-v2-xlarge-mnli
 specter_model_path: /app/models_cache/sentence-transformers--allenai-specter
 
 # ── LLM судья (через OpenRouter) ─────────────────────────────────────────────
-judge_model:       openai/gpt-4o-mini
+judge_model:       qwen/qwen3-32b
 judge_base_url:    https://openrouter.ai/api/v1
 judge_api_key_env: OPENROUTER_API_KEY
-judge_id:          gpt4o_mini
+# judge_provider:    alibaba        # опционально — явно указать провайдера
+judge_reasoning:   false           # отключить thinking токены
+judge_id:          qwen3
 judge_comment:     run1
 
-# ── A.1 — Противоречия ───────────────────────────────────────────────────────
-contr_nli_threshold:      0.5     # min P(contradiction) для кандидата
-contr_max_candidates:     200     # cap кандидатов на обзор (дороже — LLM вызов)
-
-# ── A.2 — Терминологическая неконсистентность ─────────────────────────────────
-term_similarity_threshold: 0.85   # cosine similarity порог кластеризации
-term_min_cluster_size:     2      # мин. размер кластера для рассмотрения
+# ── A.1 — Противоречия (новый pipeline) ──────────────────────────────────────
+similarity_threshold:   0.6    # cosine similarity порог для кандидатов (SPECTER)
+embedding_batch_size:   32     # batch size для SPECTER кодирования
+concurrency:            25     # параллельные LLM вызовы (topic filter + contradiction)
+max_retries:            3      # retry попыток на LLM вызов
+cache_dir:              /tmp/structural/cache   # diskcache директория (том tmp)
 
 # ── A.3 — Повторы ─────────────────────────────────────────────────────────────
 rep_embedding_prefilter:  0.7    # cosine similarity порог pre-filter

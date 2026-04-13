@@ -1,17 +1,17 @@
 metric_id: expert
 
 # ── LLM судья (через OpenRouter) ─────────────────────────────────────────────
-judge_model:       meta-llama/llama-3.3-70b-instruct:nitro
+judge_model:       qwen/qwen3-32b
 judge_base_url:    https://openrouter.ai/api/v1
 judge_api_key_env: OPENROUTER_API_KEY
-# judge_provider:    groq          # опционально — явно указать провайдера на OpenRouter
+judge_provider:    alibaba          # опционально — явно указать провайдера на OpenRouter
 judge_disable_reasoning: true  # отключить reasoning/thinking токены (для моделей типа Qwen3, DeepSeek-R1)
-judge_id:          llama-3.3
+judge_id:          qwen3
 judge_comment:     run1
 
 # ── Параметры ─────────────────────────────────────────────────────────────────
 max_retries:       3
-# Параллельные LLM вызовы на один claim (C.1 + C.2 + C.3 + C.4 одновременно)
-llm_concurrency:   4
+# Параллельные claims (каждый — 1 LLM вызов с C.1–C.4)
+judge_workers:     10
 
 resume: true

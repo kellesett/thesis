@@ -3,15 +3,11 @@
 metrics/structural/main.py
 Structural quality metrics for generated surveys (group A).
 
-Computes three metrics per survey:
+Computes two metrics per survey:
 
   M_contr  — cross-section contradiction rate (A.1)
-             Two-stage: NLI entity-filtered candidates → LLM judge validation.
+             SPECTER similarity candidates → LLM topic filter → LLM contradiction check.
              Lower is better (0 = no contradictions).
-
-  M_term   — terminological inconsistency rate (A.2, exploratory)
-             NER → SPECTER embedding → HDBSCAN clusters → LLM judge.
-             Lower is better.
 
   M_rep    — cross-section repetition rate (A.3)
              SPECTER pre-filter → bi-directional NLI entailment.
@@ -32,7 +28,6 @@ import os
 import re
 import sys
 import time
-import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -49,23 +44,29 @@ ROOT   = Path(__file__).parent.parent.parent
 CONFIG = Path(__file__).parent / "config.yaml"
 sys.path.insert(0, str(ROOT))
 
+import diskcache
+from tqdm import tqdm
+
 from src.log_setup import setup_logging
 from metrics.utils import make_client, load_config
+from metrics.structural.contradiction.aggregate import compute_m_contr
+
+
+# ── Hyperparams ID ────────────────────────────────────────────────────────────
+
+def build_hyperparams_id(cfg: dict) -> str:
+    """Short human-readable key that captures cache-relevant hyperparameters.
+
+    Used as part of the intermediate stage path so that runs with different
+    thresholds or judge models don't share cached intermediate results.
+    """
+    sim = cfg.get("similarity_threshold", 0.6)
+    rp  = cfg.get("rep_embedding_prefilter", 0.7)
+    jid = cfg.get("judge_id", "judge")
+    return f"sim{sim}_rp{rp}_{jid}"
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
-
-def load_ner_model(path: str):
-    """Load ITER SciERC NER model as HuggingFace token-classification pipeline."""
-    from transformers import pipeline
-    print(f"  Loading NER: {path}")
-    return pipeline(
-        "token-classification",
-        model=path,
-        aggregation_strategy="max",
-        device=-1,  # CPU
-    )
-
 
 def load_nli_model(path: str):
     """Load DeBERTa-v2-xlarge-mnli as a text-classification pipeline."""
@@ -132,294 +133,6 @@ def nli_scores(nli_pipe, premise: str, hypothesis: str) -> dict:
     return {r["label"].upper(): r["score"] for r in result}
 
 
-# ── A.1 — Contradiction detection ────────────────────────────────────────────
-
-_CONTR_PROMPT = """\
-You are evaluating whether two statements from a scientific survey contradict each other.
-
-Statement 1 (from section "{section_i}"):
-"{statement_1}"
-
-Statement 2 (from section "{section_j}"):
-"{statement_2}"
-
-These statements were flagged as potentially contradictory because they mention the same entities: {shared_entities}.
-
-A contradiction exists when the two statements make incompatible claims about the same entity, method, result, or phenomenon. Note carefully:
-- Different formulations of the same fact are NOT contradictions
-- Statements about different aspects of the same entity are NOT contradictions
-- Statements using different terminology but compatible meanings are NOT contradictions
-- Temporal evolution ("earlier work said X, later work showed Y") is NOT a contradiction within the survey's own voice
-- A genuine contradiction requires that both statements cannot simultaneously be true
-
-Respond with a JSON object:
-{{"is_contradiction": true | false, "reasoning": "brief explanation", "contradiction_type": "factual" | "methodological" | "quantitative" | "none"}}"""
-
-
-def extract_entities(ner_pipe, sentences: list[str]) -> list[set[str]]:
-    """Return per-sentence sets of entity surface forms (lowercased)."""
-    result = []
-    for sent in sentences:
-        try:
-            ents = ner_pipe(sent[:512])
-            words = {e["word"].lower().strip("##") for e in ents if e.get("word")}
-            result.append(words)
-        except Exception:
-            result.append(set())
-    return result
-
-
-def compute_m_contr(
-    sections: list[dict],
-    ner_pipe,
-    nli_pipe,
-    client: OpenAI,
-    cfg: dict,
-) -> dict:
-    """Compute cross-section contradiction rate (A.1).
-
-    Two-stage pipeline: NLI entity-filtered candidate pairs → LLM judge validation.
-
-    Args:
-        sections: List of sections with sentences.
-        ner_pipe: NER pipeline for entity extraction.
-        nli_pipe: NLI pipeline for entailment checking.
-        client: OpenAI client for LLM judge.
-        cfg: Config with thresholds and model name.
-
-    Returns:
-        Dict with m_contr (rate), n_candidates, n_confirmed.
-    """
-    nli_threshold  = cfg.get("contr_nli_threshold", 0.5)
-    max_candidates = cfg.get("contr_max_candidates", 200)
-    model          = cfg["judge_model"]
-
-    # Flatten (sentence, section_title, entity_set) for all sections
-    flat: list[tuple[str, str, set]] = []
-    for sec in sections:
-        ent_sets = extract_entities(ner_pipe, sec["sentences"])
-        for sent, ents in zip(sec["sentences"], ent_sets):
-            flat.append((sent, sec["title"], ents))
-
-    # Cross-section pairs with shared entities
-    candidates = []
-    for i, (s1, t1, e1) in enumerate(flat):
-        for j, (s2, t2, e2) in enumerate(flat):
-            if j <= i:
-                continue
-            if t1 == t2:
-                continue  # same section
-            shared = e1 & e2
-            if not shared:
-                continue
-            scores = nli_scores(nli_pipe, s1, s2)
-            if scores.get("CONTRADICTION", 0) >= nli_threshold:
-                candidates.append({
-                    "s1": s1, "t1": t1,
-                    "s2": s2, "t2": t2,
-                    "shared_entities": list(shared)[:5],
-                    "nli_contradiction": scores.get("CONTRADICTION", 0),
-                })
-
-    # Cap for cost control
-    if len(candidates) > max_candidates:
-        candidates = sorted(
-            candidates, key=lambda x: x["nli_contradiction"], reverse=True
-        )[:max_candidates]
-
-    if not candidates:
-        return {"m_contr": 0.0, "n_candidates": 0, "n_confirmed": 0}
-
-    # LLM judge validation
-    n_confirmed = 0
-    for cand in candidates:
-        prompt = _CONTR_PROMPT.format(
-            section_i=cand["t1"],
-            statement_1=cand["s1"][:400],
-            section_j=cand["t2"],
-            statement_2=cand["s2"][:400],
-            shared_entities=", ".join(cand["shared_entities"]),
-        )
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-            )
-            content = resp.choices[0].message.content
-            if content is None:
-                print(f"[ERROR] OpenRouter None content (finish_reason={resp.choices[0].finish_reason}).\n"
-                      f"Full response: {resp}", file=sys.stderr)
-                raise RuntimeError(
-                    f"OpenRouter returned None content "
-                    f"(finish_reason={resp.choices[0].finish_reason})."
-                )
-            raw = content.strip()
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            parsed = json.loads(raw)
-            if parsed.get("is_contradiction"):
-                n_confirmed += 1
-                cand["llm_confirmed"] = True
-                cand["contradiction_type"] = parsed.get("contradiction_type", "unknown")
-        except Exception as e:
-            cand["llm_error"] = str(e)
-
-    m_contr = n_confirmed / len(candidates) if candidates else 0.0
-    return {
-        "m_contr":      round(m_contr, 4),
-        "n_candidates": len(candidates),
-        "n_confirmed":  n_confirmed,
-    }
-
-
-# ── A.2 — Terminological inconsistency ───────────────────────────────────────
-
-_TERM_PROMPT = """\
-You are evaluating terminological consistency in a scientific survey.
-
-The following surface forms were clustered together as potentially referring to the same concept:
-{list_of_forms}
-
-Context snippets where each form appears:
-{context_snippets}
-
-Determine whether these forms represent:
-1. Legitimate stylistic variation — all forms refer to exactly the same concept, and using different forms is normal scientific writing practice
-2. Genuine terminological inconsistency — the forms refer to subtly different concepts, or their interchangeable use creates ambiguity
-
-Important:
-- Abbreviations and their full forms are NOT inconsistency
-- Different levels of specificity may or may not be inconsistent depending on context
-- Only flag as inconsistency when the variation actually causes confusion
-
-Respond with a JSON object:
-{{"is_inconsistent": true | false, "reasoning": "brief explanation", "severity": "none" | "minor" | "major"}}"""
-
-
-def compute_m_term(
-    sections: list[dict],
-    ner_pipe,
-    specter_model,
-    client: OpenAI,
-    cfg: dict,
-) -> dict:
-    """Compute terminological inconsistency rate (A.2, exploratory).
-
-    NER → SPECTER embedding → HDBSCAN clustering → LLM judge for inconsistency.
-
-    Args:
-        sections: List of sections with sentences.
-        ner_pipe: NER pipeline for entity extraction.
-        specter_model: SPECTER sentence encoder for embeddings.
-        client: OpenAI client for LLM judge.
-        cfg: Config with similarity threshold and cluster settings.
-
-    Returns:
-        Dict with m_term (rate), n_clusters, n_inconsistent, exploratory flag.
-    """
-    sim_threshold   = cfg.get("term_similarity_threshold", 0.85)
-    min_cluster     = cfg.get("term_min_cluster_size", 2)
-    model           = cfg["judge_model"]
-
-    from sklearn.metrics.pairwise import cosine_similarity
-    try:
-        import hdbscan
-    except ImportError:
-        return {"m_term": None, "error": "hdbscan not installed", "exploratory": True}
-
-    # Collect all (entity_text, sentence, section) triples
-    records: list[dict] = []
-    for sec in sections:
-        for sent in sec["sentences"]:
-            try:
-                ents = ner_pipe(sent[:512])
-                for e in ents:
-                    word = e.get("word", "").strip("##").strip()
-                    if len(word) > 2:
-                        records.append({
-                            "term": word,
-                            "sentence": sent,
-                            "section": sec["title"],
-                        })
-            except Exception:
-                pass
-
-    if len(records) < min_cluster * 2:
-        return {"m_term": 0.0, "n_clusters": 0, "n_inconsistent": 0, "exploratory": True}
-
-    terms = [r["term"] for r in records]
-    embeddings = specter_model.encode(terms, batch_size=64, show_progress_bar=False)
-
-    # Agglomerative clustering by cosine similarity
-    dist_matrix = 1.0 - cosine_similarity(embeddings)
-    dist_matrix = np.clip(dist_matrix, 0.0, 2.0).astype(np.float64)
-
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster,
-        metric="precomputed",
-    )
-    labels = clusterer.fit_predict(dist_matrix)
-
-    # Group records by cluster
-    clusters: dict[int, list[dict]] = {}
-    for rec, label in zip(records, labels):
-        if label == -1:
-            continue  # noise
-        clusters.setdefault(label, []).append(rec)
-
-    # Only clusters with multiple distinct surface forms
-    multi_form_clusters = {
-        k: v for k, v in clusters.items()
-        if len({r["term"].lower() for r in v}) > 1
-    }
-
-    if not multi_form_clusters:
-        return {"m_term": 0.0, "n_clusters": 0, "n_inconsistent": 0, "exploratory": True}
-
-    n_inconsistent = 0
-    for cluster_recs in multi_form_clusters.values():
-        forms = list({r["term"] for r in cluster_recs})[:8]
-        snippets = "\n".join(
-            f'- "{r["term"]}" in [{r["section"]}]: "{r["sentence"][:200]}"'
-            for r in cluster_recs[:6]
-        )
-        prompt = _TERM_PROMPT.format(
-            list_of_forms=", ".join(f'"{f}"' for f in forms),
-            context_snippets=snippets,
-        )
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-            )
-            content = resp.choices[0].message.content
-            if content is None:
-                print(f"[ERROR] OpenRouter None content (finish_reason={resp.choices[0].finish_reason}).\n"
-                      f"Full response: {resp}", file=sys.stderr)
-                raise RuntimeError(
-                    f"OpenRouter returned None content "
-                    f"(finish_reason={resp.choices[0].finish_reason})."
-                )
-            raw = content.strip()
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            parsed = json.loads(raw)
-            if parsed.get("is_inconsistent"):
-                n_inconsistent += 1
-        except Exception:
-            pass
-
-    n_clusters = len(multi_form_clusters)
-    m_term = n_inconsistent / n_clusters if n_clusters else 0.0
-    return {
-        "m_term":        round(m_term, 4),
-        "n_clusters":    n_clusters,
-        "n_inconsistent": n_inconsistent,
-        "exploratory":   True,
-    }
-
 
 # ── A.3 — Repetition detection ────────────────────────────────────────────────
 
@@ -428,70 +141,106 @@ def compute_m_rep(
     specter_model,
     nli_pipe,
     cfg: dict,
+    stage_dir: Path,
 ) -> dict:
     """Compute cross-section repetition rate (A.3).
 
-    SPECTER embedding pre-filter → bi-directional NLI entailment check.
+    Stage 4: SPECTER pre-filter → candidate pairs  → candidates.json
+    Stage 5: Bi-directional NLI entailment check   → duplicates.json
+
+    Each stage loads from disk if its output file already exists (resume support).
 
     Args:
-        sections: List of sections with sentences.
+        sections:     List of sections with sentences.
         specter_model: SPECTER sentence encoder for pre-filtering.
-        nli_pipe: NLI pipeline for entailment verification.
-        cfg: Config with similarity and entailment thresholds.
+        nli_pipe:     NLI pipeline for entailment verification.
+        cfg:          Config with similarity and entailment thresholds.
+        stage_dir:    Directory for intermediate JSON files.
 
     Returns:
         Dict with m_rep (rate), n_total_sentences, n_candidates, n_duplicates.
     """
     from sklearn.metrics.pairwise import cosine_similarity as cos_sim
 
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
     emb_threshold = cfg.get("rep_embedding_prefilter", 0.7)
     nli_threshold = cfg.get("rep_nli_threshold", 0.5)
 
-    # Flatten all sentences with section labels
-    all_sents: list[tuple[str, str]] = []
-    for sec in sections:
-        for sent in sec["sentences"]:
-            all_sents.append((sent, sec["title"]))
-
+    # Flatten sentences — always needed for final index resolution
+    all_sents: list[tuple[str, str]] = [
+        (sent, sec["title"])
+        for sec in sections
+        for sent in sec["sentences"]
+    ]
     n_total = len(all_sents)
     if n_total < 2:
-        return {"m_rep": 0.0, "n_total_sentences": n_total, "n_duplicates": 0}
+        return {"m_rep": 0.0, "n_total_sentences": n_total, "n_candidates": 0, "n_duplicates": 0}
 
-    texts = [s for s, _ in all_sents]
+    texts  = [s for s, _ in all_sents]
     titles = [t for _, t in all_sents]
 
-    # Encode all sentences
-    embs = specter_model.encode(texts, batch_size=64, show_progress_bar=False)
-    sims = cos_sim(embs, embs)
+    # ── Stage 4 — SPECTER rep candidates ─────────────────────────────────────
+    cands_file = stage_dir / "candidates.json"
+    if cands_file.exists():
+        rep_candidates = json.loads(cands_file.read_text())
+    else:
+        embs = specter_model.encode(texts, batch_size=64, show_progress_bar=False)
+        sims = cos_sim(embs, embs)
 
-    # Find pre-filter candidates (different sections, high similarity)
-    candidates = []
-    for i in range(n_total):
-        for j in range(i + 1, n_total):
-            if titles[i] == titles[j]:
-                continue  # same section
-            if sims[i, j] >= emb_threshold:
-                candidates.append((i, j))
+        rep_candidates = []
+        n_pairs = n_total * (n_total - 1) // 2
+        with tqdm(total=n_pairs, desc="  4/5 rep SPECTER", leave=False, unit="pair") as pbar:
+            for i in range(n_total):
+                for j in range(i + 1, n_total):
+                    pbar.update(1)
+                    if titles[i] == titles[j]:
+                        continue
+                    if sims[i, j] >= emb_threshold:
+                        rep_candidates.append({
+                            "i": i, "j": j,
+                            "s1": texts[i], "s2": texts[j],
+                            "section_i": titles[i], "section_j": titles[j],
+                            "similarity": round(float(sims[i, j]), 4),
+                        })
 
-    # Bi-directional NLI check
+        cands_file.write_text(json.dumps(rep_candidates, ensure_ascii=False))
+
+    # ── Stage 5 — Bi-directional NLI ─────────────────────────────────────────
+    dup_file = stage_dir / "duplicates.json"
+    if dup_file.exists():
+        dup_results = json.loads(dup_file.read_text())
+    else:
+        dup_results = []
+        with tqdm(total=len(rep_candidates), desc="  5/5 NLI", leave=False, unit="pair") as pbar:
+            for cand in rep_candidates:
+                try:
+                    fwd = nli_scores(nli_pipe, cand["s1"], cand["s2"])
+                    bwd = nli_scores(nli_pipe, cand["s2"], cand["s1"])
+                    is_dup = (
+                        fwd.get("ENTAILMENT", 0) >= nli_threshold and
+                        bwd.get("ENTAILMENT", 0) >= nli_threshold
+                    )
+                    dup_results.append({**cand, "is_duplicate": is_dup})
+                except Exception:
+                    raise
+                finally:
+                    pbar.update(1)
+
+        dup_file.write_text(json.dumps(dup_results, ensure_ascii=False))
+
     duplicate_indices: set[int] = set()
-    for i, j in candidates:
-        try:
-            fwd = nli_scores(nli_pipe, texts[i], texts[j])
-            bwd = nli_scores(nli_pipe, texts[j], texts[i])
-            if (fwd.get("ENTAILMENT", 0) >= nli_threshold and
-                    bwd.get("ENTAILMENT", 0) >= nli_threshold):
-                duplicate_indices.add(i)
-                duplicate_indices.add(j)
-        except Exception:
-            pass
+    for r in dup_results:
+        if r.get("is_duplicate"):
+            duplicate_indices.add(r["i"])
+            duplicate_indices.add(r["j"])
 
     m_rep = len(duplicate_indices) / n_total if n_total else 0.0
     return {
-        "m_rep":              round(m_rep, 4),
-        "n_total_sentences":  n_total,
-        "n_candidates":       len(candidates),
-        "n_duplicates":       len(duplicate_indices),
+        "m_rep":             round(m_rep, 4),
+        "n_total_sentences": n_total,
+        "n_candidates":      len(rep_candidates),
+        "n_duplicates":      len(duplicate_indices),
     }
 
 
@@ -501,13 +250,17 @@ def process_survey(
     gen: dict,
     out_path: Path,
     cfg: dict,
-    ner_pipe,
     nli_pipe,
     specter_model,
     client: OpenAI,
+    cache,
+    stage_base: Path,
+    hparams_id: str,
 ) -> dict | None:
-    survey_id = gen["id"]
-    out_file  = out_path / f"{survey_id}.json"
+    survey_id  = gen["id"]
+    dataset_id = gen["dataset_id"]
+    model_id   = gen["model_id"]
+    out_file   = out_path / f"{survey_id}.json"
 
     if cfg.get("resume") and out_file.exists():
         try:
@@ -534,23 +287,20 @@ def process_survey(
     n_sents  = sum(len(s["sentences"]) for s in sections)
     print(f"         {len(sections)} sections, {n_sents} sentences")
 
+    contr_stage_dir = stage_base / "contradiction" / dataset_id / model_id / hparams_id / survey_id
+    rep_stage_dir   = stage_base / "repetition"    / dataset_id / model_id / hparams_id / survey_id
+
     try:
-        contr = compute_m_contr(sections, ner_pipe, nli_pipe, client, cfg)
-    except Exception as e:
-        contr = {"m_contr": None, "error": str(e)}
+        contr = compute_m_contr(survey_id, sections, specter_model, client, cfg, cache, contr_stage_dir)
+    except Exception:
         logger.exception(f"Error computing m_contr for {survey_id}")
+        raise
 
     try:
-        term = compute_m_term(sections, ner_pipe, specter_model, client, cfg)
-    except Exception as e:
-        term = {"m_term": None, "error": str(e), "exploratory": True}
-        logger.exception(f"Error computing m_term for {survey_id}")
-
-    try:
-        rep = compute_m_rep(sections, specter_model, nli_pipe, cfg)
-    except Exception as e:
-        rep = {"m_rep": None, "error": str(e)}
+        rep = compute_m_rep(sections, specter_model, nli_pipe, cfg, rep_stage_dir)
+    except Exception:
         logger.exception(f"Error computing m_rep for {survey_id}")
+        raise
 
     result = {
         "survey_id":  survey_id,
@@ -560,7 +310,6 @@ def process_survey(
         "n_sections": len(sections),
         "n_sentences": n_sents,
         **{f"contr_{k}": v for k, v in contr.items()},
-        **{f"term_{k}":  v for k, v in term.items()},
         **{f"rep_{k}":   v for k, v in rep.items()},
         "latency_sec": round(time.time() - t0, 1),
         "timestamp":   datetime.now(timezone.utc).isoformat(),
@@ -571,7 +320,9 @@ def process_survey(
 
     print(
         f"         m_contr={contr.get('m_contr')}  "
-        f"m_term={term.get('m_term')}  "
+        f"(cands={contr.get('n_candidates_stage1')} "
+        f"topic={contr.get('n_after_topic_filter')} "
+        f"confirmed={contr.get('n_contradictions')})  "
         f"m_rep={rep.get('m_rep')}  "
         f"({result['latency_sec']}s)"
     )
@@ -584,9 +335,9 @@ def write_summary(results: list[dict], out_path: Path) -> None:
     csv_path = out_path / "summary.csv"
     fields = [
         "survey_id", "query",
-        "contr_m_contr", "contr_n_candidates", "contr_n_confirmed",
-        "term_m_term",   "term_n_clusters",    "term_n_inconsistent",
-        "rep_m_rep",     "rep_n_total_sentences", "rep_n_duplicates",
+        "contr_m_contr", "contr_n_candidates_stage1",
+        "contr_n_after_topic_filter", "contr_n_contradictions", "contr_n_failed",
+        "rep_m_rep", "rep_n_total_sentences", "rep_n_duplicates",
         "latency_sec",
     ]
     with open(csv_path, "w", newline="") as f:
@@ -609,9 +360,17 @@ def main() -> None:
     client = make_client(cfg)
 
     print("\n[structural] Loading models...")
-    ner_pipe     = load_ner_model(cfg["ner_model_path"])
-    nli_pipe     = load_nli_model(cfg["nli_model_path"])
+    nli_pipe      = load_nli_model(cfg["nli_model_path"])
     specter_model = load_specter(cfg["specter_model_path"])
+
+    cache_dir = Path(cfg.get("cache_dir", "/tmp/structural/cache"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = diskcache.Cache(str(cache_dir))
+
+    # Intermediate stage files live one level up from the diskcache dir
+    stage_base = cache_dir.parent
+    hparams_id = build_hyperparams_id(cfg)
+    print(f"             hparams_id={hparams_id}")
 
     gen_dir = ROOT / "results" / "generations" / f"{args.dataset}_{args.model}"
     if not gen_dir.exists():
@@ -633,7 +392,7 @@ def main() -> None:
         with open(gf) as f:
             gen = json.load(f)
 
-        res = process_survey(gen, out_dir, cfg, ner_pipe, nli_pipe, specter_model, client)
+        res = process_survey(gen, out_dir, cfg, nli_pipe, specter_model, client, cache, stage_base, hparams_id)
         if res:
             all_results.append(res)
 

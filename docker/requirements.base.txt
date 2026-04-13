@@ -26,6 +26,7 @@ sentence-transformers
 accelerate
 safetensors
 tiktoken
+sentencepiece
 
 # ── Визуализация ──────────────────────────────────────────────────────────────
 matplotlib

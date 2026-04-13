@@ -35,6 +35,7 @@ import logging
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -89,8 +90,15 @@ def make_client(cfg: dict) -> OpenAI:
     return OpenAI(api_key=api_key, base_url=cfg["judge_base_url"])
 
 
-def llm_call(client: OpenAI, model: str, system: str, user: str,
-             max_tokens: int = 1000, disable_reasoning: bool = False) -> str:
+def llm_call(
+    client: OpenAI,
+    model: str,
+    system: str,
+    user: str,
+    max_tokens: int = 1000,
+    disable_reasoning: bool = False,
+    provider: str | None = None,
+) -> str:
     """Call LLM for claim extraction.
 
     Args:
@@ -99,7 +107,8 @@ def llm_call(client: OpenAI, model: str, system: str, user: str,
         system: System prompt.
         user: User message with snippet and sentence.
         max_tokens: Maximum tokens in response.
-        disable_reasoning: Whether to disable reasoning (for non-reasoning models).
+        disable_reasoning: Whether to disable reasoning tokens.
+        provider: Optional OpenRouter provider name (e.g. "alibaba").
 
     Returns:
         Stripped response text from LLM.
@@ -107,7 +116,9 @@ def llm_call(client: OpenAI, model: str, system: str, user: str,
     Raises:
         RuntimeError: If LLM returns None content.
     """
-    extra_body = {}
+    extra_body: dict = {}
+    if provider:
+        extra_body["provider"] = {"order": [provider], "allow_fallbacks": False}
     if disable_reasoning:
         extra_body["reasoning"] = {"enabled": False}
 
@@ -127,7 +138,7 @@ def llm_call(client: OpenAI, model: str, system: str, user: str,
               f"Full response: {response}", file=sys.stderr)
         raise RuntimeError(
             f"Model returned None content (finish_reason={response.choices[0].finish_reason}). "
-            f"Try increasing judge_max_tokens or setting judge_disable_reasoning: true."
+            f"Try increasing judge_max_tokens or disabling reasoning."
         )
     return content.strip()
 
@@ -189,11 +200,67 @@ def _make_bar(desc: str, total: int) -> tqdm:
     return tqdm(total=total, desc=desc, unit="sent", leave=True, dynamic_ncols=True)
 
 
-def extract_claims(text: str, nlp, client: OpenAI, model: str,
-                   max_tokens: int = 1000,
-                   disable_reasoning: bool = False,
-                   sents_bar: tqdm | None = None) -> list[str]:
+def _extract_sentence_claims(
+    i: int,
+    sentences: list[str],
+    client: OpenAI,
+    model: str,
+    max_tokens: int,
+    disable_reasoning: bool,
+    template: str,
+    provider: str | None = None,
+) -> tuple[int, list[str]]:
+    """Extract claims from a single sentence. Returns (index, claims).
+
+    Keeping the index allows order-preserving reassembly after parallel execution.
+
+    Raises:
+        RuntimeError: If LLM call fails.
+    """
+    raw_sentence = sentences[i]
+    snippet  = _build_snippet(sentences, i)
+    prompt   = template.format(snippet=snippet, sentence=raw_sentence)
+
+    try:
+        response = llm_call(client, model, _EXTRACTION_SYSTEM, prompt,
+                            max_tokens=max_tokens,
+                            disable_reasoning=disable_reasoning,
+                            provider=provider)
+    except Exception as e:
+        raise RuntimeError(
+            f"LLM failed for sentence {i} ({raw_sentence[:60]!r}): {e}"
+        ) from e
+
+    if not response or "No verifiable claim." in response:
+        return i, []
+
+    claims: list[str] = []
+    for line in response.split("\n"):
+        line = line.strip().replace("- ", "")
+        line = re.sub(r"^\d+\.?\s+", "", line)
+        if not line or line.startswith("Note:"):
+            continue
+        claims.append(line)
+
+    return i, claims
+
+
+def extract_claims(
+    text: str,
+    nlp,
+    client: OpenAI,
+    model: str,
+    max_tokens: int = 1000,
+    disable_reasoning: bool = False,
+    sents_bar: tqdm | None = None,
+    workers: int = 1,
+    provider: str | None = None,
+) -> list[str]:
     """Extract deduplicated atomic claims from text.
+
+    Sentences are processed in parallel (workers LLM calls at a time).
+    Results are reassembled in sentence order, then deduplicated with
+    dict.fromkeys() to preserve first-occurrence order.
 
     Args:
         text: Survey text to extract claims from.
@@ -201,49 +268,40 @@ def extract_claims(text: str, nlp, client: OpenAI, model: str,
         client: OpenAI client instance.
         model: Judge model name.
         max_tokens: Maximum tokens per LLM response.
-        disable_reasoning: Whether to disable reasoning.
+        disable_reasoning: Whether to disable reasoning tokens.
         sents_bar: Optional tqdm progress bar.
+        workers: Number of parallel LLM calls.
+        provider: Optional OpenRouter provider name.
 
     Returns:
-        Deduplicated list of claim strings.
+        Deduplicated list of claim strings (order preserved by sentence index).
 
     Raises:
-        RuntimeError: On persistent LLM failure.
+        RuntimeError: On LLM failure for any sentence.
     """
     sentences = [s.text.strip() for s in nlp(text).sents if s.text.strip()]
-    all_claims: list[str] = []
-    template = _load_template()
+    template  = _load_template()
 
-    for i, raw_sentence in enumerate(sentences):
-        snippet  = _build_snippet(sentences, i)
-        prompt   = template.format(snippet=snippet, sentence=raw_sentence)
+    # claims_by_sent[i] = list of raw claims from sentence i
+    claims_by_sent: list[list[str]] = [[] for _ in sentences]
 
-        try:
-            response = llm_call(client, model, _EXTRACTION_SYSTEM, prompt,
-                                max_tokens=max_tokens,
-                                disable_reasoning=disable_reasoning)
-        except Exception as e:
-            raise RuntimeError(
-                f"LLM failed for sentence {i} ({raw_sentence[:60]!r}): {e}"
-            ) from e
-
-        if not response or "No verifiable claim." in response:
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {
+            ex.submit(
+                _extract_sentence_claims,
+                i, sentences, client, model, max_tokens, disable_reasoning, template, provider,
+            ): i
+            for i in range(len(sentences))
+        }
+        for future in as_completed(futures):
+            i, sent_claims = future.result()  # raises on LLM failure → propagates up
+            claims_by_sent[i] = sent_claims
             if sents_bar is not None:
                 sents_bar.update(1)
-            continue
 
-        for line in response.split("\n"):
-            line = line.strip().replace("- ", "")
-            line = re.sub(r"^\d+\.?\s+", "", line)
-            if not line or line.startswith("Note:"):
-                continue
-            if line not in all_claims:
-                all_claims.append(line)
-
-        if sents_bar is not None:
-            sents_bar.update(1)
-
-    return all_claims
+    # Flatten in sentence order, then deduplicate preserving first occurrence
+    flat = [claim for sent_claims in claims_by_sent for claim in sent_claims]
+    return list(dict.fromkeys(flat))
 
 
 # ── Per-survey processing ─────────────────────────────────────────────────────
@@ -285,13 +343,17 @@ def process_survey(
 
     tqdm.write(f"  [PROC] {survey_id} | {question[:70]}", file=sys.stderr)
 
-    disable_reasoning = cfg.get("judge_disable_reasoning", False)
+    disable_reasoning = not cfg.get("judge_reasoning", True)
     max_tokens        = cfg.get("judge_max_tokens", 1000)
+    workers           = cfg.get("sent_workers", 1)
+    provider          = cfg.get("judge_provider")        # None → OpenRouter выбирает сам
     sents_bar = _make_bar("  sents", n_sentences)
     claims = extract_claims(text, nlp, client, cfg["judge_model"],
                             max_tokens=max_tokens,
                             disable_reasoning=disable_reasoning,
-                            sents_bar=sents_bar)
+                            sents_bar=sents_bar,
+                            workers=workers,
+                            provider=provider)
     sents_bar.close()
 
     result = {

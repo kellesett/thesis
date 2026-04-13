@@ -1,3 +1,4 @@
 # metrics/structural/requirements.txt
 # Все зависимости уже в thesis-base (hdbscan, spacy, transformers, sentence-transformers).
-# Файл оставлен пустым для единообразия структуры.
+diskcache    # кэш LLM-вызовов для M_contr (topic filter + contradiction check)
+tqdm         # прогресс-бары по стадиям

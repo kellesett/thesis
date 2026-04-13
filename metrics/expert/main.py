@@ -122,61 +122,72 @@ def llm_json(
     return {}
 
 
-# ── C.1 — Criticality ────────────────────────────────────────────────────────
+# ── C.1–C.4 combined judge ────────────────────────────────────────────────────
 
-_CRIT_SYS = "You are evaluating whether an atomic claim from a scientific survey is critical in nature."
+_ALL_SYS = (
+    "You are evaluating an atomic claim from a scientific survey along four independent dimensions. "
+    "Analyse the claim carefully and answer all four parts in a single JSON object."
+)
 
-_CRIT_USER = """\
+_ALL_USER = """\
 The claim:
 "{claim}"
 
-A claim is considered critical if it does one of the following:
+Evaluate the claim on the four dimensions below and return a single JSON object with all keys.
+
+## C.1 — Criticality
+A claim is critical if it:
 - Points out a limitation, weakness, or failure mode of a cited work
 - Mentions a negative result or conditions under which a method fails
 - Identifies a contradiction or tension between different works
 - Questions the validity, generalizability, or scope of a claim
 - Discusses trade-offs where one approach sacrifices something for another
+A claim is NOT critical if it merely describes what a paper does, presents results neutrally, or states general facts.
+Keys: "is_critical" (bool), "critical_type" ("limitation"|"negative_result"|"contradiction"|"trade_off"|"none"), "c1_reasoning" (brief)
 
-A claim is NOT critical if it:
-- Merely describes what a paper does
-- Presents results neutrally without evaluation
-- Compares approaches without judgment about their relative merits
-- States general facts about a research area
+## C.2 — Comparativeness
+A claim is comparative if it explicitly compares two or more methods, models, approaches, or results using constructions like "outperforms", "in contrast to", "unlike", "better than", "whereas", or ranks/orders approaches.
+A claim is NOT comparative if it only describes a single item or mentions multiple works without drawing contrasts.
+Keys: "is_comparative" (bool), "compared_entities" (list of strings | null), "c2_reasoning" (brief)
 
-Respond with a JSON object:
-{{"is_critical": true | false, "reasoning": "brief explanation", "critical_type": "limitation" | "negative_result" | "contradiction" | "trade_off" | "none"}}"""
+## C.3 — Open question
+A claim is an open question if it explicitly states something remains unknown/unresolved/disputed, points to gaps in understanding, identifies future research directions, or uses markers like "remains unclear", "open question", "further research is needed".
+A claim is NOT an open question if it describes established results or uses hedging only for style.
+Keys: "is_open_question" (bool), "question_type" ("generalization"|"scalability"|"mechanism"|"theoretical"|"empirical"|"none"), "c3_reasoning" (brief)
+
+## C.4 — Epistemic modality
+Classify the confidence level expressed by the claim's linguistic markers (not whether the claim is true):
+1. Categorical — no hedging, uses "is", "does", "demonstrates"
+2. Strong — mild qualifiers, uses "generally", "typically", "has been shown to"
+3. Moderate — clear hedging, uses "often", "tends to", "can"
+4. Weak — strong hedging, uses "may", "might", "could", "suggests", "appears to"
+5. Explicit uncertainty — "remains unclear", "is debated", "open question"
+Keys: "modality_level" (1–5), "hedging_markers" (list of strings), "c4_reasoning" (brief)
+
+Respond with a single JSON object containing all keys listed above."""
 
 
-def judge_criticality(claim: str, client: OpenAI, model: str, max_retries: int, provider: str | None = None, disable_reasoning: bool = False) -> dict:
-    """Judge whether a claim makes a critical evaluation or judgment.
+def judge_all(
+    claim: str,
+    client: OpenAI,
+    model: str,
+    max_retries: int,
+    provider: str | None = None,
+    disable_reasoning: bool = False,
+) -> dict:
+    """Single LLM call evaluating C.1–C.4 for one claim.
 
-    Identifies claims that point out limitations, negative results, contradictions,
-    or trade-offs (C.1).
+    Returns a flat dict with all keys for criticality, comparativeness,
+    open question, and modality. Falls back to safe defaults on parse error.
     """
-    return llm_json(client, model, _CRIT_SYS, _CRIT_USER.format(claim=claim[:600]), max_retries, provider, disable_reasoning)
+    return llm_json(
+        client, model, _ALL_SYS,
+        _ALL_USER.format(claim=claim[:600]),
+        max_retries, provider, disable_reasoning,
+    )
 
 
-# ── C.2 — Comparativeness ────────────────────────────────────────────────────
-
-_COMP_SYS = "You are evaluating whether an atomic claim makes an explicit comparison between multiple works or approaches."
-
-_COMP_USER = """\
-The claim:
-"{claim}"
-
-A claim is comparative if it:
-- Explicitly compares two or more methods, models, approaches, or results
-- Uses comparative constructions like "outperforms", "in contrast to", "unlike", "better than", "more than", "whereas"
-- Contrasts characteristics of different works
-- Ranks or orders approaches
-
-A claim is NOT comparative if it:
-- Only describes a single method or result
-- Mentions multiple works without comparing them
-- Lists related approaches without drawing contrasts
-
-Respond with a JSON object:
-{{"is_comparative": true | false, "reasoning": "brief explanation", "compared_entities": ["entity_1", "entity_2"] | null}}"""
+# ── C.2 validity (kept for future use, not included in metrics yet) ───────────
 
 _VALID_SYS = "You are evaluating whether a comparative claim in a scientific survey makes a VALID comparison."
 
@@ -203,86 +214,17 @@ Respond with a JSON object:
 {{"is_valid": true | false, "reasoning": "brief explanation", "invalidity_type": "incomparable_setup" | "different_metrics" | "unsupported_numbers" | "missing_context" | "none"}}"""
 
 
-def judge_comparative(claim: str, client: OpenAI, model: str, max_retries: int, provider: str | None = None, disable_reasoning: bool = False) -> dict:
-    """Judge whether a claim makes an explicit comparison between approaches.
-
-    Identifies comparative claims that contrast methods, models, or results (C.2).
-    """
-    return llm_json(client, model, _COMP_SYS, _COMP_USER.format(claim=claim[:600]), max_retries, provider, disable_reasoning)
-
-
 def judge_valid_comparison(claim: str, context: str, client: OpenAI, model: str, max_retries: int, provider: str | None = None, disable_reasoning: bool = False) -> dict:
     """Judge validity of a comparative claim given source context.
 
-    Determines if a comparison is fair and properly supported, handling only
-    claims flagged as comparative (C.2).
+    Determines if a comparison is fair and properly supported (C.2 validity).
+    Not yet wired into metric computation — kept for future use.
     """
     return llm_json(
         client, model, _VALID_SYS,
         _VALID_USER.format(claim=claim[:600], context=context[:800] if context else "Not available"),
         max_retries, provider, disable_reasoning,
     )
-
-
-# ── C.3 — Open questions ──────────────────────────────────────────────────────
-
-_OPEN_SYS = "You are evaluating whether an atomic claim from a scientific survey explicitly formulates an open question, unresolved problem, or direction for future research."
-
-_OPEN_USER = """\
-The claim:
-"{claim}"
-
-A claim is considered an open question formulation if it:
-- Explicitly states that something remains unknown, unresolved, or disputed
-- Points to gaps in current understanding
-- Identifies directions for future research
-- Uses hedging markers like "remains unclear", "open question", "further research is needed", "not yet established"
-- Discusses problems that have not been solved by the cited works
-
-A claim is NOT an open question if it:
-- Describes established results
-- Makes claims about what is known
-- Uses hedging for stylistic reasons without genuinely pointing to unresolved issues
-
-Respond with a JSON object:
-{{"is_open_question": true | false, "reasoning": "brief explanation", "question_type": "generalization" | "scalability" | "mechanism" | "theoretical" | "empirical" | "none"}}"""
-
-
-def judge_open_question(claim: str, client: OpenAI, model: str, max_retries: int, provider: str | None = None, disable_reasoning: bool = False) -> dict:
-    """Judge whether a claim formulates an open question or unresolved problem.
-
-    Identifies claims that acknowledge gaps, unknowns, or future directions (C.3).
-    """
-    return llm_json(client, model, _OPEN_SYS, _OPEN_USER.format(claim=claim[:600]), max_retries, provider, disable_reasoning)
-
-
-# ── C.4 — Modality diversity ──────────────────────────────────────────────────
-
-_MOD_SYS = "You are classifying an atomic claim from a scientific survey by its epistemic modality — the level of confidence the claim expresses."
-
-_MOD_USER = """\
-The claim:
-"{claim}"
-
-Classify the claim into one of five levels:
-1. Categorical assertion — stated as an established fact, no hedging. Uses "is", "does", "demonstrates".
-2. Strong assertion — high confidence with mild qualifiers. Uses "generally", "typically", "has been shown to".
-3. Moderate assertion — clear hedging indicating general but not universal applicability. Uses "often", "tends to", "can".
-4. Weak assertion — strong hedging indicating tentative nature. Uses "may", "might", "could", "suggests", "appears to".
-5. Explicit uncertainty — explicitly acknowledges the matter is unresolved. Uses "remains unclear", "is debated", "open question".
-
-Focus on the linguistic markers of confidence, not on whether the claim is actually true.
-
-Respond with a JSON object:
-{{"modality_level": 1 | 2 | 3 | 4 | 5, "reasoning": "brief explanation citing specific hedging markers", "hedging_markers": ["marker_1"] | []}}"""
-
-
-def judge_modality(claim: str, client: OpenAI, model: str, max_retries: int, provider: str | None = None, disable_reasoning: bool = False) -> dict:
-    """Judge epistemic modality level (confidence) of a claim.
-
-    Classifies claims on a 5-level scale from categorical to explicitly uncertain (C.4).
-    """
-    return llm_json(client, model, _MOD_SYS, _MOD_USER.format(claim=claim[:600]), max_retries, provider, disable_reasoning)
 
 
 # ── Metric aggregation ────────────────────────────────────────────────────────
@@ -308,51 +250,31 @@ def judge_claim(
     provider: str | None = None,
     disable_reasoning: bool = False,
 ) -> dict:
-    """Run all 4 LLM judges for a single claim. Returns enriched claim dict.
+    """Run combined C.1–C.4 judge for a single claim. Returns enriched claim dict.
 
-    Parallelizes criticality, comparativeness, open question, and modality judges
-    via ThreadPoolExecutor (4 workers, one per judge). Validity check runs
-    sequentially for claims flagged as comparative.
+    Issues a single LLM call via judge_all() instead of four parallel ones.
+    Validity check (C.2b) is not yet wired into metric computation.
     """
     claim = claim_record["claim"]
 
-    # ThreadPoolExecutor with max_workers=4 parallelizes the four judges.
-    # Rate limiting is handled by the OpenAI client's internal queue.
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        f_crit  = ex.submit(judge_criticality,  claim, client, model, max_retries, provider, disable_reasoning)
-        f_comp  = ex.submit(judge_comparative,   claim, client, model, max_retries, provider, disable_reasoning)
-        f_open  = ex.submit(judge_open_question, claim, client, model, max_retries, provider, disable_reasoning)
-        f_mod   = ex.submit(judge_modality,      claim, client, model, max_retries, provider, disable_reasoning)
-
-        crit_res = f_crit.result()
-        comp_res = f_comp.result()
-        open_res = f_open.result()
-        mod_res  = f_mod.result()
+    res = judge_all(claim, client, model, max_retries, provider, disable_reasoning)
 
     result = {
         **claim_record,
         # C.1
-        "is_critical":    crit_res.get("is_critical", False),
-        "critical_type":  crit_res.get("critical_type", "none"),
+        "is_critical":      res.get("is_critical", False),
+        "critical_type":    res.get("critical_type", "none"),
         # C.2
-        "is_comparative": comp_res.get("is_comparative", False),
-        "compared_entities": comp_res.get("compared_entities"),
+        "is_comparative":   res.get("is_comparative", False),
+        "compared_entities": res.get("compared_entities"),
         # C.3
-        "is_open_question": open_res.get("is_open_question", False),
-        "question_type":    open_res.get("question_type", "none"),
+        "is_open_question": res.get("is_open_question", False),
+        "question_type":    res.get("question_type", "none"),
         # C.4
-        "modality_level": mod_res.get("modality_level", 1),
-        "hedging_markers": mod_res.get("hedging_markers", []),
+        "modality_level":   res.get("modality_level", 1),
+        "hedging_markers":  res.get("hedging_markers", []),
+        # validity not yet in metrics — field absent intentionally
     }
-
-    # C.2 validity check — only for comparative claims
-    if result["is_comparative"]:
-        valid_res = judge_valid_comparison(claim, source_context, client, model, max_retries, provider, disable_reasoning)
-        result["is_valid_comparison"] = valid_res.get("is_valid", False)
-        result["invalidity_type"]     = valid_res.get("invalidity_type", "none")
-    else:
-        result["is_valid_comparison"] = None
-        result["invalidity_type"]     = None
 
     return result
 
@@ -398,32 +320,41 @@ def process_survey(
     print(f"  [PROC] {survey_id} | {gen.get('query', '')[:60]} | {len(claims)} claims")
     t0 = time.time()
 
-    model       = cfg["judge_model"]
-    max_retries = cfg.get("max_retries", 3)
-    provider           = cfg.get("judge_provider")           # optional — None means let OpenRouter choose
-    disable_reasoning  = cfg.get("judge_disable_reasoning", False)
+    model             = cfg["judge_model"]
+    max_retries       = cfg.get("max_retries", 3)
+    provider          = cfg.get("judge_provider")        # optional — None means let OpenRouter choose
+    disable_reasoning = cfg.get("judge_disable_reasoning", False)
+    workers           = cfg.get("judge_workers", 4)
     # Shared source context (first reference abstract) for validity checks
-    source_ctx  = ""  # enriched per model if corpus available
+    source_ctx = ""  # enriched per model if corpus available
 
-    judged_claims: list[dict] = []
-    for claim_record in tqdm(claims, desc="  judging", unit="claim", leave=True):
-        try:
-            judged = judge_claim(claim_record, client, model, max_retries, source_ctx, provider, disable_reasoning)
-            judged_claims.append(judged)
-        except Exception as e:
-            judged_claims.append({**claim_record, "_judge_error": str(e)})
+    judged_claims: list[dict | None] = [None] * len(claims)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {
+            ex.submit(
+                judge_claim, cr, client, model, max_retries,
+                source_ctx, provider, disable_reasoning,
+            ): i
+            for i, cr in enumerate(claims)
+        }
+        with tqdm(total=len(claims), desc="  judging", unit="claim", leave=True) as bar:
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    judged_claims[i] = future.result()
+                except Exception as e:
+                    judged_claims[i] = {**claims[i], "_judge_error": str(e)}
+                bar.update(1)
 
     # ── Compute metrics ────────────────────────────────────────────────────
     n = len(judged_claims)
 
     m_crit       = round(sum(1 for c in judged_claims if c.get("is_critical")) / n, 4) if n else 0.0
     m_comp_total = round(sum(1 for c in judged_claims if c.get("is_comparative")) / n, 4) if n else 0.0
-
     comparative  = [c for c in judged_claims if c.get("is_comparative")]
-    m_comp_valid = (
-        round(sum(1 for c in comparative if c.get("is_valid_comparison")) / len(comparative), 4)
-        if comparative else None
-    )
+
+    # m_comp_valid not yet computed — judge_valid_comparison not wired in
+    m_comp_valid = None
 
     m_open = round(sum(1 for c in judged_claims if c.get("is_open_question")) / n, 4) if n else 0.0
 
@@ -442,11 +373,9 @@ def process_survey(
         # C.1
         "m_crit":       m_crit,
         "n_critical":   sum(1 for c in judged_claims if c.get("is_critical")),
-        # C.2
+        # C.2 (validity not yet included)
         "m_comp_total": m_comp_total,
-        "m_comp_valid": m_comp_valid,
         "n_comparative": len(comparative),
-        "n_valid_comp":  sum(1 for c in comparative if c.get("is_valid_comparison")),
         # C.3
         "m_open":       m_open,
         "n_open":       sum(1 for c in judged_claims if c.get("is_open_question")),
@@ -465,7 +394,7 @@ def process_survey(
 
     print(
         f"         m_crit={m_crit}  m_comp={m_comp_total}  "
-        f"m_comp_valid={m_comp_valid}  m_open={m_open}  m_mod={m_mod}  "
+        f"m_open={m_open}  m_mod={m_mod}  "
         f"({result['latency_sec']}s)"
     )
     return result
@@ -478,7 +407,7 @@ def write_summary(results: list[dict], out_path: Path) -> None:
     fields = [
         "survey_id", "query", "n_claims",
         "m_crit", "n_critical",
-        "m_comp_total", "m_comp_valid", "n_comparative", "n_valid_comp",
+        "m_comp_total", "n_comparative",
         "m_open", "n_open",
         "m_mod",
         "latency_sec",
@@ -499,7 +428,7 @@ def main() -> None:
     parser.add_argument("--model",   required=True)
     args = parser.parse_args()
 
-    cfg    = load_config()
+    cfg    = load_config(CONFIG)
     client = make_client(cfg)
 
     claims_dir = resolve_claims_dir(args.dataset, args.model)
