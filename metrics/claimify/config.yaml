@@ -1,13 +1,16 @@
 metric_id: claimify
 
 # LLM для декомпозиции (через OpenRouter)
-judge_model: meta-llama/llama-3.3-70b-instruct:nitro
-judge_base_url: https://openrouter.ai/api/v1
+judge_model:       meta-llama/llama-3.3-70b-instruct:nitro
+judge_base_url:    https://openrouter.ai/api/v1
 judge_api_key_env: OPENROUTER_API_KEY
+# judge_provider:         alibaba   # опционально — явно указать провайдера
+# judge_reasoning_effort: low       # "low"|"medium"|"high" — для reasoning-моделей
+# judge_max_tokens:       2048      # максимум токенов в ответе
 
 # Параметры пайплайна Claimify (Metropolitansky & Larson, ACL 2025)
 # Гиперпараметры стадий жёстко заданы в claim_extractor.py (Appendix D)
 # max_concurrent — сколько предложений обрабатывается параллельно
-max_concurrent: 5
+max_concurrent: 50
 
 resume: true                # пропускать уже обработанные обзоры

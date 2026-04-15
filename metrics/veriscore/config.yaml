@@ -1,12 +1,13 @@
 metric_id: veriscore
 
 # LLM для извлечения атомарных claims (через OpenRouter)
-judge_model:       qwen/qwen3-32b
+judge_model:       openai/gpt-oss-120b
 judge_base_url:    https://openrouter.ai/api/v1
 judge_api_key_env: OPENROUTER_API_KEY
-judge_provider:    alibaba          # опционально — явно указать провайдера на OpenRouter
-judge_reasoning:   false             # использовать ли reasoning/thinking токены
-judge_max_tokens:  1000
+# judge_provider:    alibaba           # опционально — явно указать провайдера на OpenRouter
+judge_reasoning_effort: low        # "low"|"medium"|"high" — для reasoning-моделей (несовместимо с judge_reasoning: false)
+# judge_reasoning:   false             # отключить thinking токены (Qwen3/DeepSeek)
+judge_max_tokens:  4096
 
 resume: true               # пропускать уже обработанные обзоры
-sent_workers: 10            # параллельные LLM вызовы на предложения внутри одного survey
+sent_workers: 50            # параллельные LLM вызовы на предложения внутри одного survey

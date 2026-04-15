@@ -55,39 +55,10 @@ CONFIG = Path(__file__).parent / "config.yaml"
 sys.path.insert(0, str(ROOT))
 
 from src.log_setup import setup_logging
-
-
-# ── Config & client ───────────────────────────────────────────────────────────
-
-def load_config() -> dict:
-    """Load YAML configuration from CONFIG path.
-
-    Returns:
-        Parsed config dictionary.
-
-    Raises:
-        FileNotFoundError: If config file does not exist.
-    """
-    with open(CONFIG) as f:
-        return yaml.safe_load(f)
-
-
-def make_client(cfg: dict) -> OpenAI:
-    """Create OpenAI client from config.
-
-    Args:
-        cfg: Config dict with judge_api_key_env and judge_base_url.
-
-    Returns:
-        Initialized OpenAI client.
-
-    Raises:
-        RuntimeError: If API key environment variable not set.
-    """
-    api_key = os.environ.get(cfg["judge_api_key_env"], "")
-    if not api_key:
-        raise RuntimeError(f"API key not set: env var '{cfg['judge_api_key_env']}'")
-    return OpenAI(api_key=api_key, base_url=cfg["judge_base_url"])
+from metrics.utils import (
+    TokenCounter, load_config as load_config_util, make_client,
+    check_and_load_cache, load_generation_files,
+)
 
 
 def llm_call(
@@ -98,6 +69,8 @@ def llm_call(
     max_tokens: int = 1000,
     disable_reasoning: bool = False,
     provider: str | None = None,
+    reasoning_effort: str | None = None,
+    token_counter: TokenCounter | None = None,
 ) -> str:
     """Call LLM for claim extraction.
 
@@ -109,6 +82,7 @@ def llm_call(
         max_tokens: Maximum tokens in response.
         disable_reasoning: Whether to disable reasoning tokens.
         provider: Optional OpenRouter provider name (e.g. "alibaba").
+        reasoning_effort: "low"|"medium"|"high" for reasoning-capable models (takes priority over disable_reasoning).
 
     Returns:
         Stripped response text from LLM.
@@ -119,7 +93,9 @@ def llm_call(
     extra_body: dict = {}
     if provider:
         extra_body["provider"] = {"order": [provider], "allow_fallbacks": False}
-    if disable_reasoning:
+    if reasoning_effort:
+        extra_body["reasoning_effort"] = reasoning_effort
+    elif disable_reasoning:
         extra_body["reasoning"] = {"enabled": False}
 
     response = client.chat.completions.create(
@@ -139,6 +115,13 @@ def llm_call(
         raise RuntimeError(
             f"Model returned None content (finish_reason={response.choices[0].finish_reason}). "
             f"Try increasing judge_max_tokens or disabling reasoning."
+        )
+    if token_counter is not None and response.usage is not None:
+        cost = (response.usage.model_extra or {}).get("cost") or 0.0
+        token_counter.add(
+            response.usage.prompt_tokens or 0,
+            response.usage.completion_tokens or 0,
+            float(cost),
         )
     return content.strip()
 
@@ -209,6 +192,8 @@ def _extract_sentence_claims(
     disable_reasoning: bool,
     template: str,
     provider: str | None = None,
+    reasoning_effort: str | None = None,
+    token_counter: TokenCounter | None = None,
 ) -> tuple[int, list[str]]:
     """Extract claims from a single sentence. Returns (index, claims).
 
@@ -225,7 +210,9 @@ def _extract_sentence_claims(
         response = llm_call(client, model, _EXTRACTION_SYSTEM, prompt,
                             max_tokens=max_tokens,
                             disable_reasoning=disable_reasoning,
-                            provider=provider)
+                            provider=provider,
+                            reasoning_effort=reasoning_effort,
+                            token_counter=token_counter)
     except Exception as e:
         raise RuntimeError(
             f"LLM failed for sentence {i} ({raw_sentence[:60]!r}): {e}"
@@ -255,6 +242,8 @@ def extract_claims(
     sents_bar: tqdm | None = None,
     workers: int = 1,
     provider: str | None = None,
+    reasoning_effort: str | None = None,
+    token_counter: TokenCounter | None = None,
 ) -> list[str]:
     """Extract deduplicated atomic claims from text.
 
@@ -289,7 +278,7 @@ def extract_claims(
         futures = {
             ex.submit(
                 _extract_sentence_claims,
-                i, sentences, client, model, max_tokens, disable_reasoning, template, provider,
+                i, sentences, client, model, max_tokens, disable_reasoning, template, provider, reasoning_effort, token_counter,
             ): i
             for i in range(len(sentences))
         }
@@ -298,6 +287,8 @@ def extract_claims(
             claims_by_sent[i] = sent_claims
             if sents_bar is not None:
                 sents_bar.update(1)
+                if token_counter is not None:
+                    sents_bar.set_postfix_str(token_counter.fmt())
 
     # Flatten in sentence order, then deduplicate preserving first occurrence
     flat = [claim for sent_claims in claims_by_sent for claim in sent_claims]
@@ -316,18 +307,13 @@ def process_survey(
     survey_id = str(gen["id"])
     out_file  = out_path / f"{survey_id}.json"
 
-    if cfg.get("resume") and out_file.exists():
-        try:
-            existing = json.loads(out_file.read_text())
-            if existing.get("pipeline") == "veriscore":
-                tqdm.write(
-                    f"  [SKIP] {survey_id} — {existing['n_claims']} claims already saved",
-                    file=sys.stderr,
-                )
-                return existing
-        except Exception:
-            pass
-        tqdm.write(f"  [WARN] {survey_id} — will re-process", file=sys.stderr)
+    cached = check_and_load_cache(out_file, cfg, survey_id, required_keys=("survey_id", "claims"))
+    if cached is not None:
+        tqdm.write(
+            f"  [SKIP] {survey_id} — {cached['n_claims']} claims already saved",
+            file=sys.stderr,
+        )
+        return cached
 
     if not gen.get("success", False):
         tqdm.write(f"  [SKIP] {survey_id} — generation not successful", file=sys.stderr)
@@ -346,14 +332,18 @@ def process_survey(
     disable_reasoning = not cfg.get("judge_reasoning", True)
     max_tokens        = cfg.get("judge_max_tokens", 1000)
     workers           = cfg.get("sent_workers", 1)
-    provider          = cfg.get("judge_provider")        # None → OpenRouter выбирает сам
+    provider          = cfg.get("judge_provider") or None
+    reasoning_effort  = cfg.get("judge_reasoning_effort") or None
+    token_counter     = TokenCounter()
     sents_bar = _make_bar("  sents", n_sentences)
     claims = extract_claims(text, nlp, client, cfg["judge_model"],
                             max_tokens=max_tokens,
                             disable_reasoning=disable_reasoning,
                             sents_bar=sents_bar,
                             workers=workers,
-                            provider=provider)
+                            provider=provider,
+                            reasoning_effort=reasoning_effort,
+                            token_counter=token_counter)
     sents_bar.close()
 
     result = {
@@ -386,7 +376,7 @@ def main() -> None:
     parser.add_argument("--model",   required=True, help="Model id (e.g. perplexity_dr)")
     args = parser.parse_args()
 
-    cfg    = load_config()
+    cfg    = load_config_util(CONFIG)
     client = make_client(cfg)
 
     # Check for template file early
@@ -414,8 +404,7 @@ def main() -> None:
     out_dir = ROOT / "results" / "scores" / f"{args.dataset}_{args.model}_claims"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    gen_files = sorted(gen_dir.glob("*.json"))
-    gen_files = [f for f in gen_files if not re.search(r"_(raw|old)\.json$", f.name)]
+    gen_files = load_generation_files(gen_dir)
 
     print(f"\n[veriscore] {args.dataset} / {args.model}")
     print(f"            {len(gen_files)} surveys → {out_dir}")

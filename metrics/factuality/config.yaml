@@ -4,12 +4,13 @@ metric_id: factuality
 alignscore_ckpt: /app/models_cache/yzha--AlignScore-large/AlignScore-large.ckpt
 
 # ── LLM судья (через OpenRouter) ─────────────────────────────────────────────
-judge_model:       qwen/qwen3-32b
+judge_model:       openai/gpt-oss-120b
 judge_base_url:    https://openrouter.ai/api/v1
 judge_api_key_env: OPENROUTER_API_KEY
-judge_provider:    alibaba        # опционально — явно указать провайдера
-judge_reasoning:   false          # отключить thinking токены
-judge_id:          qwen3
+# judge_provider:         alibaba   # опционально — явно указать провайдера
+judge_reasoning_effort: low     # "low"|"medium"|"high" — для reasoning-моделей (gpt-oss и т.д.)
+# judge_reasoning:         false    # отключить thinking токены (Qwen3/DeepSeek, несовместимо с reasoning_effort)
+judge_id:          gpt-oss-120b
 judge_comment:     run1
 
 # ── AlignScore ────────────────────────────────────────────────────────────────
@@ -18,5 +19,6 @@ alignscore_batch_size: 16
 alignscore_threshold:  0.5    # P(support) порог для Support(a, e_a) = 1
 
 # ── Параметры ─────────────────────────────────────────────────────────────────
-max_retries: 3
+judge_workers: 50   # параллельные LLM вызовы при классификации claims
+max_retries:   3
 resume: true

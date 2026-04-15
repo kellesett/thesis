@@ -61,7 +61,7 @@ from metrics.claimify.claim_extractor import (
     _SEL_COMPLETIONS,
     _DIS_COMPLETIONS,
 )
-from metrics.utils import load_config
+from metrics.utils import load_config, check_and_load_cache, load_generation_files
 
 
 # ── Client creation ───────────────────────────────────────────────────────────
@@ -122,15 +122,10 @@ async def process_survey(
     survey_id = str(gen["id"])
     out_file  = out_path / f"{survey_id}.json"
 
-    if cfg.get("resume") and out_file.exists():
-        try:
-            with open(out_file) as f:
-                existing = json.load(f)
-            tqdm.write(f"  [SKIP] {survey_id} — {existing['n_claims']} claims already saved", file=sys.stderr)
-            return existing
-        except Exception:
-            logger.warning(f"{survey_id} — corrupt cache, re-processing")
-            tqdm.write(f"  [WARN] {survey_id} — corrupt cache, re-processing", file=sys.stderr)
+    cached = check_and_load_cache(out_file, cfg, survey_id, required_keys=("survey_id", "claims"))
+    if cached is not None:
+        tqdm.write(f"  [SKIP] {survey_id} — {cached['n_claims']} claims already saved", file=sys.stderr)
+        return cached
 
     if not gen.get("success", False):
         logger.info(f"{survey_id} — generation not successful, skipping")
@@ -241,7 +236,13 @@ async def main_async() -> None:
 
     cfg       = load_config(CONFIG)
     client    = make_client(cfg)
-    extractor = ClaimExtractor(client, model_name=cfg["judge_model"])
+    extractor = ClaimExtractor(
+        client,
+        model_name=cfg["judge_model"],
+        provider=cfg.get("judge_provider") or None,
+        reasoning_effort=cfg.get("judge_reasoning_effort") or None,
+        max_tokens=cfg.get("judge_max_tokens") or None,
+    )
 
     gen_dir = ROOT / "results" / "generations" / f"{args.dataset}_{args.model}"
     if not gen_dir.exists():
@@ -251,8 +252,7 @@ async def main_async() -> None:
     out_dir = ROOT / "results" / "scores" / f"{args.dataset}_{args.model}_claims"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    gen_files = sorted(gen_dir.glob("*.json"))
-    gen_files = [f for f in gen_files if not re.search(r"_(raw|old)\.json$", f.name)]
+    gen_files = load_generation_files(gen_dir)
 
     print(f"\n[claimify] {args.dataset} / {args.model}")
     print(f"           {len(gen_files)} surveys → {out_dir}")

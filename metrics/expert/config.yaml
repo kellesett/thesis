@@ -1,17 +1,19 @@
 metric_id: expert
 
 # ── LLM судья (через OpenRouter) ─────────────────────────────────────────────
-judge_model:       qwen/qwen3-32b
+judge_model:       google/gemma-4-31b-it
 judge_base_url:    https://openrouter.ai/api/v1
 judge_api_key_env: OPENROUTER_API_KEY
-judge_provider:    alibaba          # опционально — явно указать провайдера на OpenRouter
-judge_disable_reasoning: true  # отключить reasoning/thinking токены (для моделей типа Qwen3, DeepSeek-R1)
-judge_id:          qwen3
+# judge_provider:    deepinfra/bf16
+# judge_reasoning_effort: low     # "low" | "medium" | "high" — для моделей с reasoning budget (gpt-oss и т.д.)
+judge_disable_reasoning: false # отключить thinking токены — для Qwen3/DeepSeek (несовместимо с reasoning_effort)
+judge_max_tokens:  4096
+judge_id:          gemma-4-31b
 judge_comment:     run1
 
 # ── Параметры ─────────────────────────────────────────────────────────────────
 max_retries:       3
 # Параллельные claims (каждый — 1 LLM вызов с C.1–C.4)
-judge_workers:     10
+judge_workers:     50
 
 resume: true

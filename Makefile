@@ -3,7 +3,7 @@
 # Предварительно: cp .env.example .env && заполни ключи
 
 .PHONY: help setup setup-sf base \
-        generate evaluate \
+        generate evaluate validate \
         convert-autosurvey convert-reference \
         viewer enrich \
         download inspect models models-ping \
@@ -53,6 +53,10 @@ help:
 	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=structural  # A.1 M_contr, A.2 M_term, A.3 M_rep"
 	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=factuality  # B.1 CitCorrect_k"
 	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=expert      # C.1-C.4 M_crit/comp/open/mod"
+	@echo ""
+	@echo "  [Валидация промптов]"
+	@echo "  make validate METRIC=expert       # precision/recall на expert_classes_test + expert_modalities_test"
+	@echo "  make validate METRIC=factuality   # precision/recall на factuality_classes_test"
 	@echo ""
 	@echo "  [Данные / Модели]"
 	@echo "  make download / sfdb / sfdb-check / sfmodel"
@@ -108,6 +112,12 @@ evaluate: base
 	docker build -f metrics/$(METRIC)/Dockerfile -t thesis-eval-$(METRIC) .
 	docker run --rm $(VOLUMES) thesis-eval-$(METRIC) \
 		python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL)
+
+validate: base
+	mkdir -p tmp
+	docker build -f metrics/$(METRIC)/Dockerfile -t thesis-eval-$(METRIC) .
+	docker run --rm $(VOLUMES) thesis-eval-$(METRIC) \
+		python metrics/$(METRIC)/validate.py
 
 ## ── Viewer ───────────────────────────────────────────────────────────────────
 

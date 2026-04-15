@@ -48,7 +48,10 @@ import diskcache
 from tqdm import tqdm
 
 from src.log_setup import setup_logging
-from metrics.utils import make_client, load_config
+from metrics.utils import (
+    make_client, load_config, check_and_load_cache, load_generation_files,
+    write_summary_csv,
+)
 from metrics.structural.contradiction.aggregate import compute_m_contr
 
 
@@ -299,14 +302,9 @@ def process_survey(
     model_id   = gen["model_id"]
     out_file   = out_path / f"{survey_id}.json"
 
-    if cfg.get("resume") and out_file.exists():
-        try:
-            with open(out_file) as f:
-                existing = json.load(f)
-            tqdm.write(f"  [SKIP] {survey_id} — already scored")
-            return existing
-        except Exception:
-            tqdm.write(f"  [WARN] {survey_id} — corrupt cache, re-processing")
+    cached = check_and_load_cache(out_file, cfg, survey_id)
+    if cached is not None:
+        return cached
 
     if not gen.get("success", False):
         tqdm.write(f"  [SKIP] {survey_id} — generation not successful")
@@ -374,7 +372,6 @@ def process_survey(
 # ── Summary CSV ───────────────────────────────────────────────────────────────
 
 def write_summary(results: list[dict], out_path: Path) -> None:
-    csv_path = out_path / "summary.csv"
     fields = [
         "survey_id", "query",
         "contr_m_contr", "contr_n_candidates_stage1",
@@ -382,11 +379,7 @@ def write_summary(results: list[dict], out_path: Path) -> None:
         "rep_m_rep", "rep_n_total_sentences", "rep_n_duplicates",
         "latency_sec",
     ]
-    with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(results)
-    print(f"\n[structural] summary → {csv_path}")
+    write_summary_csv(results, out_path, fields, "structural")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -423,8 +416,7 @@ def main() -> None:
     out_dir = ROOT / "results" / "scores" / f"{args.dataset}_{args.model}_structural_{run_id}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    gen_files = sorted(gen_dir.glob("*.json"))
-    gen_files = [f for f in gen_files if not re.search(r"_(raw|old)\.json$", f.name)]
+    gen_files = load_generation_files(gen_dir)
 
     tqdm.write(f"\n[structural] {args.dataset} / {args.model}")
     tqdm.write(f"             {len(gen_files)} surveys → {out_dir}\n")

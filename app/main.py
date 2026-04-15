@@ -184,9 +184,12 @@ def page_evaluations() -> None:
     run_dir = dict(runs)[selected]
 
     # ── Route by run type ──────────────────────────────────────────────────────
-    # Routes to diversity view if run name contains _diversity suffix
     if is_diversity_run(selected):
         page_evaluations_diversity(run_dir, selected)
+        return
+
+    if is_factuality_run(selected):
+        page_evaluations_factuality(run_dir, selected)
         return
 
     scores = load_scores(run_dir)
@@ -352,6 +355,172 @@ def find_diversity_runs_for_dataset(dataset_prefix: str) -> dict[str, pathlib.Pa
             mid = re.sub(r"_diversity.*$", "", mid)
             result[mid] = d
     return result
+
+
+# ── Factuality helpers ────────────────────────────────────────────────────────
+
+def is_factuality_run(run_name: str) -> bool:
+    return "_factuality_" in run_name or run_name.endswith("_factuality")
+
+
+def load_factuality_scores(run_dir: pathlib.Path) -> list[dict]:
+    out = []
+    for f in sorted(run_dir.glob("*.json")):
+        if f.stem == "summary":
+            continue
+        try:
+            out.append(load_json(f))
+        except Exception:
+            logger.debug(f"Failed to load factuality file {f}", exc_info=True)
+    return out
+
+
+_CAT_COLORS = {"A": "#2196F3", "B": "#4CAF50", "C": "#FF9800", "D": "#E91E63"}
+_CAT_LABELS = {
+    "A": "A — General",
+    "B": "B — Methodological",
+    "C": "C — Quantitative",
+    "D": "D — Critical",
+}
+_CONF_ICON = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+
+
+def page_evaluations_factuality(run_dir: pathlib.Path, run_name: str) -> None:
+    """Factuality evaluation: claim categorisation + optional AlignScore support."""
+    st.header(f"Factuality — {run_name}")
+
+    surveys = load_factuality_scores(run_dir)
+    if not surveys:
+        st.info("No score files found.")
+        return
+
+    alignscore_enabled = any(s.get("alignscore_enabled", True) for s in surveys)
+
+    # ── Summary table ──────────────────────────────────────────────────────────
+    st.subheader("Summary")
+
+    summary_rows = []
+    for s in surveys:
+        counts = s.get("category_counts", {})
+        row = {
+            "survey_id":   s.get("survey_id", "?"),
+            "query":       (s.get("query") or "")[:60],
+            "n_claims":    s.get("n_claims"),
+            "overall":     s.get("cit_correct_overall"),
+            "A":           s.get("cit_correct_A"),
+            "B":           s.get("cit_correct_B"),
+            "C":           s.get("cit_correct_C"),
+            "D":           s.get("cit_correct_D"),
+            "nA":          (counts.get("A") or {}).get("n", 0),
+            "nB":          (counts.get("B") or {}).get("n", 0),
+            "nC":          (counts.get("C") or {}).get("n", 0),
+            "nD":          (counts.get("D") or {}).get("n", 0),
+        }
+        summary_rows.append(row)
+
+    sum_df = pd.DataFrame(summary_rows).set_index("survey_id")
+    if not alignscore_enabled:
+        sum_df = sum_df.drop(columns=["overall", "A", "B", "C", "D"], errors="ignore")
+    numeric_cols = sum_df.select_dtypes("number").columns
+    st.dataframe(
+        sum_df.style.format("{:.3f}", subset=[c for c in ["overall", "A", "B", "C", "D"] if c in numeric_cols], na_rep="—"),
+        width="stretch",
+    )
+
+    st.divider()
+
+    # ── Detail view ────────────────────────────────────────────────────────────
+    st.subheader("Detail")
+
+    reset_idx_on_run_change(run_name, "fact_idx", "_fact_run")
+    idx    = nav_arrows("fact_idx", len(surveys))
+    survey = surveys[idx]
+
+    query = survey.get("query") or f"Survey {survey.get('survey_id', idx)}"
+    st.markdown(f"**{query}**  ·  ID `{survey.get('survey_id', '?')}`")
+
+    # ── Chips ──────────────────────────────────────────────────────────────────
+    n_claims = survey.get("n_claims", 0)
+    counts   = survey.get("category_counts", {})
+
+    chip_cols = st.columns(9)
+    chip_cols[0].metric("Claims", n_claims)
+    chip_cols[1].metric("nA", (counts.get("A") or {}).get("n", 0))
+    chip_cols[2].metric("nB", (counts.get("B") or {}).get("n", 0))
+    chip_cols[3].metric("nC", (counts.get("C") or {}).get("n", 0))
+    chip_cols[4].metric("nD", (counts.get("D") or {}).get("n", 0))
+    if survey.get("alignscore_enabled", True):
+        def _cc(k):
+            v = survey.get(f"cit_correct_{k}")
+            return f"{v:.3f}" if v is not None else "—"
+        chip_cols[5].metric("CitCorr overall", _cc("overall"))
+        chip_cols[6].metric("CitCorr A", _cc("A"))
+        chip_cols[7].metric("CitCorr B", _cc("B"))
+        chip_cols[8].metric("CitCorr C/D", f"{_cc('C')} / {_cc('D')}")
+    else:
+        chip_cols[5].metric("AlignScore", "disabled")
+
+    st.divider()
+
+    # ── Category distribution chart ────────────────────────────────────────────
+    categories = ["A", "B", "C", "D"]
+    n_vals     = [(counts.get(k) or {}).get("n", 0) for k in categories]
+    sup_vals   = [(counts.get(k) or {}).get("n_supported") or 0 for k in categories]
+
+    fig = go.Figure()
+    if survey.get("alignscore_enabled", True):
+        unsup = [n - s for n, s in zip(n_vals, sup_vals)]
+        fig.add_trace(go.Bar(
+            name="Supported", x=categories, y=sup_vals,
+            marker_color=[_CAT_COLORS[k] for k in categories], opacity=0.9,
+        ))
+        fig.add_trace(go.Bar(
+            name="Unsupported", x=categories, y=unsup,
+            marker_color=[_CAT_COLORS[k] for k in categories], opacity=0.35,
+        ))
+        fig.update_layout(barmode="stack")
+    else:
+        fig.add_trace(go.Bar(
+            x=categories, y=n_vals,
+            marker_color=[_CAT_COLORS[k] for k in categories],
+            showlegend=False,
+        ))
+
+    fig.update_layout(
+        height=260,
+        margin=dict(l=10, r=10, t=10, b=30),
+        xaxis=dict(tickvals=categories, ticktext=[_CAT_LABELS[k] for k in categories]),
+        yaxis_title="# claims",
+        legend=dict(orientation="h", y=1.05),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    # ── Claims by category ─────────────────────────────────────────────────────
+    st.markdown("#### Claims")
+    claims = survey.get("claims", [])
+    if not claims:
+        st.info("No claims recorded.")
+        return
+
+    tabs = st.tabs([_CAT_LABELS[k] for k in categories])
+    for tab, cat in zip(tabs, categories):
+        with tab:
+            cat_claims = [c for c in claims if c.get("category") == cat]
+            if not cat_claims:
+                st.caption("No claims in this category.")
+                continue
+
+            rows = []
+            for c in cat_claims:
+                sup = c.get("supported")
+                rows.append({
+                    "claim":      c.get("claim", ""),
+                    "confidence": f"{_CONF_ICON.get(c.get('confidence', ''), '')} {c.get('confidence', '—')}",
+                    "supported":  "✓" if sup is True else ("✗" if sup is False else "—"),
+                    "error":      "⚠️" if c.get("error") else "",
+                })
+            cdf = pd.DataFrame(rows)
+            st.dataframe(cdf, width="stretch", hide_index=True)
 
 
 # ── Page: Diversity view (inside Evaluations) ─────────────────────────────────
@@ -788,6 +957,15 @@ _EXPERT_METRICS = [
     ("m_mod",         "Modality entropy (m_mod)"),
 ]
 
+_FACTUALITY_METRICS = [
+    ("n_claims",            "# claims"),
+    ("cit_correct_overall", "CitCorrect overall"),
+    ("cit_correct_A",       "CitCorrect A — General"),
+    ("cit_correct_B",       "CitCorrect B — Methodological"),
+    ("cit_correct_C",       "CitCorrect C — Quantitative"),
+    ("cit_correct_D",       "CitCorrect D — Critical"),
+]
+
 
 def page_comparison() -> None:
     """Display model comparison page: side-by-side diversity and expert evaluation metrics."""
@@ -816,12 +994,15 @@ def page_comparison() -> None:
     div_b  = _find_score_run(dataset, model_b, "diversity")
     exp_a  = _find_score_run(dataset, model_a, "expert")
     exp_b  = _find_score_run(dataset, model_b, "expert")
+    fac_a  = _find_score_run(dataset, model_a, "factuality")
+    fac_b  = _find_score_run(dataset, model_b, "factuality")
 
-    have_diversity = div_a is not None or div_b is not None
-    have_expert    = exp_a is not None or exp_b is not None
+    have_diversity  = div_a is not None or div_b is not None
+    have_expert     = exp_a is not None or exp_b is not None
+    have_factuality = fac_a is not None or fac_b is not None
 
-    if not have_diversity and not have_expert:
-        st.info("No diversity or expert scores found for these models.")
+    if not have_diversity and not have_expert and not have_factuality:
+        st.info("No diversity, expert, or factuality scores found for these models.")
         return
 
     # ── Survey navigation ──────────────────────────────────────────────────────
@@ -904,6 +1085,77 @@ def page_comparison() -> None:
                     legend=dict(orientation="h", y=1.1),
                 )
                 st.plotly_chart(fig, width="stretch")
+
+    # ── Factuality table ───────────────────────────────────────────────────────
+    if have_factuality:
+        st.markdown("### Factuality")
+        fa = _load_survey_json(fac_a, survey_id)
+        fb = _load_survey_json(fac_b, survey_id)
+
+        if fa is None and fb is None:
+            st.info("No factuality data for this survey.")
+        else:
+            def _cc(d):
+                """Extract category_counts dict safely."""
+                return (d or {}).get("category_counts", {})
+
+            def _n(d, cat):
+                return (_cc(d).get(cat) or {}).get("n")
+
+            def _sup(d, cat):
+                return (_cc(d).get(cat) or {}).get("n_supported")
+
+            _CAT_NAMES = [
+                ("A", "General topical"),
+                ("B", "Methodological"),
+                ("C", "Quantitative"),
+                ("D", "Critical & comparative"),
+            ]
+
+            # ── Table 1: Claim distribution (always) ──────────────────────────
+            st.markdown("**Claim distribution**")
+            dist_rows = [
+                (name, None, _n(fa, k), _n(fb, k))
+                for k, name in _CAT_NAMES
+            ]
+            dist_rows.append((
+                "**Total**", None,
+                (fa or {}).get("n_claims"),
+                (fb or {}).get("n_claims"),
+            ))
+            st.dataframe(_comparison_df(dist_rows), width="stretch")
+
+            # ── Table 2: Supported claims (only if AlignScore ran) ─────────────
+            alignscore_on = (fa or {}).get("alignscore_enabled", True) or \
+                            (fb or {}).get("alignscore_enabled", True)
+            if alignscore_on:
+                st.markdown("**Fraction of factually supported claims**")
+                sup_rows = [
+                    (name, None,
+                     (fa or {}).get(f"cit_correct_{k}"),
+                     (fb or {}).get(f"cit_correct_{k}"))
+                    for k, name in _CAT_NAMES
+                ]
+                sup_rows.append((
+                    "**Overall**", None,
+                    (fa or {}).get("cit_correct_overall"),
+                    (fb or {}).get("cit_correct_overall"),
+                ))
+                st.dataframe(_comparison_df(sup_rows), width="stretch")
+
+                n_sup_a = (fa or {}).get("n_supported")
+                n_sup_b = (fb or {}).get("n_supported")
+                n_tot_a = (fa or {}).get("n_claims")
+                n_tot_b = (fb or {}).get("n_claims")
+                parts = []
+                if n_sup_a is not None:
+                    parts.append(f"{model_a}: **{n_sup_a}** / {n_tot_a}")
+                if n_sup_b is not None:
+                    parts.append(f"{model_b}: **{n_sup_b}** / {n_tot_b}")
+                if parts:
+                    st.caption("Supported claims — " + "  ·  ".join(parts))
+            else:
+                st.caption("AlignScore disabled — citation correctness not available")
 
 
 # ── Page: HyperOpt ────────────────────────────────────────────────────────────

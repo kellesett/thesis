@@ -27,11 +27,9 @@ Usage (inside Docker):
     python metrics/expert/main.py --dataset SurGE --model perplexity_dr
 """
 import argparse
-import csv
 import json
 import logging
 import math
-import os
 import re
 import sys
 import time
@@ -53,73 +51,12 @@ CONFIG = Path(__file__).parent / "config.yaml"
 sys.path.insert(0, str(ROOT))
 
 from src.log_setup import setup_logging
-from metrics.utils import make_client, load_config
+from metrics.utils import (
+    make_client, load_config, TokenCounter,
+    resolve_claims_dir, load_generation_files,
+    check_and_load_cache, write_summary_csv, llm_json_call,
+)
 
-
-# ── Config & client ───────────────────────────────────────────────────────────
-
-
-# ── Claimify cache guard ──────────────────────────────────────────────────────
-
-def resolve_claims_dir(dataset: str, model: str) -> Path:
-    claims_dir = ROOT / "results" / "scores" / f"{dataset}_{model}_claims"
-    if not claims_dir.exists() or not any(claims_dir.glob("*.json")):
-        print(
-            f"\n[ERROR] Claimify cache not found at:\n  {claims_dir}\n\n"
-            f"Run first:\n"
-            f"  make evaluate DATASET={dataset} MODEL={model} METRIC=claimify\n",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    return claims_dir
-
-
-# ── LLM call helper ───────────────────────────────────────────────────────────
-
-def llm_json(
-    client: OpenAI,
-    model: str,
-    system: str,
-    user: str,
-    max_retries: int,
-    provider: str | None = None,
-    disable_reasoning: bool = False,
-) -> dict:
-    """Call LLM, parse JSON response. Returns {} on persistent failure."""
-    extra_body: dict = {}
-    if provider:
-        extra_body["provider"] = {"order": [provider], "allow_fallbacks": False}
-    if disable_reasoning:
-        extra_body["reasoning"] = {"enabled": False}
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
-                ],
-                temperature=0,
-                extra_body=extra_body or None,
-            )
-            content = resp.choices[0].message.content
-            if content is None:
-                print(f"[ERROR] OpenRouter None content (finish_reason={resp.choices[0].finish_reason}).\n"
-                      f"Full response: {resp}", file=sys.stderr)
-                raise RuntimeError(
-                    f"OpenRouter returned None content "
-                    f"(finish_reason={resp.choices[0].finish_reason})."
-                )
-            raw = content.strip()
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            return json.loads(raw)
-        except Exception as e:
-            if attempt < max_retries:
-                time.sleep(2 ** attempt)
-            else:
-                return {"_error": str(e)}
-    return {}
 
 
 # ── C.1–C.4 combined judge ────────────────────────────────────────────────────
@@ -174,16 +111,28 @@ def judge_all(
     max_retries: int,
     provider: str | None = None,
     disable_reasoning: bool = False,
+    token_counter: TokenCounter | None = None,
+    reasoning_effort: str | None = None,
+    max_tokens: int | None = None,
 ) -> dict:
     """Single LLM call evaluating C.1–C.4 for one claim.
 
     Returns a flat dict with all keys for criticality, comparativeness,
     open question, and modality. Falls back to safe defaults on parse error.
     """
-    return llm_json(
-        client, model, _ALL_SYS,
-        _ALL_USER.format(claim=claim[:600]),
-        max_retries, provider, disable_reasoning,
+    return llm_json_call(
+        client, model,
+        messages=[
+            {"role": "system", "content": _ALL_SYS},
+            {"role": "user",   "content": _ALL_USER.format(claim=claim[:600])},
+        ],
+        max_retries=max_retries,
+        provider=provider,
+        disable_reasoning=disable_reasoning,
+        token_counter=token_counter,
+        reasoning_effort=reasoning_effort,
+        max_tokens=max_tokens,
+        on_failure=lambda e: {},  # expert code expects {} on failure
     )
 
 
@@ -220,10 +169,16 @@ def judge_valid_comparison(claim: str, context: str, client: OpenAI, model: str,
     Determines if a comparison is fair and properly supported (C.2 validity).
     Not yet wired into metric computation — kept for future use.
     """
-    return llm_json(
-        client, model, _VALID_SYS,
-        _VALID_USER.format(claim=claim[:600], context=context[:800] if context else "Not available"),
-        max_retries, provider, disable_reasoning,
+    return llm_json_call(
+        client, model,
+        messages=[
+            {"role": "system", "content": _VALID_SYS},
+            {"role": "user", "content": _VALID_USER.format(claim=claim[:600], context=context[:800] if context else "Not available")},
+        ],
+        max_retries=max_retries,
+        provider=provider,
+        disable_reasoning=disable_reasoning,
+        on_failure=lambda e: {},  # expert code expects {} on failure
     )
 
 
@@ -249,6 +204,9 @@ def judge_claim(
     source_context: str,
     provider: str | None = None,
     disable_reasoning: bool = False,
+    token_counter: TokenCounter | None = None,
+    reasoning_effort: str | None = None,
+    max_tokens: int | None = None,
 ) -> dict:
     """Run combined C.1–C.4 judge for a single claim. Returns enriched claim dict.
 
@@ -257,7 +215,10 @@ def judge_claim(
     """
     claim = claim_record["claim"]
 
-    res = judge_all(claim, client, model, max_retries, provider, disable_reasoning)
+    res = judge_all(claim, client, model, max_retries, provider, disable_reasoning,
+                    token_counter=token_counter,
+                    reasoning_effort=reasoning_effort,
+                    max_tokens=max_tokens)
 
     result = {
         **claim_record,
@@ -291,14 +252,9 @@ def process_survey(
     survey_id = gen["id"]
     out_file  = out_path / f"{survey_id}.json"
 
-    if cfg.get("resume") and out_file.exists():
-        try:
-            with open(out_file) as f:
-                existing = json.load(f)
-            print(f"  [SKIP] {survey_id} — already scored")
-            return existing
-        except Exception:
-            print(f"  [WARN] {survey_id} — corrupt cache, re-processing")
+    cached = check_and_load_cache(out_file, cfg, survey_id)
+    if cached is not None:
+        return cached
 
     if not gen.get("success", False):
         print(f"  [SKIP] {survey_id} — generation not successful")
@@ -322,18 +278,22 @@ def process_survey(
 
     model             = cfg["judge_model"]
     max_retries       = cfg.get("max_retries", 3)
-    provider          = cfg.get("judge_provider")        # optional — None means let OpenRouter choose
+    provider          = cfg.get("judge_provider")
     disable_reasoning = cfg.get("judge_disable_reasoning", False)
+    reasoning_effort  = cfg.get("judge_reasoning_effort") or None   # "low"|"medium"|"high", takes priority
+    max_tokens        = cfg.get("judge_max_tokens") or None
     workers           = cfg.get("judge_workers", 4)
     # Shared source context (first reference abstract) for validity checks
     source_ctx = ""  # enriched per model if corpus available
 
+    token_counter = TokenCounter()
     judged_claims: list[dict | None] = [None] * len(claims)
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {
             ex.submit(
                 judge_claim, cr, client, model, max_retries,
-                source_ctx, provider, disable_reasoning,
+                source_ctx, provider, disable_reasoning, token_counter,
+                reasoning_effort, max_tokens,
             ): i
             for i, cr in enumerate(claims)
         }
@@ -345,6 +305,7 @@ def process_survey(
                 except Exception as e:
                     judged_claims[i] = {**claims[i], "_judge_error": str(e)}
                 bar.update(1)
+                bar.set_postfix_str(token_counter.fmt())
 
     # ── Compute metrics ────────────────────────────────────────────────────
     n = len(judged_claims)
@@ -403,7 +364,6 @@ def process_survey(
 # ── Summary CSV ───────────────────────────────────────────────────────────────
 
 def write_summary(results: list[dict], out_path: Path) -> None:
-    csv_path = out_path / "summary.csv"
     fields = [
         "survey_id", "query", "n_claims",
         "m_crit", "n_critical",
@@ -412,11 +372,7 @@ def write_summary(results: list[dict], out_path: Path) -> None:
         "m_mod",
         "latency_sec",
     ]
-    with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(results)
-    print(f"\n[expert] summary → {csv_path}")
+    write_summary_csv(results, out_path, fields, "expert")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -442,8 +398,7 @@ def main() -> None:
     out_dir = ROOT / "results" / "scores" / f"{args.dataset}_{args.model}_expert_{run_id}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    gen_files = sorted(gen_dir.glob("*.json"))
-    gen_files = [f for f in gen_files if not re.search(r"_(raw|old)\.json$", f.name)]
+    gen_files = load_generation_files(gen_dir)
 
     print(f"\n[expert] {args.dataset} / {args.model}")
     print(f"         {len(gen_files)} surveys → {out_dir}\n")

@@ -19,9 +19,16 @@ import json
 import logging
 import re
 import sys
+from pathlib import Path
 
 import nltk
 from tqdm import tqdm
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from metrics.utils import TokenCounter
 
 logger = logging.getLogger(__name__)
 
@@ -729,9 +736,20 @@ class ClaimExtractor:
         model_name: Model to use for all stages.
     """
 
-    def __init__(self, client, model_name: str = "openai/gpt-4o-mini"):
-        self.client = client
-        self.model  = model_name
+    def __init__(
+        self,
+        client,
+        model_name: str = "openai/gpt-4o-mini",
+        provider: str | None = None,
+        reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
+    ):
+        self.client          = client
+        self.model           = model_name
+        self.provider        = provider
+        self.reasoning_effort = reasoning_effort
+        self.max_tokens      = max_tokens
+        self.token_counter   = TokenCounter()
 
     # ── Stage 1: Sentence Splitting ───────────────────────────────────────────
 
@@ -800,17 +818,28 @@ class ClaimExtractor:
         Raises:
             RuntimeError: After all retries fail.
         """
+        extra_body: dict = {}
+        if self.provider:
+            extra_body["provider"] = {"order": [self.provider], "allow_fallbacks": False}
+        if self.reasoning_effort:
+            extra_body["reasoning_effort"] = self.reasoning_effort
+
+        create_kwargs: dict = dict(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ],
+            temperature=temperature,
+            extra_body=extra_body or None,
+        )
+        if self.max_tokens is not None:
+            create_kwargs["max_tokens"] = self.max_tokens
+
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES + 1):
             try:
-                resp = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user",   "content": user},
-                    ],
-                    temperature=temperature,
-                )
+                resp = await self.client.chat.completions.create(**create_kwargs)
                 content = resp.choices[0].message.content
                 if content is None:
                     print(f"[ERROR] OpenRouter None content (finish_reason={resp.choices[0].finish_reason}).\n"
@@ -818,6 +847,13 @@ class ClaimExtractor:
                     raise RuntimeError(
                         f"OpenRouter returned None content "
                         f"(finish_reason={resp.choices[0].finish_reason})."
+                    )
+                if resp.usage is not None:
+                    cost = (resp.usage.model_extra or {}).get("cost") or 0.0
+                    self.token_counter.add(
+                        resp.usage.prompt_tokens or 0,
+                        resp.usage.completion_tokens or 0,
+                        cost=float(cost),
                     )
                 return content.strip()
             except Exception as e:
@@ -861,6 +897,7 @@ class ClaimExtractor:
             raw = await self._call_llm(_SELECTION_SYSTEM, user, 0.2)
             if llm_bar is not None:
                 llm_bar.update(1)
+                llm_bar.set_postfix_str(self.token_counter.fmt())
             return raw
 
         outputs = await asyncio.gather(*[_call() for _ in range(_SEL_COMPLETIONS)])
@@ -899,6 +936,7 @@ class ClaimExtractor:
             raw = await self._call_llm(_DISAMBIGUATION_SYSTEM, user, 0.2)
             if llm_bar is not None:
                 llm_bar.update(1)
+                llm_bar.set_postfix_str(self.token_counter.fmt())
             return raw
 
         outputs = await asyncio.gather(*[_call() for _ in range(_DIS_COMPLETIONS)])
@@ -936,6 +974,7 @@ class ClaimExtractor:
         raw = await self._call_llm(_DECOMPOSITION_SYSTEM, user, 0.0)
         if llm_bar is not None:
             llm_bar.update(1)
+            llm_bar.set_postfix_str(self.token_counter.fmt())
         return _parse_decomposition(raw)
 
     # ── Public stage API ──────────────────────────────────────────────────────

@@ -23,13 +23,12 @@ Usage (inside Docker):
     python metrics/factuality/main.py --dataset SurGE --model perplexity_dr
 """
 import argparse
-import csv
 import json
 import logging
-import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,26 +47,11 @@ CONFIG = Path(__file__).parent / "config.yaml"
 sys.path.insert(0, str(ROOT))
 
 from src.log_setup import setup_logging
-from metrics.utils import make_client, load_config
-
-
-# ── Claimify cache guard ──────────────────────────────────────────────────────
-
-def resolve_claims_dir(dataset: str, model: str) -> Path:
-    """
-    Return path to pre-computed claims dir.
-    Fails fast with a clear message if absent.
-    """
-    claims_dir = ROOT / "results" / "scores" / f"{dataset}_{model}_claims"
-    if not claims_dir.exists() or not any(claims_dir.glob("*.json")):
-        print(
-            f"\n[ERROR] Claimify cache not found at:\n  {claims_dir}\n\n"
-            f"Run first:\n"
-            f"  make evaluate DATASET={dataset} MODEL={model} METRIC=claimify\n",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    return claims_dir
+from metrics.utils import (
+    make_client, load_config, TokenCounter,
+    resolve_claims_dir, load_generation_files,
+    check_and_load_cache, write_summary_csv, llm_json_call,
+)
 
 
 # ── Corpus loading ────────────────────────────────────────────────────────────
@@ -141,6 +125,8 @@ def classify_claim(
     max_retries: int,
     disable_reasoning: bool = False,
     provider: str | None = None,
+    token_counter: TokenCounter | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict:
     """Classify a claim into one of four categories (A/B/C/D).
 
@@ -152,6 +138,8 @@ def classify_claim(
         max_retries: Maximum retry attempts for API calls.
         disable_reasoning: Disable thinking tokens (Qwen3, DeepSeek-R1).
         provider: Optional OpenRouter provider override.
+        token_counter: Optional thread-safe accumulator for tracking API token usage.
+        reasoning_effort: "low"|"medium"|"high" for reasoning-capable models (takes priority over disable_reasoning).
 
     Returns:
         Dict with "category" (A/B/C/D), "confidence", and optional "error".
@@ -160,45 +148,29 @@ def classify_claim(
         claim=claim[:600],
         source_context=source_context[:800] if source_context else "Not available",
     )
-    extra_body: dict = {}
-    if provider:
-        extra_body["provider"] = {"order": [provider], "allow_fallbacks": False}
-    if disable_reasoning:
-        extra_body["reasoning"] = {"enabled": False}
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": _CATEGORY_SYSTEM},
-                    {"role": "user",   "content": prompt},
-                ],
-                temperature=0,
-                extra_body=extra_body or None,
-            )
-            content = resp.choices[0].message.content
-            if content is None:
-                print(f"[ERROR] OpenRouter None content (finish_reason={resp.choices[0].finish_reason}).\n"
-                      f"Full response: {resp}", file=sys.stderr)
-                raise RuntimeError(
-                    f"OpenRouter returned None content "
-                    f"(finish_reason={resp.choices[0].finish_reason})."
-                )
-            raw = content.strip()
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            parsed = json.loads(raw)
-            cat = parsed.get("category", "").upper()
-            if cat not in {"A", "B", "C", "D"}:
-                raise ValueError(f"Unknown category: {cat}")
-            return {"category": cat, "confidence": parsed.get("confidence", "low")}
-        except Exception as e:
-            if attempt < max_retries:
-                time.sleep(2 ** attempt)
-            else:
-                return {"category": "A", "confidence": "low", "error": str(e)}
-    return {"category": "A", "confidence": "low"}
+    def _fallback(exc):
+        return {"category": "A", "confidence": "low", "error": str(exc)}
+
+    parsed = llm_json_call(
+        client, model,
+        messages=[
+            {"role": "system", "content": _CATEGORY_SYSTEM},
+            {"role": "user",   "content": prompt},
+        ],
+        max_retries=max_retries,
+        provider=provider,
+        disable_reasoning=disable_reasoning,
+        reasoning_effort=reasoning_effort,
+        token_counter=token_counter,
+        on_failure=_fallback,
+    )
+    if "error" in parsed:
+        return parsed  # fallback dict from on_failure
+    cat = parsed.get("category", "").upper()
+    if cat not in {"A", "B", "C", "D"}:
+        return {"category": "A", "confidence": "low", "error": f"Unknown category: {cat}"}
+    return {"category": cat, "confidence": parsed.get("confidence", "low")}
 
 
 # ── Support verification via AlignScore ───────────────────────────────────────
@@ -293,14 +265,9 @@ def process_survey(
     survey_id = gen["id"]
     out_file  = out_path / f"{survey_id}.json"
 
-    if cfg.get("resume") and out_file.exists():
-        try:
-            with open(out_file) as f:
-                existing = json.load(f)
-            print(f"  [SKIP] {survey_id} — already scored")
-            return existing
-        except Exception:
-            print(f"  [WARN] {survey_id} — corrupt cache, re-processing")
+    cached = check_and_load_cache(out_file, cfg, survey_id)
+    if cached is not None:
+        return cached
 
     if not gen.get("success", False):
         print(f"  [SKIP] {survey_id} — generation not successful")
@@ -323,20 +290,41 @@ def process_survey(
     print(f"  [PROC] {survey_id} | {gen.get('query', '')[:60]} | {len(claims)} claims")
     t0 = time.time()
     max_retries        = cfg.get("max_retries", 3)
+    judge_workers      = cfg.get("judge_workers", 8)
     disable_reasoning  = not cfg.get("judge_reasoning", True)
     provider           = cfg.get("judge_provider") or None
+    reasoning_effort   = cfg.get("judge_reasoning_effort") or None
 
-    # ── Step 1: Classify each claim as A/B/C/D ─────────────────────────────
-    categorized: list[dict] = []
-    for c in tqdm(claims, desc="  classifying", unit="claim", leave=True):
-        # Per-claim source context: use claim record for more precise lookup
-        source_ctx = get_source_context(c, gen, corpus_index)
-        cat_result = classify_claim(
-            c["claim"], source_ctx, client, cfg["judge_model"], max_retries,
-            disable_reasoning=disable_reasoning,
-            provider=provider,
-        )
-        categorized.append({**c, **cat_result, "_source_ctx": source_ctx})
+    # ── Step 1: Classify each claim as A/B/C/D (parallel) ─────────────────
+    token_counter = TokenCounter()
+
+    # Pre-compute source contexts so futures only do LLM work
+    claim_items = [
+        (c, get_source_context(c, gen, corpus_index))
+        for c in claims
+    ]
+
+    results: list[dict | None] = [None] * len(claim_items)
+    futures: dict = {}
+
+    with ThreadPoolExecutor(max_workers=judge_workers) as pool:
+        for i, (c, source_ctx) in enumerate(claim_items):
+            fut = pool.submit(
+                classify_claim,
+                c["claim"], source_ctx, client, cfg["judge_model"], max_retries,
+                disable_reasoning, provider, token_counter, reasoning_effort,
+            )
+            futures[fut] = (i, c, source_ctx)
+
+        with tqdm(total=len(claim_items), desc="  classifying", unit="claim", leave=True) as bar:
+            for fut in as_completed(futures):
+                i, c, source_ctx = futures[fut]
+                cat_result = fut.result()
+                results[i] = {**c, **cat_result, "_source_ctx": source_ctx}
+                bar.update(1)
+                bar.set_postfix_str(token_counter.fmt())
+
+    categorized: list[dict] = [r for r in results if r is not None]
 
     # ── Step 2: AlignScore support verification (optional) ────────────────
     if alignscore_model is not None:
@@ -413,18 +401,13 @@ def process_survey(
 # ── Summary CSV ───────────────────────────────────────────────────────────────
 
 def write_summary(results: list[dict], out_path: Path) -> None:
-    csv_path = out_path / "summary.csv"
     fields = [
         "survey_id", "query", "n_claims", "n_supported",
         "cit_correct_overall",
         "cit_correct_A", "cit_correct_B", "cit_correct_C", "cit_correct_D",
         "latency_sec",
     ]
-    with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(results)
-    print(f"\n[factuality] summary → {csv_path}")
+    write_summary_csv(results, out_path, fields, "factuality")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -458,8 +441,7 @@ def main() -> None:
     out_dir = ROOT / "results" / "scores" / f"{args.dataset}_{args.model}_factuality_{run_id}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    gen_files = sorted(gen_dir.glob("*.json"))
-    gen_files = [f for f in gen_files if not re.search(r"_(raw|old)\.json$", f.name)]
+    gen_files = load_generation_files(gen_dir)
 
     print(f"\n[factuality] {args.dataset} / {args.model}")
     print(f"             {len(gen_files)} surveys → {out_dir}\n")
