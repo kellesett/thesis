@@ -92,15 +92,26 @@ SS_DELAY  = 3.2        # seconds between paginated SS requests (no-auth guidelin
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
 DEFAULT_THRESHOLD = 0.85
-DEFAULT_MODEL     = "google/gemma-3-27b-it"   # closest real OpenRouter Gemma; override via --model
+DEFAULT_MODEL     = "google/gemma-4-31b-it"   # closest real OpenRouter Gemma; override via --model
 DEFAULT_PARALLEL  = 50
+DEFAULT_TOP_K     = 5                         # hybrid: LLM re-ranker sees this many candidates per SS title
 DEFAULT_CACHE_DIR = ROOT / "datasets" / "surge" / "latex_src"
+
+# Threshold above which a (ss_title, bibitem) pair is considered a "strong"
+# candidate by the string score — used in hybrid diagnostics to count
+# multi-candidate disambiguation work actually done by the LLM.
+STRONG_SCORE = 0.85
 
 # Max chars of each bibitem we show to the LLM. 500 easily fits
 # authors+title+venue while keeping the prompt under context limits at 50
 # concurrent requests. Surveys with ~200 bibitems × 500 chars ≈ 100k chars =
 # ~25k tokens per call, comfortably inside Gemma-3-27b's 128k window.
 LLM_RAW_TRUNC = 500
+
+# Bibitem raw bytes we keep in conflict records for post-hoc inspection. Much
+# larger than ``LLM_RAW_TRUNC`` because size of the output JSON doesn't matter
+# for downstream consumers and the extra context helps debugging conflicts.
+CONFLICT_RAW_TRUNC = 1500
 
 
 # ── IO helper (kept local; avoids importing a private name) ───────────────────
@@ -228,10 +239,18 @@ def _lcs_ratio(ss_norm: str, bib_norm: str) -> float:
     Dividing by ``len(ss)`` (not ``len(bib)``) is deliberate: bibitems contain
     authors, venue, years, etc. around the title, which we treat as permitted
     "noise" rather than evidence against a match.
+
+    ``autojunk=False`` is NON-NEGOTIABLE here. ``SequenceMatcher`` defaults to
+    treating as junk any char that occurs in more than 1% of the second
+    sequence when it is longer than 200 items — which silently kills ASCII
+    spaces on longer bibitems. A SS title fully contained in a 220-char
+    bibitem could drop from ratio 1.0 to 0.04 under the default, producing
+    false negatives that look exactly like legitimate "SS has no record"
+    misses. We learned the hard way.
     """
     if not ss_norm or not bib_norm:
         return 0.0
-    m = SequenceMatcher(None, ss_norm, bib_norm).find_longest_match(
+    m = SequenceMatcher(None, ss_norm, bib_norm, autojunk=False).find_longest_match(
         0, len(ss_norm), 0, len(bib_norm),
     )
     return m.size / len(ss_norm)
@@ -500,17 +519,177 @@ def match_by_llm(
         # consumers can sort / threshold uniformly with the string-mode output.
         mapping[k] = (winner, 1.0)
         if len(js_sorted) > 1:
-            conflicts.append({
-                "bibitem_idx":        bibitems[k].idx,
-                "winner_ss_index":    winner,
-                "loser_ss_indices":   js_sorted[1:],
-                "winner_title":       ss_refs[winner].get("title"),
-                "loser_titles":       [ss_refs[x].get("title") for x in js_sorted[1:]],
-            })
+            conflicts.append(_mk_conflict(bibitems[k], winner, js_sorted[1:], ss_refs))
     return mapping, conflicts, per_tokens
 
 
+# ── Variant 3: hybrid (string top-K + LLM re-ranker) ──────────────────────────
+
+
+def match_by_hybrid(
+    bibitems: list[BibItem],
+    ss_refs: list[dict],
+    *,
+    top_k: int,
+    model: str,
+    api_key: str,
+    session: requests.Session,
+    executor: ThreadPoolExecutor,
+    inner_bar: tqdm,
+    global_tokens: TokenCounter,
+) -> tuple[
+    dict[int, tuple[int, float]],   # mapping {bibitem_idx: (ss_idx, score)}
+    list[dict],                     # conflicts
+    TokenCounter,                   # per-survey tokens
+    dict[int, dict],                # ss_diagnostics keyed by ss_idx
+]:
+    """String retrieval + LLM re-ranker.
+
+    For each SS title we precompute the ``_lcs_ratio`` against every bibitem,
+    pick the top ``top_k`` candidates and hand ONLY those to the LLM. The
+    promptthus shrinks from ``n_latex`` entries to ``top_k`` (default 5) —
+    input-token cost drops ~``n_latex/top_k``× (roughly 10-20× on a typical
+    survey).
+
+    Alongside the mapping we emit ``ss_diagnostics[j]`` for every SS title
+    that reached the LLM stage — containing:
+        * ``top_k_scores``          list[float] of K scores in descending order
+        * ``top_k_bibitem_indices`` list[int]  — original k of each position
+        * ``strong_candidates``     int count of scores ≥ ``STRONG_SCORE``
+        * ``llm_picked_rank``       int 1..K (or None if LLM returned null)
+
+    The counter of multi-strong SS titles (``strong_candidates >= 2``) is what
+    tells us *how often* LLM did useful disambiguation that string-only couldn't.
+    """
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    # If the survey has fewer bibitems than K, clamp — otherwise bipartite
+    # logic is unchanged.
+    top_k = min(top_k, len(bibitems))
+
+    bib_norms = [_norm(b.raw) for b in bibitems]
+
+    # Pre-rank candidates per SS title.
+    # jobs entry: (j, ss_title, [(k_orig, score), ...] length = top_k)
+    jobs: list[tuple[int, str, list[tuple[int, float]]]] = []
+    ss_diagnostics: dict[int, dict] = {}
+    for j, ss in enumerate(ss_refs):
+        title = (ss.get("title") or "").strip()
+        if not title:
+            continue
+        ss_norm = _norm(title)
+        if not ss_norm:
+            continue
+        # Full-candidate scoring: O(n_latex) per SS title, cheap.
+        scored = [(k, _lcs_ratio(ss_norm, bn)) for k, bn in enumerate(bib_norms)]
+        scored.sort(key=lambda x: -x[1])
+        top = scored[:top_k]
+        strong = sum(1 for _, s in top if s >= STRONG_SCORE)
+        ss_diagnostics[j] = {
+            "top_k_scores":          [round(s, 4) for _, s in top],
+            "top_k_bibitem_indices": [bibitems[k].idx for k, _ in top],
+            "strong_candidates":     strong,
+            "llm_picked_rank":       None,  # filled in below if LLM picks
+        }
+        jobs.append((j, title, top))
+
+    per_tokens = TokenCounter()
+    inner_bar.reset(total=max(len(jobs), 1))
+    inner_bar.set_postfix_str(
+        f"surv: {per_tokens.fmt()}  total: {global_tokens.fmt()}"
+    )
+    if not jobs:
+        inner_bar.update(1)
+        return {}, [], per_tokens, ss_diagnostics
+
+    # Submit LLM re-ranker calls: same prompt format as --mode llm, but bib_lines
+    # only lists the top-K candidates. The 1..K index space is re-mapped to
+    # original bibitem indices when we parse the LLM result.
+    results: dict[int, tuple[int, int]] = {}  # j -> (k_original, rank_in_topK 1-indexed)
+
+    def _submit(j: int, title: str, top: list[tuple[int, float]]):
+        bib_lines = [
+            f"[{rank + 1}] "
+            + re.sub(r"\s+", " ", bibitems[k_orig].raw[:LLM_RAW_TRUNC]).strip()
+            for rank, (k_orig, _) in enumerate(top)
+        ]
+        return executor.submit(
+            _llm_pick_one, session, api_key, model, title, bib_lines,
+            token_counter=per_tokens,
+        )
+
+    futs = {_submit(j, title, top): (j, top) for j, title, top in jobs}
+    for fut in as_completed(futs):
+        j, top = futs[fut]
+        try:
+            rank = fut.result()  # 0-indexed within top-K, or None
+        except Exception as e:
+            logger.warning("hybrid LLM crash for ss[%d]: %s", j, e)
+            rank = None
+        if rank is not None:
+            k_orig = top[rank][0]
+            results[j] = (k_orig, rank + 1)  # store 1-indexed rank for output
+            ss_diagnostics[j]["llm_picked_rank"] = rank + 1
+        inner_bar.update(1)
+        inner_bar.set_postfix_str(
+            f"surv: {per_tokens.fmt()}  total: {global_tokens.fmt()}"
+        )
+
+    global_tokens.add(
+        per_tokens.in_tokens, per_tokens.out_tokens, cost=per_tokens.cost_usd,
+    )
+
+    # Bipartite conflict resolution (identical to LLM mode).
+    by_k: dict[int, list[int]] = {}
+    for j, (k, _rank) in results.items():
+        by_k.setdefault(k, []).append(j)
+
+    mapping: dict[int, tuple[int, float]] = {}
+    conflicts: list[dict] = []
+    for k, js in by_k.items():
+        js_sorted = sorted(js)
+        winner = js_sorted[0]
+        # The stored score is the string-LCS score of the candidate the LLM
+        # actually picked — far more informative than the opaque ``1.0``
+        # placeholder used by pure-LLM mode. The winner is always in
+        # ``ss_diagnostics`` and always has a non-None ``llm_picked_rank``
+        # (otherwise it wouldn't be in ``results``), but we guard anyway.
+        picked_rank = ss_diagnostics[winner].get("llm_picked_rank")
+        if picked_rank is not None:
+            winner_score = ss_diagnostics[winner]["top_k_scores"][picked_rank - 1]
+        else:
+            winner_score = 1.0
+        mapping[k] = (winner, winner_score)
+        if len(js_sorted) > 1:
+            conflicts.append(_mk_conflict(bibitems[k], winner, js_sorted[1:], ss_refs))
+
+    return mapping, conflicts, per_tokens, ss_diagnostics
+
+
 # ── Output builder ────────────────────────────────────────────────────────────
+
+
+def _mk_conflict(
+    bib: BibItem,
+    winner_j: int,
+    loser_js: list[int],
+    ss_refs: list[dict],
+) -> dict:
+    """Build a conflict record with both sides visible for debugging.
+
+    Unlike the mapping entry, we include ``bibitem_raw`` (truncated) here so
+    a consumer can inspect the raw LaTeX that two SS titles fought over without
+    round-tripping through ``merged.tex``.
+    """
+    return {
+        "bibitem_idx":       bib.idx,
+        "bibitem_title":     bib.title,
+        "bibitem_raw":       bib.raw[:CONFLICT_RAW_TRUNC],
+        "winner_ss_index":   winner_j,
+        "winner_title":      ss_refs[winner_j].get("title"),
+        "loser_ss_indices":  loser_js,
+        "loser_titles":      [ss_refs[x].get("title") for x in loser_js],
+    }
 
 
 def _mk_mapping_entry(bib: BibItem, ss: dict, score: float) -> dict:
@@ -537,62 +716,124 @@ def _mk_mapping_entry(bib: BibItem, ss: dict, score: float) -> dict:
 
 def build_output(
     *,
-    arxiv_id:  str,
-    mode:      str,
-    model:     str | None,
-    threshold: float | None,
-    bibitems:  list[BibItem],
-    ss_refs:   list[dict],
-    mapping:   dict[int, tuple[int, float]],
-    conflicts: list[dict],
-    tokens:    TokenCounter | None = None,
+    arxiv_id:       str,
+    mode:           str,
+    model:          str | None,
+    threshold:      float | None,
+    bibitems:       list[BibItem],
+    ss_refs:        list[dict],
+    mapping:        dict[int, tuple[int, float]],
+    conflicts:      list[dict],
+    tokens:         TokenCounter | None = None,
+    # Hybrid-only diagnostics (None in other modes)
+    top_k:          int | None = None,
+    ss_diagnostics: dict[int, dict] | None = None,
 ) -> dict:
     """Assemble the final mapping JSON (see module docstring for schema).
 
-    When ``tokens`` is provided (LLM mode) the counts and cost are embedded
-    under ``usage`` so a later aggregation step can total cost across all
-    surveys without re-running anything.
+    Mode-specific behaviour:
+        * ``llm``    — ``tokens`` embed as ``usage``.
+        * ``hybrid`` — additionally emits ``top_k`` at the root and enriches
+          every matched/unmatched-SS entry with ``top_k_scores``,
+          ``strong_candidates`` and ``llm_picked_rank``. The top-level
+          ``stats`` grows three counters that quantify how much real
+          disambiguation work the LLM did:
+
+              - ``strong_singleton``      SS titles where exactly one top-K
+                                          candidate had score ≥ STRONG_SCORE;
+                                          string-only mode would have matched
+                                          these unambiguously.
+              - ``llm_disambiguations``   SS titles with ≥2 strong candidates
+                                          and the LLM actually picked one —
+                                          this is the "LLM adds value" count.
+              - ``llm_null_returned``     SS titles the LLM abstained on
+                                          (unmatched regardless of candidate
+                                          scores).
     """
     matched_k = set(mapping.keys())
     matched_j = {j for j, _ in mapping.values()}
 
-    mapping_out = [
-        _mk_mapping_entry(bibitems[k], ss_refs[j], score)
-        for k, (j, score) in sorted(mapping.items())
-    ]
+    def _enrich_with_diag(j: int) -> dict:
+        """Pull hybrid diagnostics for SS index j, empty dict if unavailable."""
+        if ss_diagnostics is None:
+            return {}
+        d = ss_diagnostics.get(j)
+        if d is None:
+            return {}
+        return {
+            "top_k_scores":          d["top_k_scores"],
+            "top_k_bibitem_indices": d["top_k_bibitem_indices"],
+            "strong_candidates":     d["strong_candidates"],
+            "llm_picked_rank":       d["llm_picked_rank"],
+        }
+
+    mapping_out = []
+    for k, (j, score) in sorted(mapping.items()):
+        entry = _mk_mapping_entry(bibitems[k], ss_refs[j], score)
+        entry.update(_enrich_with_diag(j))
+        mapping_out.append(entry)
+
     unmatched_latex = [
         {"idx": b.idx, "key": b.key, "title": b.title}
         for k, b in enumerate(bibitems) if k not in matched_k
     ]
-    unmatched_ss = [
-        {
+
+    unmatched_ss = []
+    for j, s in enumerate(ss_refs):
+        if j in matched_j:
+            continue
+        e = {
             "ss_index": j,
             "title":    s.get("title"),
             "arxiv_id": (s.get("externalIds") or {}).get("ArXiv"),
             "doi":      (s.get("externalIds") or {}).get("DOI"),
             "year":     s.get("year"),
         }
-        for j, s in enumerate(ss_refs) if j not in matched_j
-    ]
+        e.update(_enrich_with_diag(j))
+        unmatched_ss.append(e)
+
+    stats: dict = {
+        "n_latex":         len(bibitems),
+        "n_ss":            len(ss_refs),
+        "matched":         len(mapping),
+        "unmatched_latex": len(unmatched_latex),
+        "unmatched_ss":    len(unmatched_ss),
+        "conflicts":       len(conflicts),
+    }
+
+    if ss_diagnostics is not None:
+        # Roll up per-SS diagnostics into run-level counters.
+        strong_singleton     = 0
+        llm_disambig_done    = 0
+        llm_null             = 0
+        for j, d in ss_diagnostics.items():
+            strong = d["strong_candidates"]
+            picked = d["llm_picked_rank"]
+            if picked is None:
+                llm_null += 1
+            elif strong >= 2:
+                llm_disambig_done += 1
+            elif strong == 1:
+                strong_singleton += 1
+            # strong == 0 and LLM picked something: counts as "LLM rescue";
+            # rolled into neither bucket — visible via (processed - others).
+        stats["strong_singleton"]     = strong_singleton
+        stats["llm_disambiguations"]  = llm_disambig_done
+        stats["llm_null_returned"]    = llm_null
 
     out: dict = {
         "arxiv_id":  arxiv_id,
         "mode":      mode,
         "model":     model,
         "threshold": threshold,
-        "stats": {
-            "n_latex":         len(bibitems),
-            "n_ss":            len(ss_refs),
-            "matched":         len(mapping),
-            "unmatched_latex": len(unmatched_latex),
-            "unmatched_ss":    len(unmatched_ss),
-            "conflicts":       len(conflicts),
-        },
+        "stats":     stats,
         "mapping":         mapping_out,
         "unmatched_latex": unmatched_latex,
         "unmatched_ss":    unmatched_ss,
         "conflicts":       conflicts,
     }
+    if top_k is not None:
+        out["top_k"] = top_k
     if tokens is not None:
         out["usage"] = {
             "in_tokens":  tokens.in_tokens,
@@ -617,9 +858,10 @@ def _process_one(
     mode:           str,
     ss_api_key:     str | None,
     cache_dir:      Path,
-    # string-mode knob
+    # string / hybrid knobs
     threshold:      float,
-    # llm-mode plumbing (all None in string mode)
+    top_k:          int,
+    # llm / hybrid plumbing (all None in pure-string mode)
     model:          str | None,
     api_key:        str | None,
     session:        requests.Session | None,
@@ -642,9 +884,12 @@ def _process_one(
 
     conflicts: list[dict] = []
     per_tokens: TokenCounter | None = None
+    ss_diagnostics: dict[int, dict] | None = None
+    top_k_used: int | None = None
+
     if mode == "string":
         mapping = match_by_string(bibitems, ss_refs, threshold=threshold)
-    else:
+    elif mode == "llm":
         assert session is not None and executor is not None \
             and inner_bar is not None and global_tokens is not None \
             and api_key is not None and model is not None, \
@@ -655,17 +900,34 @@ def _process_one(
             session=session, executor=executor,
             inner_bar=inner_bar, global_tokens=global_tokens,
         )
+    elif mode == "hybrid":
+        assert session is not None and executor is not None \
+            and inner_bar is not None and global_tokens is not None \
+            and api_key is not None and model is not None, \
+            "hybrid mode requires session/executor/inner_bar/global_tokens/api_key/model"
+        mapping, conflicts, per_tokens, ss_diagnostics = match_by_hybrid(
+            bibitems, ss_refs,
+            top_k=top_k,
+            model=model, api_key=api_key,
+            session=session, executor=executor,
+            inner_bar=inner_bar, global_tokens=global_tokens,
+        )
+        top_k_used = min(top_k, len(bibitems))
+    else:
+        raise ValueError(f"unknown mode: {mode!r}")
 
     return build_output(
         arxiv_id=arxiv_id,
         mode=mode,
-        model=(model if mode == "llm" else None),
+        model=(model if mode in ("llm", "hybrid") else None),
         threshold=(threshold if mode == "string" else None),
         bibitems=bibitems,
         ss_refs=ss_refs,
         mapping=mapping,
         conflicts=conflicts,
         tokens=per_tokens,
+        top_k=top_k_used,
+        ss_diagnostics=ss_diagnostics,
     )
 
 
@@ -702,16 +964,23 @@ def main() -> int:
                         help="Re-match even if an output file already exists.")
 
     # Strategy + knobs
-    parser.add_argument("--mode", choices=("string", "llm"), default="string",
-                        help="Matching strategy.")
+    parser.add_argument("--mode", choices=("string", "llm", "hybrid"), default="string",
+                        help="Matching strategy. "
+                             "'string' = deterministic LCS; "
+                             "'llm' = LLM with full bibitem list in every prompt; "
+                             "'hybrid' = string picks top-K, LLM re-ranks those only.")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
-                        help=f"LCS/len(ss) threshold for --mode string (default {DEFAULT_THRESHOLD}).")
+                        help=f"LCS/len(ss) threshold for --mode string (default {DEFAULT_THRESHOLD}). "
+                             f"Not used by --mode hybrid (LLM decides among top-K regardless of score).")
+    parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K,
+                        help=f"Candidates shown to the LLM per SS title in --mode hybrid "
+                             f"(default {DEFAULT_TOP_K}).")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
                         help=f"OpenRouter model slug (default {DEFAULT_MODEL}).")
     parser.add_argument("--parallel", type=int, default=DEFAULT_PARALLEL,
                         help=f"Concurrent LLM calls per survey (default {DEFAULT_PARALLEL}).")
     parser.add_argument("--api-key-env", type=str, default="OPENROUTER_API_KEY",
-                        help="Env var holding the OpenRouter key (--mode llm only).")
+                        help="Env var holding the OpenRouter key (--mode llm / hybrid).")
 
     # Paths
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR,
@@ -753,23 +1022,27 @@ def main() -> int:
     ss_api_key  = os.environ.get(args.ss_api_key_env) or None
 
     # 2. LLM prerequisites — created once, reused across surveys ──────────────
+    # Both 'llm' and 'hybrid' modes share the same network plumbing and the
+    # same two-line tqdm stack — only the per-call work differs.
+    needs_llm = args.mode in ("llm", "hybrid")
     openrouter_key: str | None     = None
     session:  requests.Session     | None = None
     executor: ThreadPoolExecutor   | None = None
     inner_bar: tqdm                | None = None
     global_tokens: TokenCounter    | None = None
-    if args.mode == "llm":
+    if needs_llm:
         openrouter_key = os.environ.get(args.api_key_env)
         if not openrouter_key:
-            logger.error("env %s is empty — required for --mode llm", args.api_key_env)
+            logger.error("env %s is empty — required for --mode %s",
+                         args.api_key_env, args.mode)
             return 2
         session       = _make_session(args.parallel)
         executor      = ThreadPoolExecutor(max_workers=args.parallel)
         global_tokens = TokenCounter()
         # position=1 keeps the inner bar under the outer; reset() is called
-        # per-survey inside match_by_llm so only two lines ever render.
+        # per-survey inside match_by_* so only two lines ever render.
         inner_bar     = tqdm(
-            total=1, desc="llm-match", unit="call",
+            total=1, desc=f"{args.mode}-match", unit="call",
             position=1, leave=False, dynamic_ncols=True,
         )
 
@@ -822,7 +1095,8 @@ def main() -> int:
                     ss_api_key=ss_api_key,
                     cache_dir=args.cache_dir,
                     threshold=args.threshold,
-                    model=(args.model if args.mode == "llm" else None),
+                    top_k=args.top_k,
+                    model=(args.model if needs_llm else None),
                     api_key=openrouter_key,
                     session=session,
                     executor=executor,
@@ -848,14 +1122,21 @@ def main() -> int:
             summary["conflicts_total"] += s["conflicts"]
 
             # Per-survey log line (keeps a searchable record independent of tqdm)
+            extra = ""
+            if "llm_disambiguations" in s:
+                extra = (
+                    f" | strong_single={s['strong_singleton']} "
+                    f"disambig={s['llm_disambiguations']} "
+                    f"null={s['llm_null_returned']}"
+                )
             logger.info(
                 "[sid=%s arxiv=%s] latex=%d ss=%d matched=%d "
-                "(%.0f%% of latex, %.0f%% of ss) conflicts=%d",
+                "(%.0f%% of latex, %.0f%% of ss) conflicts=%d%s",
                 sid, arxiv_id,
                 s["n_latex"], s["n_ss"], s["matched"],
                 100 * s["matched"] / max(s["n_latex"], 1),
                 100 * s["matched"] / max(s["n_ss"], 1),
-                s["conflicts"],
+                s["conflicts"], extra,
             )
 
             # Outer postfix: cumulative matched + global usage (llm only).
