@@ -309,7 +309,7 @@ def main() -> int:
     parser.add_argument("--id", type=int, default=None,
                         help="Process only this survey_id.")
     parser.add_argument("--limit", type=int, default=None,
-                        help="Process only the first N surveys by ascending survey_id.")
+                        help="Process only surveys with survey_id <= LIMIT (inclusive, id-based).")
     parser.add_argument("--force", action="store_true",
                         help="Re-render even if the output generation JSON already exists.")
     args = parser.parse_args()
@@ -334,7 +334,8 @@ def main() -> int:
     if args.id is not None:
         surveys = [s for s in surveys if s["survey_id"] == args.id]
     elif args.limit is not None:
-        surveys = surveys[: args.limit]
+        # id-based inclusive filter: survey_id <= LIMIT. See veriscore's note.
+        surveys = [s for s in surveys if s["survey_id"] <= args.limit]
     if not surveys:
         logger.warning("no surveys to process (filters produced empty set)")
         return 0
