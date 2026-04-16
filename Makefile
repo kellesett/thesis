@@ -119,6 +119,7 @@ surge-reference:
 	bash scripts/merge_latex.sh
 	$(PYTHON) scripts/match_ss_to_bibitems.py --mode $(MODE) $(LIMIT_FLAG) --top-k 5 --parallel 50
 	$(PYTHON) scripts/build_surge_reference.py --mode $(MODE) $(LIMIT_FLAG)
+	$(PYTHON) scripts/enrich_arxiv_ids.py $(LIMIT_FLAG)
 
 ## ── Оценка ───────────────────────────────────────────────────────────────────
 # Промежуточные кэши всех метрик живут в ./tmp/, которая монтируется в /tmp.
