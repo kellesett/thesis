@@ -421,6 +421,13 @@ def main() -> None:
     with open(SURVEYS) as f:
         surveys = json.load(f)
 
+    # surveys.json is NOT sorted by survey_id in-file. We iterate strictly by
+    # ascending survey_id so that:
+    #   (a) the same id → same output path `results/generations/SurGE_*/<id>.json`
+    #       convention used everywhere else in the codebase;
+    #   (b) `--limit N` means "first N surveys by id", not "first N in file order".
+    surveys.sort(key=lambda s: s["survey_id"])
+
     if args.id is not None:
         surveys = [s for s in surveys if s["survey_id"] == args.id]
     elif args.limit:
