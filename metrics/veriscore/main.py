@@ -375,7 +375,9 @@ def main() -> None:
     parser.add_argument("--dataset", required=True, help="Dataset id (e.g. SurGE)")
     parser.add_argument("--model",   required=True, help="Model id (e.g. perplexity_dr)")
     parser.add_argument("--limit", type=int, default=None,
-                        help="Process only the first N surveys by ascending survey_id.")
+                        help="Process only surveys with survey_id <= LIMIT "
+                             "(inclusive, id-based — not positional; handles sparse sets "
+                             "like SurGE_reference where ids may skip).")
     parser.add_argument("--id", type=int, default=None,
                         help="Process only this survey_id.")
     args = parser.parse_args()
@@ -416,7 +418,13 @@ def main() -> None:
     if args.id is not None:
         gen_files = [f for f in gen_files if f.stem == str(args.id)]
     elif args.limit is not None:
-        gen_files = gen_files[: args.limit]
+        # id-based inclusive filter, not positional. For dense datasets this is
+        # equivalent to "first N"; for sparse ones (e.g. SurGE_reference with
+        # ids like 0,1,2,3,5,12,..) it keeps the semantic natural.
+        gen_files = [
+            f for f in gen_files
+            if f.stem.isdigit() and int(f.stem) <= args.limit
+        ]
 
     print(f"\n[veriscore] {args.dataset} / {args.model}")
     print(f"            {len(gen_files)} surveys → {out_dir}")

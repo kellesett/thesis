@@ -165,7 +165,7 @@ def main() -> int:
     parser.add_argument("--id",    type=int, default=None,
                         help="Process only this survey_id.")
     parser.add_argument("--limit", type=int, default=None,
-                        help="Process only the first N surveys by ascending survey_id.")
+                        help="Process only surveys with survey_id <= LIMIT (inclusive, id-based).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Don't write changes back to the generation JSONs.")
     args = parser.parse_args()
@@ -189,7 +189,11 @@ def main() -> int:
     if args.id is not None:
         files = [f for f in files if f.stem == str(args.id)]
     elif args.limit is not None:
-        files = files[: args.limit]
+        # id-based inclusive filter: survey_id <= LIMIT. See veriscore's note.
+        files = [
+            f for f in files
+            if f.stem.isdigit() and int(f.stem) <= args.limit
+        ]
     if not files:
         logger.warning("no generation JSONs to process (filters produced empty set)")
         return 0

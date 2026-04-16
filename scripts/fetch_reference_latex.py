@@ -408,7 +408,7 @@ def log_failure(survey_id: str, reason: str, **extra) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--limit", type=int, default=None,
-                        help="Process only first N surveys (default: all 205)")
+                        help="Process only surveys with survey_id <= LIMIT (inclusive, id-based; default: all 205).")
     parser.add_argument("--id", type=int, default=None,
                         help="Process a single survey_id")
     parser.add_argument("--retry-not-found", action="store_true",
@@ -430,8 +430,10 @@ def main() -> None:
 
     if args.id is not None:
         surveys = [s for s in surveys if s["survey_id"] == args.id]
-    elif args.limit:
-        surveys = surveys[:args.limit]
+    elif args.limit is not None:
+        # id-based inclusive filter: survey_id <= LIMIT. Natural on sparse id
+        # sets where "first N by position" would drop a different subset.
+        surveys = [s for s in surveys if s["survey_id"] <= args.limit]
 
     cache = load_cache()
 
