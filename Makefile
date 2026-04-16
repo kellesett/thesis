@@ -131,7 +131,7 @@ evaluate: base
 	mkdir -p tmp models_cache results/logs
 	docker build -f metrics/$(METRIC)/Dockerfile -t thesis-eval-$(METRIC) .
 	docker run --rm $(VOLUMES) thesis-eval-$(METRIC) \
-		python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL)
+		python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL) $(LIMIT_FLAG)
 
 validate: base
 	mkdir -p tmp
