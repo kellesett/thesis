@@ -4,7 +4,7 @@
 
 .PHONY: help setup setup-sf base \
         generate evaluate validate \
-        convert-autosurvey convert-reference \
+        convert-autosurvey surge-reference \
         viewer enrich \
         download inspect models models-ping \
         sfdb sfdb-check sfmodel \
@@ -15,6 +15,12 @@ DATASET ?= SurGE
 MODEL   ?= perplexity_dr
 METRIC  ?= surge
 GPU     ?= 0
+
+# SurGE_reference pipeline knobs (used by `make surge-reference`):
+#   MODE=string|llm|hybrid  (default hybrid — string top-K + LLM re-ranker)
+#   LIMIT=N                 (default unset — process all surveys)
+MODE     ?= hybrid
+LIMIT_FLAG = $(if $(LIMIT),--limit $(LIMIT),)
 
 # Shared volumes for all containers
 VOLUMES = --env-file .env \
@@ -44,6 +50,7 @@ help:
 	@echo "  make generate MODEL=surveyforge    [DATASET=SurGE] [GPU=1]"
 	@echo "  make generate MODEL=surveygen_i   [DATASET=SurGE]"
 	@echo "  make convert-autosurvey           [DATASET=SurGE]  — baseline (локально, без Docker)"
+	@echo "  make surge-reference              [MODE=hybrid] [LIMIT=N] — human-written SurGE surveys → generation format"
 	@echo ""
 	@echo "  [Оценка]"
 	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=surge"
@@ -98,8 +105,20 @@ generate: base
 convert-autosurvey:
 	$(PYTHON) models/autosurvey/main.py --dataset $(DATASET)
 
-convert-reference:
-	$(PYTHON) scripts/convert_surge_reference.py
+## ── SurGE_reference — human-written surveys → generation format ─────────────
+# End-to-end: fetch arxiv sources → merge LaTeX → match vs Semantic Scholar → assemble.
+# Each step is resume-friendly (skips completed work). Run individual stages
+# directly with python3 if you want tighter control — see README.
+#
+# Examples:
+#   make surge-reference                         # all surveys, hybrid mode
+#   make surge-reference MODE=string LIMIT=40    # first 40, string-only (no LLM cost)
+#   make surge-reference MODE=hybrid LIMIT=40    # first 40, hybrid (default)
+surge-reference:
+	$(PYTHON) scripts/fetch_reference_latex.py $(LIMIT_FLAG)
+	bash scripts/merge_latex.sh
+	$(PYTHON) scripts/match_ss_to_bibitems.py --mode $(MODE) $(LIMIT_FLAG) --top-k 5 --parallel 50
+	$(PYTHON) scripts/build_surge_reference.py --mode $(MODE) $(LIMIT_FLAG)
 
 ## ── Оценка ───────────────────────────────────────────────────────────────────
 # Промежуточные кэши всех метрик живут в ./tmp/, которая монтируется в /tmp.

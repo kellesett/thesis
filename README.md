@@ -168,6 +168,78 @@ make convert-autosurvey DATASET=SurGE
 
 ---
 
+## SurGE_reference — human-written surveys as baseline
+
+Pipeline, который приводит **человеческие** обзоры из SurGE к тому же формату,
+что и LLM-выходы (`results/generations/<DATASET>_<MODEL>/<sid>.json`). Цель —
+прогнать все метрики на «человеческом бейзлайне» через те же code paths, что и
+на LLM-системах.
+
+Состоит из четырёх шагов, все **resume-friendly** (повторный запуск пропускает
+готовое, докидывает недостающее):
+
+1. **`fetch_reference_latex.py`** — находит arxiv-id по названию обзора
+   (multi-strategy title search + author verification) и качает source tarball
+   в `datasets/surge/latex_src/<arxiv_id>/`.
+2. **`merge_latex.sh`** — `latexpand` с инлайном `\input{}`/`\include{}` и
+   вставкой `.bbl` → `merged.tex`.
+3. **`match_ss_to_bibitems.py`** — сопоставляет `\bibitem`-ы из `merged.tex` с
+   Semantic Scholar `/references`-ответом для arxiv-id статьи. Три режима:
+   - `string` — детерминированный LCS, без сети, бесплатно;
+   - `llm` — LLM-диспатчер (OpenRouter, полный bibitem-список в промпте);
+   - `hybrid` — string отбирает top-K кандидатов, LLM re-ranks (рекомендуется:
+     ~20× дешевле `llm`-режима при сравнимом качестве).
+4. **`build_surge_reference.py`** — парсит `merged.tex` в body markdown с
+   инлайн-цитатами `[N]`, обогащает ссылки данными из SS, пишет `merged.md`
+   рядом с `.tex`, и собирает финальный
+   `results/generations/SurGE_reference/<sid>.json`. Поля `arxiv_id` и
+   `semantic_scholar_id` в каждой reference-записи — обязательные, `null` при
+   отсутствии.
+
+### End-to-end запуск через Make
+
+```bash
+make surge-reference                           # все обзоры, hybrid-режим
+make surge-reference MODE=string LIMIT=40      # первые 40, без LLM (бесплатно)
+make surge-reference MODE=hybrid LIMIT=40      # первые 40, hybrid (по умолчанию)
+```
+
+Для `MODE=hybrid` и `MODE=llm` нужен `OPENROUTER_API_KEY` в `.env`. Для стабильной
+работы SS recommended — получить бесплатный Semantic Scholar API-ключ и
+положить в `SEMANTIC_SCHOLAR_API_KEY` (без него лимит ~100 req / 5 min / IP).
+
+### Шаги по отдельности
+
+Иногда удобнее запускать стадии вручную (другой обзор, другой `--parallel`,
+другая модель):
+
+```bash
+# 1. arxiv-поиск + tarball-скачка
+python3 scripts/fetch_reference_latex.py --limit 40
+
+# 2. LaTeX-merge (все папки в latex_src/)
+bash scripts/merge_latex.sh
+
+# 3. matching. Режим выбирается флагом --mode
+python3 scripts/match_ss_to_bibitems.py \
+    --mode hybrid --limit 40 --top-k 5 --parallel 50
+
+# 4. финальная сборка с SS-enrichment
+python3 scripts/build_surge_reference.py --mode hybrid --limit 40
+```
+
+Промежуточные артефакты остаются на диске для отладки:
+
+```
+datasets/surge/latex_src/<arxiv_id>/
+    merged.tex                          # после шага 2
+    ss_references.json                  # кэш SS-ответа (шаг 3)
+    ss_matches_{string,llm,hybrid}.json # mapping bibitem ↔ SS (шаг 3)
+    merged.md                           # clean GFM (шаг 4)
+```
+
+---
+
 ## Оценка
 
 ```bash
