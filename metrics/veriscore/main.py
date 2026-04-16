@@ -374,6 +374,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="VeriScore claim extraction")
     parser.add_argument("--dataset", required=True, help="Dataset id (e.g. SurGE)")
     parser.add_argument("--model",   required=True, help="Model id (e.g. perplexity_dr)")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Process only the first N surveys by ascending survey_id.")
+    parser.add_argument("--id", type=int, default=None,
+                        help="Process only this survey_id.")
     args = parser.parse_args()
 
     cfg    = load_config_util(CONFIG)
@@ -405,6 +409,14 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     gen_files = load_generation_files(gen_dir)
+    # load_generation_files sorts lexically ("10.json" < "2.json"); re-sort
+    # numerically so --limit / --id behave as "first N by survey_id".
+    gen_files.sort(key=lambda p: int(p.stem) if p.stem.isdigit() else 10**9)
+
+    if args.id is not None:
+        gen_files = [f for f in gen_files if f.stem == str(args.id)]
+    elif args.limit is not None:
+        gen_files = gen_files[: args.limit]
 
     print(f"\n[veriscore] {args.dataset} / {args.model}")
     print(f"            {len(gen_files)} surveys → {out_dir}")
