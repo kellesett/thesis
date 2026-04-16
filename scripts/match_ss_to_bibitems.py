@@ -510,16 +510,31 @@ def match_by_llm(
     for j, k in results.items():
         by_k.setdefault(k, []).append(j)
 
+    # Score cache — conflicts are the only place we need string scores here,
+    # and pairs tend to repeat inside a single survey.
+    score_cache: dict[tuple[int, int], float] = {}
+    def score_fn(j: int, k: int) -> float:
+        key = (j, k)
+        s = score_cache.get(key)
+        if s is None:
+            s = _lcs_ratio(
+                _norm(ss_refs[j].get("title") or ""),
+                _norm(bibitems[k].raw),
+            )
+            score_cache[key] = s
+        return s
+
     mapping: dict[int, tuple[int, float]] = {}
     conflicts: list[dict] = []
     for k, js in by_k.items():
-        js_sorted = sorted(js)
-        winner = js_sorted[0]
-        # LLM gives no confidence score; 1.0 is a placeholder so downstream
-        # consumers can sort / threshold uniformly with the string-mode output.
-        mapping[k] = (winner, 1.0)
-        if len(js_sorted) > 1:
-            conflicts.append(_mk_conflict(bibitems[k], winner, js_sorted[1:], ss_refs))
+        # Winner = SS title with highest LCS score against this bibitem.
+        # Tie-break by smallest j for run-to-run determinism (SS index order
+        # is itself stable). Losers are the rest, sorted for a tidy output.
+        winner = max(js, key=lambda j: (score_fn(j, k), -j))
+        losers = sorted(j for j in js if j != winner)
+        mapping[k] = (winner, score_fn(winner, k))
+        if losers:
+            conflicts.append(_mk_conflict(bibitems[k], winner, losers, ss_refs))
     return mapping, conflicts, per_tokens
 
 
@@ -639,29 +654,28 @@ def match_by_hybrid(
         per_tokens.in_tokens, per_tokens.out_tokens, cost=per_tokens.cost_usd,
     )
 
-    # Bipartite conflict resolution (identical to LLM mode).
+    # Bipartite conflict resolution: pick the SS title whose top-K score against
+    # this bibitem is highest (free — already in ss_diagnostics), tie-break by
+    # smallest j for determinism.
     by_k: dict[int, list[int]] = {}
     for j, (k, _rank) in results.items():
         by_k.setdefault(k, []).append(j)
 
+    def _score_for(j: int) -> float:
+        """Score of the candidate that LLM chose for SS title j."""
+        rank = ss_diagnostics[j].get("llm_picked_rank")
+        if rank is None:
+            return 0.0
+        return ss_diagnostics[j]["top_k_scores"][rank - 1]
+
     mapping: dict[int, tuple[int, float]] = {}
     conflicts: list[dict] = []
     for k, js in by_k.items():
-        js_sorted = sorted(js)
-        winner = js_sorted[0]
-        # The stored score is the string-LCS score of the candidate the LLM
-        # actually picked — far more informative than the opaque ``1.0``
-        # placeholder used by pure-LLM mode. The winner is always in
-        # ``ss_diagnostics`` and always has a non-None ``llm_picked_rank``
-        # (otherwise it wouldn't be in ``results``), but we guard anyway.
-        picked_rank = ss_diagnostics[winner].get("llm_picked_rank")
-        if picked_rank is not None:
-            winner_score = ss_diagnostics[winner]["top_k_scores"][picked_rank - 1]
-        else:
-            winner_score = 1.0
-        mapping[k] = (winner, winner_score)
-        if len(js_sorted) > 1:
-            conflicts.append(_mk_conflict(bibitems[k], winner, js_sorted[1:], ss_refs))
+        winner = max(js, key=lambda j: (_score_for(j), -j))
+        losers = sorted(j for j in js if j != winner)
+        mapping[k] = (winner, _score_for(winner))
+        if losers:
+            conflicts.append(_mk_conflict(bibitems[k], winner, losers, ss_refs))
 
     return mapping, conflicts, per_tokens, ss_diagnostics
 
@@ -702,15 +716,20 @@ def _mk_mapping_entry(bib: BibItem, ss: dict, score: float) -> dict:
         else None
     )
     return {
-        "latex_idx":   bib.idx,
-        "latex_key":   bib.key,
-        "latex_title": bib.title,
-        "ss_title":    ss.get("title"),
-        "ss_arxiv_id": arxiv,
-        "ss_doi":      doi,
-        "ss_url":      url,
-        "ss_year":     ss.get("year"),
-        "score":       round(score, 4),
+        "latex_idx":    bib.idx,
+        "latex_key":    bib.key,
+        "latex_title":  bib.title,
+        "ss_title":     ss.get("title"),
+        "ss_arxiv_id":  arxiv,
+        "ss_doi":       doi,
+        # Semantic Scholar internal id. Non-null when SS successfully linked
+        # this reference to a paper in their graph — which means we can later
+        # ``GET /paper/<paperId>`` to fetch the full abstract even if no
+        # arxiv_id is present (2nd fallback of the reference-text pipeline).
+        "ss_paper_id":  ss.get("paperId"),
+        "ss_url":       url,
+        "ss_year":      ss.get("year"),
+        "score":        round(score, 4),
     }
 
 
@@ -792,13 +811,40 @@ def build_output(
         e.update(_enrich_with_diag(j))
         unmatched_ss.append(e)
 
+    # Fetch-reachability counters — both computed over MATCHED refs.
+    #
+    # ``has_arxiv_id`` / ``has_arxiv_id_ratio``: tier-1 of the reference-text
+    #     pipeline — refs we can hydrate straight from arxiv (abstract /
+    #     tarball / GROBID-parsed PDF, whichever comes first).
+    #
+    # ``fetchable``  / ``fetchable_ratio``: tier-1 OR tier-2 union — refs we
+    #     can reach via arxiv first, falling back to SS /paper/<paperId>
+    #     when no arxiv_id is available. The superset of ``has_arxiv_id``.
+    #
+    # The *difference* (``fetchable - has_arxiv_id``) is the set where the
+    # SS-fallback earns its keep.
+    n_arxiv = sum(1 for e in mapping_out if e.get("ss_arxiv_id"))
+    n_fetchable = sum(
+        1 for e in mapping_out
+        if e.get("ss_arxiv_id") or e.get("ss_paper_id")
+    )
+    matched_total = len(mapping_out)
+
     stats: dict = {
-        "n_latex":         len(bibitems),
-        "n_ss":            len(ss_refs),
-        "matched":         len(mapping),
-        "unmatched_latex": len(unmatched_latex),
-        "unmatched_ss":    len(unmatched_ss),
-        "conflicts":       len(conflicts),
+        "n_latex":            len(bibitems),
+        "n_ss":               len(ss_refs),
+        "matched":            len(mapping),
+        "unmatched_latex":    len(unmatched_latex),
+        "unmatched_ss":       len(unmatched_ss),
+        "conflicts":          len(conflicts),
+        "has_arxiv_id":       n_arxiv,
+        "has_arxiv_id_ratio": (
+            round(n_arxiv / matched_total, 4) if matched_total else 0.0
+        ),
+        "fetchable":          n_fetchable,
+        "fetchable_ratio":    (
+            round(n_fetchable / matched_total, 4) if matched_total else 0.0
+        ),
     }
 
     if ss_diagnostics is not None:
