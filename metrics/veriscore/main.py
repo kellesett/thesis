@@ -318,14 +318,18 @@ def process_survey(
 ) -> dict | None:
     """Run claim extraction for one survey.
 
-    A fresh inner tqdm bar is created for THIS survey at ``position=1,
-    leave=False`` and ``close()``d when the survey finishes. This is simpler
-    and more robust than a long-lived ``reset()``-reused bar: after the first
-    survey's bar finishes at 100%, a second ``reset(total=...)`` on the same
-    instance interacts badly with ANSI cursor positioning and tqdm starts
-    appending lines instead of overwriting. Fresh-per-survey with ``leave=False``
-    clears cleanly; the outer bar at ``position=0`` sees position=1 freed
-    between surveys.
+    A fresh inner tqdm bar is created for THIS survey with ``leave=False``
+    (no explicit ``position=`` — see the inline comment below) and closed
+    when the survey finishes. Simpler and more robust than:
+      (a) a long-lived ``reset()``-reused bar — after the first survey's
+          bar finishes at 100%, a second ``reset(total=...)`` on the same
+          instance interacts badly with ANSI cursor positioning and tqdm
+          starts appending lines instead of overwriting;
+      (b) explicit ``position=1`` on the recreated bar — in Docker with -t
+          the repeated create/close at a fixed position produced duplicate
+          rendering on the second survey onwards. Auto-positioning (omit
+          ``position=``) is the canonical nested-tqdm pattern and survives
+          all the state transitions cleanly.
 
     ``global_tokens`` is an optional run-wide :class:`TokenCounter`; per-survey
     tokens are rolled up into it after extraction so the outer bar can
@@ -366,18 +370,20 @@ def process_survey(
     # bar can show cumulative cost across the whole run.
     per_tokens = TokenCounter()
 
-    # Fresh inner bar per survey — see docstring for the reset()-vs-recreate
-    # reasoning. position=1 puts it directly under the surveys bar; leave=False
-    # wipes it from the terminal on close() so the next survey starts on a
-    # clean line.
+    # Fresh inner bar per survey (close+recreate, not reset+reuse — see
+    # docstring). ``leave=False`` wipes it on close. IMPORTANTLY: no explicit
+    # ``position=`` — tqdm auto-positions via its global ``_instances``
+    # registry relative to other active bars. In Docker with -t the explicit
+    # position=0/1 combo (outer long-lived + inner repeatedly recreated)
+    # produced duplicate rendering on the second survey onwards, likely due
+    # to mismatched cursor bookkeeping when the second inner bar's init
+    # ANSI sequences landed on a row the outer bar had just refreshed.
+    # Auto-positioning is the canonical nested-tqdm pattern and survives all
+    # the state transitions cleanly.
     sents_bar = tqdm(
         total=max(n_sentences, 1),
         desc="  sents", unit="sent",
-        position=1, leave=False, dynamic_ncols=True,
-        # mininterval throttles how often tqdm actually writes to the terminal
-        # (default 0.1s = up to 10 writes/sec). At parallel=50 bursty updates
-        # overwhelm docker's stdout forwarder; 0.3s gives terminal room to
-        # breathe without making the bar look stuck (3 refreshes/sec is fine).
+        leave=False, dynamic_ncols=True,
         mininterval=0.3,
     )
     _postfix = (
@@ -530,9 +536,12 @@ def main() -> None:
     # Run-wide token accumulator; the inner sents bar is created fresh in
     # process_survey per survey (see its docstring for why we don't reset()).
     global_tokens = TokenCounter()
+    # Outer bar — no explicit position= either. Canonical nested pattern:
+    # tqdm picks position=0 automatically for the only active bar at this
+    # scope, and any inner bars created by process_survey get position=1.
     surveys_bar = tqdm(
         total=len(gen_files), desc="surveys", unit="survey",
-        position=0, leave=True, dynamic_ncols=True,
+        leave=True, dynamic_ncols=True,
     )
 
     try:
