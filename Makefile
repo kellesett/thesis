@@ -130,7 +130,15 @@ surge-reference:
 evaluate: base
 	mkdir -p tmp models_cache results/logs
 	docker build -f metrics/$(METRIC)/Dockerfile -t thesis-eval-$(METRIC) .
-	docker run --rm $(VOLUMES) thesis-eval-$(METRIC) \
+	# -t allocates a pseudo-TTY inside the container so tqdm can do in-place
+	# bar redraws via \r and ANSI cursor codes. Without it every update
+	# appends a new line and a two-bar display explodes on screen.
+	# TTY detection lives in the recipe shell (NOT in a $(shell ...) expansion
+	# — there fd 1 is a pipe to make and the test would always fail). The
+	# backslash-continued line keeps both assignment and docker run in one
+	# shell so $$TTY propagates; falls back to empty string under CI/nohup.
+	TTY="$$(test -t 1 && echo -t || true)" ; \
+	docker run --rm $$TTY $(VOLUMES) thesis-eval-$(METRIC) \
 		python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL) $(LIMIT_FLAG)
 
 validate: base
