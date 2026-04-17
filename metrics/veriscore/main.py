@@ -179,10 +179,6 @@ def _build_snippet(sentences: list[str], i: int) -> str:
         return f"{lead_sent.strip()} {context1.strip()} {sentence.strip()} {context2.strip()}".strip()
 
 
-def _make_bar(desc: str, total: int) -> tqdm:
-    return tqdm(total=total, desc=desc, unit="sent", leave=True, dynamic_ncols=True)
-
-
 def _extract_sentence_claims(
     i: int,
     sentences: list[str],
@@ -244,6 +240,7 @@ def extract_claims(
     provider: str | None = None,
     reasoning_effort: str | None = None,
     token_counter: TokenCounter | None = None,
+    global_tokens: TokenCounter | None = None,
 ) -> list[str]:
     """Extract deduplicated atomic claims from text.
 
@@ -286,9 +283,22 @@ def extract_claims(
             i, sent_claims = future.result()  # raises on LLM failure → propagates up
             claims_by_sent[i] = sent_claims
             if sents_bar is not None:
-                sents_bar.update(1)
+                # refresh=False on the postfix update — let ``update(1)``
+                # below be the SINGLE redraw for this tick. Default
+                # ``set_postfix_str`` forces a refresh which, combined with
+                # update()'s own redraw, doubles the terminal-write rate
+                # and bypasses mininterval-based throttling. At parallel=50
+                # this floods docker's stdout forwarder and `\r`-based
+                # overwrites collapse into appended lines.
                 if token_counter is not None:
-                    sents_bar.set_postfix_str(token_counter.fmt())
+                    if global_tokens is not None:
+                        sents_bar.set_postfix_str(
+                            f"surv: {token_counter.fmt()}  total: {global_tokens.fmt()}",
+                            refresh=False,
+                        )
+                    else:
+                        sents_bar.set_postfix_str(token_counter.fmt(), refresh=False)
+                sents_bar.update(1)
 
     # Flatten in sentence order, then deduplicate preserving first occurrence
     flat = [claim for sent_claims in claims_by_sent for claim in sent_claims]
@@ -303,48 +313,100 @@ def process_survey(
     cfg: dict,
     nlp,
     client: OpenAI,
+    *,
+    global_tokens: TokenCounter | None = None,
 ) -> dict | None:
+    """Run claim extraction for one survey.
+
+    A fresh inner tqdm bar is created for THIS survey at ``position=1,
+    leave=False`` and ``close()``d when the survey finishes. This is simpler
+    and more robust than a long-lived ``reset()``-reused bar: after the first
+    survey's bar finishes at 100%, a second ``reset(total=...)`` on the same
+    instance interacts badly with ANSI cursor positioning and tqdm starts
+    appending lines instead of overwriting. Fresh-per-survey with ``leave=False``
+    clears cleanly; the outer bar at ``position=0`` sees position=1 freed
+    between surveys.
+
+    ``global_tokens`` is an optional run-wide :class:`TokenCounter`; per-survey
+    tokens are rolled up into it after extraction so the outer bar can
+    display cumulative usage/cost.
+    """
     survey_id = str(gen["id"])
     out_file  = out_path / f"{survey_id}.json"
 
     cached = check_and_load_cache(out_file, cfg, survey_id, required_keys=("survey_id", "claims"))
     if cached is not None:
-        tqdm.write(
-            f"  [SKIP] {survey_id} — {cached['n_claims']} claims already saved",
-            file=sys.stderr,
+        logger.info(
+            "[SKIP] sid=%s — %d claims already saved",
+            survey_id, cached["n_claims"],
         )
         return cached
 
     if not gen.get("success", False):
-        tqdm.write(f"  [SKIP] {survey_id} — generation not successful", file=sys.stderr)
+        logger.info("[SKIP] sid=%s — generation not successful", survey_id)
         return None
 
     text = gen.get("text", "").strip()
     if not text:
-        tqdm.write(f"  [SKIP] {survey_id} — empty text", file=sys.stderr)
+        logger.info("[SKIP] sid=%s — empty text", survey_id)
         return None
 
     question    = gen.get("query", "")
     n_sentences = len([s for s in nlp(text).sents if s.text.strip()])
 
-    tqdm.write(f"  [PROC] {survey_id} | {question[:70]}", file=sys.stderr)
+    logger.info("[PROC] sid=%s | %s", survey_id, question[:70])
 
     disable_reasoning = not cfg.get("judge_reasoning", True)
     max_tokens        = cfg.get("judge_max_tokens", 1000)
     workers           = cfg.get("sent_workers", 1)
     provider          = cfg.get("judge_provider") or None
     reasoning_effort  = cfg.get("judge_reasoning_effort") or None
-    token_counter     = TokenCounter()
-    sents_bar = _make_bar("  sents", n_sentences)
-    claims = extract_claims(text, nlp, client, cfg["judge_model"],
-                            max_tokens=max_tokens,
-                            disable_reasoning=disable_reasoning,
-                            sents_bar=sents_bar,
-                            workers=workers,
-                            provider=provider,
-                            reasoning_effort=reasoning_effort,
-                            token_counter=token_counter)
-    sents_bar.close()
+
+    # Per-survey counter; rolled up into global_tokens at the end so the outer
+    # bar can show cumulative cost across the whole run.
+    per_tokens = TokenCounter()
+
+    # Fresh inner bar per survey — see docstring for the reset()-vs-recreate
+    # reasoning. position=1 puts it directly under the surveys bar; leave=False
+    # wipes it from the terminal on close() so the next survey starts on a
+    # clean line.
+    sents_bar = tqdm(
+        total=max(n_sentences, 1),
+        desc="  sents", unit="sent",
+        position=1, leave=False, dynamic_ncols=True,
+        # mininterval throttles how often tqdm actually writes to the terminal
+        # (default 0.1s = up to 10 writes/sec). At parallel=50 bursty updates
+        # overwhelm docker's stdout forwarder; 0.3s gives terminal room to
+        # breathe without making the bar look stuck (3 refreshes/sec is fine).
+        mininterval=0.3,
+    )
+    _postfix = (
+        f"surv: {per_tokens.fmt()}  total: {global_tokens.fmt()}"
+        if global_tokens is not None else per_tokens.fmt()
+    )
+    sents_bar.set_postfix_str(_postfix)
+
+    try:
+        claims = extract_claims(text, nlp, client, cfg["judge_model"],
+                                max_tokens=max_tokens,
+                                disable_reasoning=disable_reasoning,
+                                sents_bar=sents_bar,
+                                workers=workers,
+                                provider=provider,
+                                reasoning_effort=reasoning_effort,
+                                token_counter=per_tokens,
+                                global_tokens=global_tokens)
+    finally:
+        sents_bar.close()
+
+    # Roll per-survey usage up; do this AFTER extract returns so the inner
+    # bar has shown per-survey running totals all the way through.
+    if global_tokens is not None:
+        global_tokens.add(
+            per_tokens.in_tokens,
+            per_tokens.out_tokens,
+            per_tokens.cost_usd,
+        )
 
     result = {
         "survey_id":   survey_id,
@@ -360,10 +422,18 @@ def process_survey(
         "judge_model": cfg["judge_model"],
         "pipeline":    "veriscore",
         "timestamp":   datetime.now(timezone.utc).isoformat(),
+        "usage": {
+            "in_tokens":  per_tokens.in_tokens,
+            "out_tokens": per_tokens.out_tokens,
+            "cost_usd":   round(per_tokens.cost_usd, 6),
+        },
     }
 
     out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2))
-    tqdm.write(f"         → {len(claims)} claims", file=sys.stderr)
+    logger.info(
+        "[DONE] sid=%s — %d claims  [%s]",
+        survey_id, len(claims), per_tokens.fmt(),
+    )
     return result
 
 
@@ -371,6 +441,23 @@ def process_survey(
 
 def main() -> None:
     setup_logging("veriscore")
+
+    # Reserve stderr for tqdm — drop the console StreamHandler that
+    # setup_logging attached so nothing stomps the live bars. All log records
+    # keep flowing to results/logs/veriscore.log via FileHandler (DEBUG+).
+    # FileHandler subclasses StreamHandler, so order the check by type.
+    log_file: Path | None = None
+    for h in list(logging.root.handlers):
+        if isinstance(h, logging.FileHandler):
+            log_file = Path(getattr(h, "baseFilename", "")) or log_file
+        elif isinstance(h, logging.StreamHandler):
+            logging.root.removeHandler(h)
+    if log_file is not None:
+        print(
+            f"Logs → {log_file}  (tail -f to follow; stderr reserved for tqdm)",
+            file=sys.stderr, flush=True,
+        )
+
     parser = argparse.ArgumentParser(description="VeriScore claim extraction")
     parser.add_argument("--dataset", required=True, help="Dataset id (e.g. SurGE)")
     parser.add_argument("--model",   required=True, help="Model id (e.g. perplexity_dr)")
@@ -426,37 +513,65 @@ def main() -> None:
             if f.stem.isdigit() and int(f.stem) <= args.limit
         ]
 
-    print(f"\n[veriscore] {args.dataset} / {args.model}")
-    print(f"            {len(gen_files)} surveys → {out_dir}")
-    print(f"            model: {cfg['judge_model']}\n")
+    # Pre-run banner — goes to stdout (printed before any tqdm bar opens,
+    # so no collision) and to the log file so post-mortems know what ran.
+    banner = (
+        f"[veriscore] {args.dataset} / {args.model}\n"
+        f"            {len(gen_files)} surveys → {out_dir}\n"
+        f"            model: {cfg['judge_model']}"
+    )
+    print("\n" + banner + "\n")
+    for line in banner.splitlines():
+        logger.info(line)
 
     n_ok, n_skip = 0, 0
     total_claims = 0
 
+    # Run-wide token accumulator; the inner sents bar is created fresh in
+    # process_survey per survey (see its docstring for why we don't reset()).
+    global_tokens = TokenCounter()
     surveys_bar = tqdm(
         total=len(gen_files), desc="surveys", unit="survey",
-        leave=True, dynamic_ncols=True,
+        position=0, leave=True, dynamic_ncols=True,
     )
 
-    for gf in gen_files:
-        surveys_bar.set_postfix_str(gf.stem)
-        gen = json.loads(gf.read_text())
+    try:
+        for gf in gen_files:
+            surveys_bar.set_postfix_str(f"{gf.stem}  {global_tokens.fmt()}")
+            gen = json.loads(gf.read_text())
 
-        result = process_survey(gen, out_dir, cfg, nlp, client)
-        if result is None:
-            n_skip += 1
-        else:
-            n_ok         += 1
-            total_claims += result["n_claims"]
-            surveys_bar.set_postfix_str(f"{gf.stem} → {result['n_claims']} claims")
-        surveys_bar.update(1)
+            result = process_survey(
+                gen, out_dir, cfg, nlp, client,
+                global_tokens=global_tokens,
+            )
+            if result is None:
+                n_skip += 1
+            else:
+                n_ok         += 1
+                total_claims += result["n_claims"]
+                surveys_bar.set_postfix_str(
+                    f"{gf.stem} → {result['n_claims']} claims  {global_tokens.fmt()}"
+                )
+            surveys_bar.update(1)
+    finally:
+        surveys_bar.close()
 
-    surveys_bar.close()
-
-    print(f"\n[veriscore] done — ok={n_ok} skip={n_skip}")
-    print(f"            total claims: {total_claims}")
+    # Post-run summary — same reasoning as the banner: bars are already
+    # closed by the `finally:` above, so print() is safe. Duplicate to
+    # logger.info so the file record is self-contained.
+    summary_lines = [
+        f"[veriscore] done — ok={n_ok} skip={n_skip}",
+        f"            total claims: {total_claims}",
+    ]
     if n_ok > 0:
-        print(f"            avg per survey: {total_claims // n_ok}")
+        summary_lines.append(f"            avg per survey: {total_claims // n_ok}")
+    summary_lines.append(
+        f"            usage: in={global_tokens.in_tokens}  out={global_tokens.out_tokens}  "
+        f"cost=${global_tokens.cost_usd:.6f}  ({global_tokens.fmt()})"
+    )
+    print("\n" + "\n".join(summary_lines))
+    for line in summary_lines:
+        logger.info(line)
 
 
 if __name__ == "__main__":
