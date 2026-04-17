@@ -139,6 +139,19 @@ class BaseModel(ABC):
 
         dataset = load_dataset_cls(dataset_id, registry[dataset_id])
         instances = list(dataset)
+        # Normalize iteration order: SurGE (and possibly other datasets) stores
+        # surveys in file-order, not sorted by numeric id — so raw iteration
+        # goes 0, 1, 41, 42, 43, ... Sorting by int(id) makes:
+        #   (a) ``n_surveys`` / ``--limit`` mean "first N by ascending idx"
+        #       which matches every other script in the repo;
+        #   (b) generation output order stable across runs regardless of
+        #       surveys.json file layout.
+        # Non-numeric ids (none in SurGE today, but possible in other datasets)
+        # sort lexically and land AFTER numeric ones.
+        def _id_sort_key(inst):
+            s = str(inst.id)
+            return (0, int(s)) if s.isdigit() else (1, s)
+        instances.sort(key=_id_sort_key)
         if n_surveys is not None:
             instances = instances[:n_surveys]
 
