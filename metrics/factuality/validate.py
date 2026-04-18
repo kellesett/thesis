@@ -29,32 +29,12 @@ CONFIG = Path(__file__).parent / "config.yaml"
 sys.path.insert(0, str(ROOT))
 
 from metrics.utils import make_client, load_config, TokenCounter
+# Prompts are the single-source-of-truth shared with main.py — avoids the
+# old "# copied from main.py" drift hazard. Changes to the classifier spec
+# land in one file now.
+from metrics.factuality.prompts import CATEGORY_SYSTEM, CATEGORY_PROMPT
 
 SCORES_DIR = ROOT / "results" / "scores"
-
-
-# ── Classifier prompts (copied from main.py) ───────────────────────────────────
-
-_CATEGORY_SYSTEM = (
-    "You are classifying atomic claims from a scientific survey into one of four "
-    "categories based on what type of information they convey."
-)
-
-_CATEGORY_PROMPT = """\
-The claim to classify:
-"{claim}"
-
-Source paper context (if available):
-"{source_context}"
-
-Categories:
-A — General topical claims. Statements that can be made based on only reading the abstract. They describe what a paper is about, what problem it addresses, or its general contribution without specific methodological or quantitative details.
-B — Methodological refinements. Statements containing specific details about how methods work, requiring information typically found in the Methods section.
-C — Quantitative claims. Statements containing specific numerical values, typically from the Results section.
-D — Critical or comparative claims. Statements making evaluative judgments, comparing approaches, discussing limitations, or pointing to contradictions — typically from Discussion or Related Work sections.
-
-Respond with a JSON object:
-{{"category": "A" | "B" | "C" | "D", "reasoning": "brief explanation", "confidence": "high" | "medium" | "low"}}"""
 
 
 def classify_claim(
@@ -64,7 +44,7 @@ def classify_claim(
     reasoning_effort: str | None = None,
 ) -> str | None:
     """Returns predicted category letter (A/B/C/D), or None on failure."""
-    prompt = _CATEGORY_PROMPT.format(claim=claim[:600], source_context="Not available")
+    prompt = CATEGORY_PROMPT.format(claim=claim[:600], source_context="Not available")
     extra_body: dict = {}
     if provider:
         extra_body["provider"] = {"order": [provider], "allow_fallbacks": False}
@@ -77,7 +57,7 @@ def classify_claim(
         try:
             resp = client.chat.completions.create(
                 model=model,
-                messages=[{"role": "system", "content": _CATEGORY_SYSTEM},
+                messages=[{"role": "system", "content": CATEGORY_SYSTEM},
                           {"role": "user",   "content": prompt}],
                 temperature=0,
                 extra_body=extra_body or None,
