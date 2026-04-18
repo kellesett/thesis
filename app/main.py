@@ -55,10 +55,26 @@ def find_score_runs() -> list[tuple[str, pathlib.Path]]:
     return sorted(runs)
 
 
+def _numeric_stem_key(p: pathlib.Path) -> tuple[int, str]:
+    """Sort ``<N>.json`` files numerically; fall back to lexical for non-numeric stems.
+
+    Viewer runs iterate over files whose names are ``<survey_id>.json``. A plain
+    ``sorted(glob)`` gives lexical order, so for sparse ids (SurGE_reference =
+    0, 1, 2, 3, 5, 6, 8, 10, ...) you get 0, 1, 10, 11, ..., 2, 20, ..., 3.
+    Next/previous navigation then jumps unnaturally (1 → 10 instead of 1 → 2).
+
+    The two-element tuple key groups numeric ids first (bucket 0, sorted by
+    int) and any non-numeric filename after (bucket 1, sorted by string) so
+    both coexist predictably.
+    """
+    s = p.stem
+    return (0, int(s)) if s.isdigit() else (1, s)
+
+
 def load_generations(run_dir: pathlib.Path) -> list[dict]:
     """Load generation JSON files from a run directory, skipping files that fail to parse."""
     out = []
-    for f in sorted(run_dir.glob("*.json")):
+    for f in sorted(run_dir.glob("*.json"), key=_numeric_stem_key):
         try:
             out.append(load_json(f))
         except Exception:
@@ -79,7 +95,7 @@ def normalize_score(data: dict) -> dict:
 def load_scores(run_dir: pathlib.Path) -> list[dict]:
     """Load and normalize score JSON files from a run directory, skipping summary and invalid files."""
     out = []
-    for f in sorted(run_dir.glob("*.json")):
+    for f in sorted(run_dir.glob("*.json"), key=_numeric_stem_key):
         if f.stem == "summary":
             continue
         try:
@@ -321,7 +337,7 @@ def is_diversity_run(run_name: str) -> bool:
 def load_diversity_scores(run_dir: pathlib.Path) -> list[dict]:
     """Load per-survey diversity score JSONs (skip subdirs like plots/)."""
     out = []
-    for f in sorted(run_dir.glob("*.json")):
+    for f in sorted(run_dir.glob("*.json"), key=_numeric_stem_key):
         try:
             out.append(load_json(f))
         except Exception:
@@ -365,7 +381,7 @@ def is_factuality_run(run_name: str) -> bool:
 
 def load_factuality_scores(run_dir: pathlib.Path) -> list[dict]:
     out = []
-    for f in sorted(run_dir.glob("*.json")):
+    for f in sorted(run_dir.glob("*.json"), key=_numeric_stem_key):
         if f.stem == "summary":
             continue
         try:
@@ -773,7 +789,7 @@ def _render_pca_chart(
 # ── Page: Aggregated Metrics ───────────────────────────────────────────────────
 
 def page_aggregated_metrics() -> None:
-    """Display aggregated metrics page: PCA citation space visualization for all models and datasets."""
+    """Display aggregated metrics page: PCA citation space + expert-metric distributions."""
     st.header("Aggregated Metrics")
 
     datasets = _get_datasets()
@@ -784,26 +800,368 @@ def page_aggregated_metrics() -> None:
     dataset = st.sidebar.selectbox("Dataset", datasets, key="agg_dataset")
     st.sidebar.divider()
 
+    # ── Citation space (PCA) ─────────────────────────────────────────────────
     all_diversity_runs = find_diversity_runs_for_dataset(dataset)
-    if not all_diversity_runs:
-        st.info(f"No diversity runs found for dataset **{dataset}**.")
+    survey_ids         = _survey_ids_for_dataset(dataset)
+    if all_diversity_runs and survey_ids:
+        st.subheader("Citation space (PCA)")
+        _render_pca_chart(
+            dataset_prefix=dataset,
+            all_diversity_runs=all_diversity_runs,
+            survey_options=[(sid, sid) for sid in survey_ids],
+            default_models=sorted(all_diversity_runs.keys()),
+            key_prefix="agg_pca",
+        )
+    elif not all_diversity_runs:
+        st.caption(f"No diversity runs found for dataset **{dataset}**.")
+    else:
+        st.caption("No surveys found for this dataset.")
+
+    st.divider()
+
+    # ── Expert metrics — per-model distributions ─────────────────────────────
+    _render_expert_distributions(dataset)
+
+
+# ── Expert distributions renderer ─────────────────────────────────────────────
+
+
+# Same five metrics the comparison page reports, in the same display order.
+# Values are per-survey scalars in [0, 1] except m_mod which is Shannon
+# entropy in [0, log2(5)] ≈ [0, 2.32].
+_EXPERT_SCALAR_METRICS: list[tuple[str, str]] = [
+    ("m_crit",        "Critical (m_crit)"),
+    ("m_comp_total",  "Comparative (m_comp_total)"),
+    ("m_comp_valid",  "Valid comparisons (m_comp_valid)"),
+    ("m_open",        "Open questions (m_open)"),
+    ("m_mod",         "Modality entropy (m_mod)"),
+]
+
+# Colors for modality categories 1..5. Reds → categorical (assertive),
+# blues → explicit uncertainty. Visual continuity helps eyeball skew.
+_MODALITY_COLORS = {
+    "1": "#b10026",
+    "2": "#e31a1c",
+    "3": "#fd8d3c",
+    "4": "#fecc5c",
+    "5": "#2b8cbe",
+}
+_MODALITY_LABELS = {
+    "1": "1 · categorical",
+    "2": "2",
+    "3": "3 · hedged",
+    "4": "4",
+    "5": "5 · explicit uncertainty",
+}
+
+
+def _render_expert_distributions(dataset: str) -> None:
+    """Per-model boxplot + strip overlay for each expert metric, plus a
+    stacked-bar of mean modality_dist.
+
+    Design choices (reflect user decisions 2026-04-18):
+      * Single judge selectbox at page level — fair cross-model comparison.
+      * Multiselect for models (default: all with a run under chosen judge).
+      * Box + all-points overlay on scalar metrics; stacked bar for the
+        categorical modality distribution.
+    """
+    st.subheader("Expert metrics — distributions across surveys")
+
+    all_models = _get_models_for_dataset(dataset)
+    models_with_expert = [
+        m for m in all_models if _list_score_runs(dataset, m, "expert")
+    ]
+    if not models_with_expert:
+        st.caption(f"No expert runs found for dataset **{dataset}**.")
         return
 
-    st.subheader("Citation space (PCA)")
+    # Union of judge-suffixes across all (model, expert) runs, newest-by-mtime
+    # first. Lets the user pick one variant that applies uniformly.
+    all_runs: list[pathlib.Path] = []
+    for m in models_with_expert:
+        all_runs.extend(_list_score_runs(dataset, m, "expert"))
+    all_runs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    suffixes: list[str] = []
+    seen: set[str] = set()
+    for r in all_runs:
+        s = _run_suffix(r, dataset, "expert")
+        if s not in seen:
+            seen.add(s)
+            suffixes.append(s)
 
-    survey_ids = _survey_ids_for_dataset(dataset)
-    if not survey_ids:
-        st.info("No surveys found for this dataset.")
+    if len(suffixes) > 1:
+        judge = st.sidebar.selectbox(
+            "Expert judge",
+            suffixes,
+            index=0,  # newest by mtime
+            format_func=lambda s: s.lstrip("_") or "(no suffix)",
+            key="agg_expert_judge",
+            help="Same judge is applied to every model — keeps the comparison fair.",
+        )
+    else:
+        judge = suffixes[0] if suffixes else ""
+
+    # Only models that actually have a run for the chosen judge are comparable.
+    available = [
+        m for m in models_with_expert
+        if _find_run_with_suffix(dataset, m, "expert", judge) is not None
+    ]
+    if not available:
+        st.info("No models have an expert run with the chosen judge.")
         return
 
-    survey_options = [(sid, sid) for sid in survey_ids]
-    _render_pca_chart(
-        dataset_prefix=dataset,
-        all_diversity_runs=all_diversity_runs,
-        survey_options=survey_options,
-        default_models=sorted(all_diversity_runs.keys()),
-        key_prefix="agg_pca",
+    selected = st.multiselect(
+        "Models",
+        options=available,
+        default=available,
+        key="agg_expert_models",
     )
+    if not selected:
+        st.info("Select at least one model to plot.")
+        return
+
+    # Load per-survey rows into a long-format frame: (model, survey_id,
+    # metric, value). modality_dist is extracted separately because it's
+    # five values per survey, not one.
+    rows: list[dict] = []
+    mod_rows: list[dict] = []
+    for model in selected:
+        run_dir = _find_run_with_suffix(dataset, model, "expert", judge)
+        if run_dir is None:
+            continue
+        for f in sorted(run_dir.glob("*.json"), key=_numeric_stem_key):
+            if f.stem == "summary":
+                continue
+            try:
+                d = load_json(f)
+            except Exception:
+                logger.debug(f"Failed to load expert file {f}", exc_info=True)
+                continue
+            sid = str(d.get("survey_id") or d.get("id") or f.stem)
+            for metric_key, _ in _EXPERT_SCALAR_METRICS:
+                v = d.get(metric_key)
+                if isinstance(v, (int, float)):
+                    rows.append({
+                        "model":     model,
+                        "survey_id": sid,
+                        "metric":    metric_key,
+                        "value":     float(v),
+                    })
+            mdist = d.get("modality_dist")
+            if isinstance(mdist, dict):
+                total = sum(int(v) for v in mdist.values() if isinstance(v, (int, float)))
+                if total > 0:
+                    mod_rows.append({
+                        "model":     model,
+                        "survey_id": sid,
+                        **{str(c): mdist.get(str(c), 0) / total for c in range(1, 6)},
+                    })
+
+    if not rows:
+        st.info("No expert-metric data loaded for the selected models / judge.")
+        return
+
+    df = pd.DataFrame(rows)
+
+    # Scalar metrics — 2 columns × 3 rows. Each plot is a box with all points
+    # overlaid (user's choice of 'box + strip overlay' — see answers above).
+    st.markdown("#### Scalar metrics")
+    cols_per_row = 2
+    for i in range(0, len(_EXPERT_SCALAR_METRICS), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for j, col in enumerate(cols):
+            if i + j >= len(_EXPERT_SCALAR_METRICS):
+                break
+            metric, label = _EXPERT_SCALAR_METRICS[i + j]
+            sub = df[df["metric"] == metric]
+            with col:
+                if sub.empty:
+                    st.caption(f"**{label}** — no data")
+                    continue
+                fig = go.Figure()
+                for model in selected:
+                    mdata = sub[sub["model"] == model]
+                    if mdata.empty:
+                        continue
+                    fig.add_trace(go.Box(
+                        y=mdata["value"],
+                        name=model,
+                        boxpoints="all",       # show every survey as a dot
+                        jitter=0.35,
+                        pointpos=0,
+                        marker=dict(size=4, opacity=0.6),
+                        line=dict(width=1),
+                        hovertemplate="<b>%{fullData.name}</b><br>value: %{y:.4f}<extra></extra>",
+                    ))
+                fig.update_layout(
+                    title=label,
+                    yaxis_title="value",
+                    showlegend=False,
+                    height=320,
+                    margin=dict(l=40, r=20, t=40, b=40),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+    # Modality category distribution (mean per model). Stacked bar summing
+    # to 1.0 per model — skew-to-1 on the left reads "assertive", heavier
+    # tail on the right reads "more uncertainty acknowledged".
+    if mod_rows:
+        st.markdown("#### Modality category distribution (mean across surveys)")
+        mdf = pd.DataFrame(mod_rows)
+        means = (
+            mdf.groupby("model")[["1", "2", "3", "4", "5"]]
+               .mean()
+               .reindex(selected)                # keep the user's order
+               .dropna(how="all")                # drop models with no dist
+        )
+        fig = go.Figure()
+        for cat in ("1", "2", "3", "4", "5"):
+            fig.add_trace(go.Bar(
+                x=means.index,
+                y=means[cat],
+                name=_MODALITY_LABELS[cat],
+                marker_color=_MODALITY_COLORS[cat],
+                hovertemplate=f"%{{x}}<br>{_MODALITY_LABELS[cat]}: %{{y:.3f}}<extra></extra>",
+            ))
+        fig.update_layout(
+            barmode="stack",
+            yaxis_title="mean share",
+            yaxis=dict(range=[0, 1.02]),
+            legend_title="modality",
+            height=400,
+            margin=dict(l=40, r=20, t=20, b=40),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── Pairwise delta (M1 − M2) ──────────────────────────────────────────────
+    # Collapsed by default — user asked for it under a `расхлоп`. Scoped to
+    # the already-``selected`` set so the two selectboxes only show models the
+    # user opted into at the top of the page; keeps the flow consistent.
+    with st.expander("Pairwise delta (M1 − M2) across surveys", expanded=False):
+        if len(selected) < 2:
+            st.info("Pick at least 2 models in the multiselect above to compute a pairwise delta.")
+        else:
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                m1 = st.selectbox(
+                    "M1 (minuend)",
+                    options=selected,
+                    index=0,
+                    key="agg_delta_m1",
+                )
+            with col_m2:
+                m2 = st.selectbox(
+                    "M2 (subtrahend)",
+                    options=selected,
+                    index=min(1, len(selected) - 1),
+                    key="agg_delta_m2",
+                )
+            if m1 == m2:
+                st.info("Pick two different models.")
+            else:
+                # Wide frames indexed by (survey_id, metric) — merging on
+                # those two keys gives us exactly the intersection of
+                # surveys × metrics where BOTH models have a value.
+                left  = (df[df["model"] == m1]
+                         [["survey_id", "metric", "value"]]
+                         .rename(columns={"value": "v1"}))
+                right = (df[df["model"] == m2]
+                         [["survey_id", "metric", "value"]]
+                         .rename(columns={"value": "v2"}))
+                merged = left.merge(right, on=["survey_id", "metric"], how="inner")
+                merged["delta"] = merged["v1"] - merged["v2"]
+
+                if merged.empty:
+                    st.info(
+                        "No overlapping (survey_id × metric) pairs between "
+                        f"**{m1}** and **{m2}**."
+                    )
+                else:
+                    st.caption(f"**{m1} − {m2}** · paired survey deltas")
+
+                    # One figure per metric, all in one row. Each col gets an
+                    # equal share via ``st.columns(N)``; y-axis is per-plot
+                    # (metric-local), so magnitudes don't collapse around a
+                    # shared scale. Dashed line at Δ = 0 on every plot.
+                    non_empty = [
+                        (k, lbl) for k, lbl in _EXPERT_SCALAR_METRICS
+                        if not merged[merged["metric"] == k].empty
+                    ]
+                    if non_empty:
+                        cols = st.columns(len(non_empty))
+                        for col, (metric_key, label) in zip(cols, non_empty):
+                            sub = merged[merged["metric"] == metric_key]
+                            with col:
+                                fig = go.Figure()
+                                fig.add_trace(go.Box(
+                                    y=sub["delta"],
+                                    name=label,
+                                    boxpoints="all",
+                                    jitter=0.35,
+                                    pointpos=0,
+                                    marker=dict(size=5, opacity=0.65),
+                                    line=dict(width=1),
+                                    hovertemplate=(
+                                        "Δ: %{y:.4f}<br>"
+                                        "survey: %{customdata}<extra></extra>"
+                                    ),
+                                    customdata=sub["survey_id"],
+                                ))
+                                fig.add_hline(
+                                    y=0, line_dash="dash", line_color="gray",
+                                )
+                                fig.update_layout(
+                                    title=dict(text=label, font=dict(size=13)),
+                                    yaxis_title="Δ",
+                                    showlegend=False,
+                                    height=380,
+                                    margin=dict(l=40, r=10, t=40, b=20),
+                                    xaxis=dict(showticklabels=False),
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+
+                    # Full-quantile summary: count, mean, std, min,
+                    # 10/25/50/75/90%, max, plus win-rate. Gives a richer
+                    # shape than mean/median alone — useful for spotting
+                    # heavy tails or one-sided skew.
+                    summary_rows = []
+                    for metric_key, label in _EXPERT_SCALAR_METRICS:
+                        sub = merged[merged["metric"] == metric_key]
+                        if sub.empty:
+                            continue
+                        d = sub["delta"]
+                        summary_rows.append({
+                            "metric":      label,
+                            "n":           len(d),
+                            "mean Δ":      d.mean(),
+                            "std":         d.std(ddof=0),
+                            "min":         d.min(),
+                            "q10":         d.quantile(0.10),
+                            "q25":         d.quantile(0.25),
+                            "median":      d.median(),
+                            "q75":         d.quantile(0.75),
+                            "q90":         d.quantile(0.90),
+                            "max":         d.max(),
+                            "M1 > M2 (%)": 100.0 * (d > 0).mean(),
+                        })
+                    if summary_rows:
+                        sum_df = pd.DataFrame(summary_rows).set_index("metric")
+                        st.dataframe(
+                            sum_df.style.format({
+                                "n":           "{:.0f}",
+                                "mean Δ":      "{:+.4f}",
+                                "std":         "{:.4f}",
+                                "min":         "{:+.4f}",
+                                "q10":         "{:+.4f}",
+                                "q25":         "{:+.4f}",
+                                "median":      "{:+.4f}",
+                                "q75":         "{:+.4f}",
+                                "q90":         "{:+.4f}",
+                                "max":         "{:+.4f}",
+                                "M1 > M2 (%)": "{:.0f}%",
+                            }),
+                            width="stretch",
+                        )
 
 
 # ── Comparison helpers ─────────────────────────────────────────────────────────
@@ -820,56 +1178,131 @@ def _get_datasets() -> list[str]:
 
 
 def _get_models_for_dataset(dataset: str) -> list[str]:
-    """All model IDs that have any score or generation run for this dataset."""
-    models: set[str] = set()
+    """All model IDs that have any score or generation run for this dataset.
+
+    Deduplicates case-insensitively: if both ``SurveyForge`` and
+    ``surveyforge`` directories exist on disk, they collapse into one entry.
+    Canonical capitalization is chosen in this order:
+      1. The form that appears under ``results/generations/`` (that's what
+         ``BaseModel`` writes with; usually matches the ``MODEL=...`` CLI arg).
+      2. First-seen form under ``results/scores/`` as a fallback.
+    """
+    canonical: dict[str, str] = {}  # lower_key -> preferred original form
     prefix = dataset + "_"
 
-    for base in (SCORES_DIR, GENERATIONS_DIR):
-        if not base.exists():
-            continue
-        for d in base.iterdir():
-            if not d.is_dir() or not d.name.startswith(prefix):
-                continue
-            tail = d.name[len(prefix):]
-            # Strip known suffixes to get the model_id
-            model = re.sub(r"_(diversity|claims|expert|factuality|structural|surge).*$", "", tail)
-            if model:
-                models.add(model)
+    def _extract_model(d: pathlib.Path) -> str | None:
+        if not d.is_dir() or not d.name.startswith(prefix):
+            return None
+        tail = d.name[len(prefix):]
+        m = re.sub(r"_(diversity|claims|expert|factuality|structural|surge).*$", "", tail)
+        return m or None
 
-    return sorted(models)
+    # Pass 1: generation dirs produce the canonical form (MODEL= arg spelling).
+    if GENERATIONS_DIR.exists():
+        for d in GENERATIONS_DIR.iterdir():
+            model = _extract_model(d)
+            if model:
+                canonical.setdefault(model.lower(), model)
+
+    # Pass 2: score dirs fill in models that have no generation dir yet.
+    if SCORES_DIR.exists():
+        for d in SCORES_DIR.iterdir():
+            model = _extract_model(d)
+            if model:
+                canonical.setdefault(model.lower(), model)
+
+    return sorted(canonical.values(), key=str.lower)
+
+
+def _list_score_runs(dataset: str, model: str, kind: str) -> list[pathlib.Path]:
+    """All score directories matching (dataset, model, kind), newest first.
+
+    Matching is **case-insensitive** on dataset and model so a dir called
+    ``SurGE_surveyforge_expert_run1`` is picked up when the UI passes
+    ``model="SurveyForge"``. Sorted by filesystem ``mtime`` descending —
+    the first element is what most callers want as "the latest run" (the
+    previous lexical ``sorted()[-1]`` was a bug: ``qwen3`` wins over the
+    newer ``gemma-4-31b`` alphabetically).
+    """
+    if not SCORES_DIR.exists():
+        return []
+    prefix_lower = f"{dataset}_{model}_{kind}".lower()
+    matches = [
+        d for d in SCORES_DIR.iterdir()
+        if d.is_dir() and d.name.lower().startswith(prefix_lower)
+    ]
+    matches.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    return matches
 
 
 def _find_score_run(dataset: str, model: str, kind: str) -> pathlib.Path | None:
+    """Most-recent score directory for (dataset, model, kind). Case-insensitive.
+
+    Thin wrapper over :func:`_list_score_runs` for callers that only need
+    one directory and are happy with "newest by mtime".
     """
-    Find the score directory for (dataset, model, kind).
-    kind = 'diversity' | 'expert' | 'claims'
-    Returns the last alphabetically (latest run) if multiple exist.
+    runs = _list_score_runs(dataset, model, kind)
+    return runs[0] if runs else None
+
+
+def _run_suffix(run_dir: pathlib.Path, dataset: str, kind: str) -> str:
+    """Extract the judge/comment suffix after the ``..._{kind}`` portion.
+
+    For ``SurGE_SurveyForge_expert_gemma-4-31b_run1`` with kind=``expert``
+    returns ``"_gemma-4-31b_run1"``. For a bare ``SurGE_SurveyForge_expert``
+    returns ``""``. The match is case-insensitive; returned suffix is
+    taken from the dir name verbatim (preserves the on-disk capitalization
+    so it round-trips with :func:`_find_run_with_suffix`).
+    """
+    pattern = re.compile(
+        rf"^{re.escape(dataset)}_.+?_{re.escape(kind)}(.*)$",
+        re.IGNORECASE,
+    )
+    m = pattern.match(run_dir.name)
+    return m.group(1) if m else ""
+
+
+def _find_run_with_suffix(
+    dataset: str, model: str, kind: str, suffix: str,
+) -> pathlib.Path | None:
+    """Locate the score dir with the exact given suffix (case-insensitive).
+
+    Used by the comparison page after the user picks a judge variant — we
+    need a specific run (e.g. ``_gemma-4-31b_run1``), not just the newest.
     """
     if not SCORES_DIR.exists():
         return None
-    prefix = f"{dataset}_{model}_{kind}"
-    matches = sorted(
-        d for d in SCORES_DIR.iterdir()
-        if d.is_dir() and d.name.startswith(prefix)
-    )
-    return matches[-1] if matches else None
+    target_lower = f"{dataset}_{model}_{kind}{suffix or ''}".lower()
+    for d in SCORES_DIR.iterdir():
+        if d.is_dir() and d.name.lower() == target_lower:
+            return d
+    return None
 
 
 def _survey_ids_for_dataset(dataset: str) -> list[str]:
     """
     Canonical survey ID list from the first available generation dir
     or any score dir for this dataset.
+
+    Ordering uses :func:`_numeric_stem_key` so sparse numeric ids (e.g.
+    SurGE_reference = 0, 1, 2, 3, 5, 6, 8, 10, ...) navigate naturally on
+    the comparison page; plain ``sorted()`` would give 0, 1, 10, 11, ..., 2.
     """
     if GENERATIONS_DIR.exists():
         for d in sorted(GENERATIONS_DIR.iterdir()):
             if d.is_dir() and d.name.startswith(dataset + "_"):
-                ids = sorted(f.stem for f in d.glob("*.json"))
+                files = sorted(d.glob("*.json"), key=_numeric_stem_key)
+                ids = [f.stem for f in files]
                 if ids:
                     return ids
     if SCORES_DIR.exists():
         for d in sorted(SCORES_DIR.iterdir()):
             if d.is_dir() and d.name.startswith(dataset + "_"):
-                ids = sorted(f.stem for f in d.glob("*.json") if f.stem != "summary")
+                files = sorted(
+                    (f for f in d.glob("*.json") if f.stem != "summary"),
+                    key=_numeric_stem_key,
+                )
+                ids = [f.stem for f in files]
                 if ids:
                     return ids
     return []
@@ -989,13 +1422,63 @@ def page_comparison() -> None:
                                    index=models.index(default_b))
     st.sidebar.divider()
 
-    # ── Load run dirs ──────────────────────────────────────────────────────────
-    div_a  = _find_score_run(dataset, model_a, "diversity")
-    div_b  = _find_score_run(dataset, model_b, "diversity")
-    exp_a  = _find_score_run(dataset, model_a, "expert")
-    exp_b  = _find_score_run(dataset, model_b, "expert")
-    fac_a  = _find_score_run(dataset, model_a, "factuality")
-    fac_b  = _find_score_run(dataset, model_b, "factuality")
+    # ── Judge/run-variant picker per metric ────────────────────────────────────
+    # When multiple runs exist for (model, kind) — e.g. expert scored by
+    # gemma/qwen/gpt-oss/llama — let the user pick which one to compare.
+    # Default = the most recent by mtime from the UNION across model A + B
+    # (not lexical; the old ``sorted()[-1]`` logic picked ``qwen3`` over a
+    # newer ``gemma-4-31b`` run). Same suffix is applied to both models —
+    # if only one side has that judge, the other shows as empty.
+    def _variants_for(kind: str) -> list[str]:
+        runs = (
+            _list_score_runs(dataset, model_a, kind)
+            + _list_score_runs(dataset, model_b, kind)
+        )
+        # Re-sort the union by mtime desc (each half is already sorted but
+        # concatenation breaks the order).
+        runs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+        out: list[str] = []
+        seen: set[str] = set()
+        for r in runs:
+            s = _run_suffix(r, dataset, kind)
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    div_variants = _variants_for("diversity")
+    exp_variants = _variants_for("expert")
+    fac_variants = _variants_for("factuality")
+
+    def _pick_variant(label: str, key: str, variants: list[str]) -> str | None:
+        """Show a selectbox in the sidebar when >1 judge variant exists."""
+        if not variants:
+            return None
+        if len(variants) == 1:
+            return variants[0]
+        return st.sidebar.selectbox(
+            label,
+            variants,
+            index=0,  # newest-by-mtime
+            format_func=lambda s: s.lstrip("_") or "(no suffix)",
+            key=key,
+            help="Multiple judge/run variants exist on disk. Newest by mtime is default.",
+        )
+
+    if exp_variants or fac_variants or (div_variants and len(div_variants) > 1):
+        st.sidebar.markdown("**Judge / run variant**")
+    div_pick = _pick_variant("Diversity run",     "cmp_div_variant", div_variants)
+    exp_pick = _pick_variant("Expert judge",      "cmp_exp_variant", exp_variants)
+    fac_pick = _pick_variant("Factuality judge",  "cmp_fac_variant", fac_variants)
+    st.sidebar.divider()
+
+    # ── Load run dirs for chosen variants ──────────────────────────────────────
+    div_a = _find_run_with_suffix(dataset, model_a, "diversity",  div_pick)  if div_pick is not None else None
+    div_b = _find_run_with_suffix(dataset, model_b, "diversity",  div_pick)  if div_pick is not None else None
+    exp_a = _find_run_with_suffix(dataset, model_a, "expert",     exp_pick)  if exp_pick is not None else None
+    exp_b = _find_run_with_suffix(dataset, model_b, "expert",     exp_pick)  if exp_pick is not None else None
+    fac_a = _find_run_with_suffix(dataset, model_a, "factuality", fac_pick)  if fac_pick is not None else None
+    fac_b = _find_run_with_suffix(dataset, model_b, "factuality", fac_pick)  if fac_pick is not None else None
 
     have_diversity  = div_a is not None or div_b is not None
     have_expert     = exp_a is not None or exp_b is not None
@@ -1025,9 +1508,18 @@ def page_comparison() -> None:
 
     st.divider()
 
+    # Small helper: show which on-disk directory is actually being read for
+    # each side so there's no "why is B empty?" surprise when only one side
+    # has that judge variant.
+    def _source_caption(da_: pathlib.Path | None, db_: pathlib.Path | None) -> str:
+        a = da_.name if da_ else "—"
+        b = db_.name if db_ else "—"
+        return f"<small>🔵 {a}  ·  🔴 {b}</small>"
+
     # ── Diversity table ────────────────────────────────────────────────────────
     if have_diversity:
         st.markdown("### Diversity")
+        st.markdown(_source_caption(div_a, div_b), unsafe_allow_html=True)
         da = _load_survey_json(div_a, survey_id)
         db = _load_survey_json(div_b, survey_id)
 
@@ -1043,6 +1535,7 @@ def page_comparison() -> None:
     # ── Expert table ───────────────────────────────────────────────────────────
     if have_expert:
         st.markdown("### Expert")
+        st.markdown(_source_caption(exp_a, exp_b), unsafe_allow_html=True)
         ea = _load_survey_json(exp_a, survey_id)
         eb = _load_survey_json(exp_b, survey_id)
 
@@ -1089,6 +1582,7 @@ def page_comparison() -> None:
     # ── Factuality table ───────────────────────────────────────────────────────
     if have_factuality:
         st.markdown("### Factuality")
+        st.markdown(_source_caption(fac_a, fac_b), unsafe_allow_html=True)
         fa = _load_survey_json(fac_a, survey_id)
         fb = _load_survey_json(fac_b, survey_id)
 
