@@ -18,7 +18,14 @@ Format:
     "n_sentences": 142,
     "n_claims":    87,
     "claims": [
-      {"claim_id": 0, "claim": "...", "source_sentence": ""}
+      {
+        "claim_id": 0,
+        "claim":    "...",
+        "sources": [                      // all sentences where this claim appeared
+          {"sentence": "...", "sentence_idx": 3},
+          {"sentence": "...", "sentence_idx": 47}
+        ]
+      }
     ],
     "judge_model": "...",
     "pipeline":    "veriscore",
@@ -241,12 +248,18 @@ def extract_claims(
     reasoning_effort: str | None = None,
     token_counter: TokenCounter | None = None,
     global_tokens: TokenCounter | None = None,
-) -> list[str]:
-    """Extract deduplicated atomic claims from text.
+) -> list[tuple[str, list[tuple[str, int]]]]:
+    """Extract deduplicated atomic claims from text with ALL source locations.
 
     Sentences are processed in parallel (workers LLM calls at a time).
-    Results are reassembled in sentence order, then deduplicated with
-    dict.fromkeys() to preserve first-occurrence order.
+    Results are reassembled in sentence order, then deduplicated by claim
+    text — but crucially, **every occurrence is preserved as a source**.
+    If the same atomic claim surfaces from multiple sentences (e.g. a fact
+    repeated in intro + conclusion), each sentence contributes to the
+    returned source list. This is essential for factchecking: citations in
+    every paragraph where the claim appears must be unioned into the
+    evidence pool — keeping only the first location would silently drop
+    supporting refs that live near the later occurrence.
 
     Args:
         text: Survey text to extract claims from.
@@ -260,7 +273,11 @@ def extract_claims(
         provider: Optional OpenRouter provider name.
 
     Returns:
-        Deduplicated list of claim strings (order preserved by sentence index).
+        List of ``(claim, sources)`` where ``sources`` is a non-empty list of
+        ``(sentence_text, sentence_idx)`` tuples — one per occurrence in
+        sentence-index order. ``sentence_idx`` is 0-based in the spaCy split
+        of ``text`` and is a deterministic pointer when the same spaCy model
+        is applied downstream.
 
     Raises:
         RuntimeError: On LLM failure for any sentence.
@@ -300,9 +317,18 @@ def extract_claims(
                         sents_bar.set_postfix_str(token_counter.fmt(), refresh=False)
                 sents_bar.update(1)
 
-    # Flatten in sentence order, then deduplicate preserving first occurrence
-    flat = [claim for sent_claims in claims_by_sent for claim in sent_claims]
-    return list(dict.fromkeys(flat))
+    # Dedup on claim TEXT but COLLECT every sentence where the claim occurred.
+    # Python 3.7+ dict preserves insertion order, so ``occurrences.items()``
+    # walks claims in the same order as the old ``list(dict.fromkeys(flat))``.
+    # Each value is a list of (sentence_text, sentence_idx) — empty is
+    # impossible by construction (we only append under an extant claim).
+    occurrences: dict[str, list[tuple[str, int]]] = {}
+    for sent_idx, sent_claims in enumerate(claims_by_sent):
+        for claim in sent_claims:
+            occurrences.setdefault(claim, []).append(
+                (sentences[sent_idx], sent_idx)
+            )
+    return list(occurrences.items())
 
 
 # ── Per-survey processing ─────────────────────────────────────────────────────
@@ -422,8 +448,18 @@ def process_survey(
         "n_sentences": n_sentences,
         "n_claims":    len(claims),
         "claims": [
-            {"claim_id": i, "claim": c, "source_sentence": ""}
-            for i, c in enumerate(claims)
+            {
+                "claim_id": i,
+                "claim":    c,
+                # Every occurrence of this claim's text in the doc — not just
+                # the first. Downstream factcheck unions citations across all
+                # entries so multi-mention claims get their full evidence pool.
+                "sources": [
+                    {"sentence": s, "sentence_idx": si}
+                    for s, si in occs
+                ],
+            }
+            for i, (c, occs) in enumerate(claims)
         ],
         "judge_model": cfg["judge_model"],
         "pipeline":    "veriscore",
