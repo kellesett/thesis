@@ -362,20 +362,20 @@ def _legacy_or_new_sources(claim: dict) -> list[dict]:
 # folder, so config changes (scope / evidence_source / aggregation / judge)
 # naturally invalidate stale checkpoints — they simply live in a different dir.
 
-# Checkpoint root depends on the execution environment.
+# Checkpoint root. Default — repo-relative `tmp/factuality/`, which is
+# persistent (survives reboots) and already gitignored. The default is
+# what we want on bare-metal (server, macOS without docker).
 #
-# * In docker: the Makefile maps host `tmp/` → container `/tmp/` (absolute
-#   root, NOT `/app/tmp/`). So checkpoints written under `ROOT/"tmp"`
-#   (== `/app/tmp`) die with the container; we must use absolute `/tmp`.
-# * Bare metal (server, local without docker): `/tmp` is the system tmp
-#   and often cleared on reboot. `ROOT/"tmp"` is a per-repo dir that
-#   survives reboots and is already gitignored — the right place.
-#
-# Detect docker via the presence of /.dockerenv (standard marker created
-# by the docker daemon in every container) and branch accordingly.
+# When running inside our own thesis docker image, the canonical `tmp/`
+# mount lives at `/tmp` (not `/app/tmp`), so the Makefile sets the env
+# override `FACTUALITY_CHECKPOINT_ROOT=/tmp/factuality` to point the code
+# at the real mounted path. Any other container environment (e.g. a
+# shared SSH-over-docker host) leaves the env unset and uses the default
+# repo-relative path.
 def _default_checkpoint_root() -> Path:
-    if Path("/.dockerenv").is_file():
-        return Path("/tmp") / "factuality"
+    override = os.environ.get("FACTUALITY_CHECKPOINT_ROOT")
+    if override:
+        return Path(override)
     return ROOT / "tmp" / "factuality"
 
 _CHECKPOINT_ROOT = _default_checkpoint_root()

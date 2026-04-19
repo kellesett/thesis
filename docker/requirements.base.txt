@@ -20,8 +20,11 @@ numpy
 scikit-learn
 
 # ── Transformers ecosystem ────────────────────────────────────────────────────
-transformers>=4.40
-tokenizers>=0.19
+# Upper bound to <5: AlignScore (repos/AlignScore) imports `AdamW` from the
+# top-level `transformers` namespace, which was removed in 5.0. Stay on 4.x
+# until AlignScore is patched or replaced.
+transformers>=4.40,<5
+tokenizers>=0.19,<0.22
 sentence-transformers
 accelerate
 safetensors
