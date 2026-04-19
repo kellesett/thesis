@@ -32,6 +32,7 @@ EXTRA_ARGS ?=
 
 # Shared volumes for all containers
 VOLUMES = --env-file .env \
+          -e FACTUALITY_CHECKPOINT_ROOT=/tmp/factuality \
           -v "$(PWD)/tmp:/tmp" \
           -v "$(PWD)/repos:/app/repos" \
           -v "$(PWD)/datasets:/app/datasets" \
