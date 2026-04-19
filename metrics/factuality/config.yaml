@@ -4,19 +4,64 @@ metric_id: factuality
 alignscore_ckpt: /app/models_cache/yzha--AlignScore-large/AlignScore-large.ckpt
 
 # ── LLM судья (через OpenRouter) ─────────────────────────────────────────────
-judge_model:       openai/gpt-oss-120b
+judge_model:       google/gemma-4-31b-it
 judge_base_url:    https://openrouter.ai/api/v1
 judge_api_key_env: OPENROUTER_API_KEY
 # judge_provider:         alibaba   # опционально — явно указать провайдера
-judge_reasoning_effort: low     # "low"|"medium"|"high" — для reasoning-моделей (gpt-oss и т.д.)
-# judge_reasoning:         false    # отключить thinking токены (Qwen3/DeepSeek, несовместимо с reasoning_effort)
-judge_id:          gpt-oss-120b
+#judge_reasoning_effort: low     # "low"|"medium"|"high" — для reasoning-моделей (gpt-oss и т.д.)
+judge_reasoning:         true    # отключить thinking токены (Qwen3/DeepSeek, несовместимо с reasoning_effort)
+judge_id:          gemma-4-31b
 judge_comment:     run1
 
 # ── AlignScore ────────────────────────────────────────────────────────────────
-alignscore_enabled:    false  # false = пропустить AlignScore, считать только LLM-категоризацию
-alignscore_batch_size: 16
+# Если включено и checkpoint отсутствует — main.py упадёт заранее с понятной
+# ошибкой (не в глубине AlignScore-loader'а).
+alignscore_enabled:    true  # false = пропустить AlignScore, считать только LLM-категоризацию
+alignscore_batch_size: 8
 alignscore_threshold:  0.5    # P(support) порог для Support(a, e_a) = 1
+alignscore_device:     cpu    # "cpu" | "cuda" — CLAUDE.md §11 отмечал hardcoded-cpu как wart
+
+# ── Factcheck scope & evidence ────────────────────────────────────────────────
+# Варианты комбо пишутся в разные output dir'ы (<variant> в имени), т.ч.
+# side-by-side сравнение возможно без overwrite'а.
+claim_scope:            section     # paragraph | section
+# None = все ancestor'ы включаются; 0 = только own section; 1 = + immediate
+# parent; N = + N ближайших ancestors. YAML `null` → None в Python.
+section_max_ancestor_depth: 1
+evidence_source:        abstract    # abstract | full_text (arxiv-source LaTeX)
+evidence_aggregation:   per_ref      # concat (faster, no attribution) | per_ref (slower, keeps argmax)
+
+# ── Fetch-цепочка абстрактов (режим evidence_source=abstract) ───────────────
+# Приоритет в fetch_abstract:
+#   1. disk cache (любая запись — hit или miss; чтобы форсировать re-fetch,
+#                  удали abstracts.json или конкретные ключи вручную)
+#   2. corpus.json[doc_id]
+#   3. arxiv Atom API по arxiv_id (публичный, без ключа, 3s между запросами)
+#   4. Semantic Scholar API (ниже ss_enabled; нужен ключ)
+#
+# ss_enabled=false: тир SS скипается целиком (никаких сетевых вызовов к SS,
+# никакого throttle). Включать только когда будет настоящий API-ключ — без
+# ключа SS отдаёт 429 с первого запроса (общий анонимный пул, ~100 req/5min
+# на все IP мира, шариковый).
+ss_enabled:             true
+ss_api_key_env:         SEMANTIC_SCHOLAR_API_KEY
+
+# ── Evidence mode ────────────────────────────────────────────────────────────
+# Оба режима читают/пишут per-survey sources файлы по одному пути:
+#     results/generations/<dataset_id>_<model_id>/sources/<sid>_sources.json
+# (см. metrics/factuality/sources_io.py — схема файла).
+#
+# Разница между режимами только в поведении при отсутствии файла:
+#
+#   internal — factuality сама строит файл: запускает fetch-waterfall
+#              (fetch_abstract / fetch_full_text) по всем refs генерации
+#              и сохраняет результат в каноническую папку. Существующий
+#              файл используется как checkpoint (fetch пропускается).
+#   external — файл ОБЯЗАН быть на месте. Если нет — ошибка с явным
+#              сообщением (survey не обрабатывается). Put colab output
+#              files directly under the canonical path before switching
+#              to external.
+evidence_mode:          external
 
 # ── Параметры ─────────────────────────────────────────────────────────────────
 judge_workers: 50   # параллельные LLM вызовы при классификации claims
