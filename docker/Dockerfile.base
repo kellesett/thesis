@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     && pip install --no-cache-dir -r requirements.base.txt \
     && pip install --no-cache-dir --no-deps repos/AlignScore \
     && python -m spacy download en_core_web_sm \
+    && python -m nltk.downloader -d /usr/local/share/nltk_data punkt_tab punkt \
     && apt-get purge -y build-essential && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 # Пустые папки для данных (монтируются снаружи через EXP_VOLUMES)

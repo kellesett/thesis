@@ -22,6 +22,14 @@ GPU     ?= 0
 MODE     ?= hybrid
 LIMIT_FLAG = $(if $(LIMIT),--limit $(LIMIT),)
 
+# EXTRA_ARGS — generic pass-through for `make evaluate`. Any flags the
+# underlying metric main.py accepts can be supplied here, e.g.:
+#   EXTRA_ARGS="--debug-claim-idx 3 --evidence-aggregation per_ref"
+# Unset by default. Useful for metric-specific knobs that aren't worth
+# dedicated Makefile variables (factuality's --claim-scope,
+# --evidence-source, etc.).
+EXTRA_ARGS ?=
+
 # Shared volumes for all containers
 VOLUMES = --env-file .env \
           -v "$(PWD)/tmp:/tmp" \
@@ -60,6 +68,7 @@ help:
 	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=structural  # A.1 M_contr, A.2 M_term, A.3 M_rep"
 	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=factuality  # B.1 CitCorrect_k"
 	@echo "  make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=expert      # C.1-C.4 M_crit/comp/open/mod"
+	@echo "  (add LIMIT=N to cap to survey_id<=N, EXTRA_ARGS='--flag val' for metric-specific knobs)"
 	@echo ""
 	@echo "  [Валидация промптов]"
 	@echo "  make validate METRIC=expert       # precision/recall на expert_classes_test + expert_modalities_test"
@@ -133,13 +142,14 @@ evaluate: base
 	# -t allocates a pseudo-TTY inside the container so tqdm can do in-place
 	# bar redraws via \r and ANSI cursor codes. Without it every update
 	# appends a new line and a two-bar display explodes on screen.
-	# TTY detection lives in the recipe shell (NOT in a $(shell ...) expansion
-	# — there fd 1 is a pipe to make and the test would always fail). The
-	# backslash-continued line keeps both assignment and docker run in one
-	# shell so $$TTY propagates; falls back to empty string under CI/nohup.
+	# TTY detection lives in the recipe shell — not in a make $$(shell ..)
+	# expansion, since there fd 1 is a pipe to make and the test would
+	# always fail. The backslash-continued line keeps both assignment and
+	# docker run in one shell so $$TTY propagates; falls back to empty
+	# string under CI/nohup.
 	TTY="$$(test -t 1 && echo -t || true)" ; \
 	docker run --rm $$TTY $(VOLUMES) thesis-eval-$(METRIC) \
-		python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL) $(LIMIT_FLAG)
+		python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL) $(LIMIT_FLAG) $(EXTRA_ARGS)
 
 validate: base
 	mkdir -p tmp
