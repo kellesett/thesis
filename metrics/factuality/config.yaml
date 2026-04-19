@@ -16,7 +16,7 @@ judge_comment:     run1
 # ── AlignScore ────────────────────────────────────────────────────────────────
 # Если включено и checkpoint отсутствует — main.py упадёт заранее с понятной
 # ошибкой (не в глубине AlignScore-loader'а).
-alignscore_enabled:    true  # false = пропустить AlignScore, считать только LLM-категоризацию
+alignscore_enabled:    false  # false = пропустить AlignScore, считать только LLM-категоризацию
 alignscore_batch_size: 8
 alignscore_threshold:  0.5    # P(support) порог для Support(a, e_a) = 1
 alignscore_device:     cpu    # "cpu" | "cuda" — CLAUDE.md §11 отмечал hardcoded-cpu как wart

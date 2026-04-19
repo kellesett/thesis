@@ -362,21 +362,32 @@ def _legacy_or_new_sources(claim: dict) -> list[dict]:
 # folder, so config changes (scope / evidence_source / aggregation / judge)
 # naturally invalidate stale checkpoints — they simply live in a different dir.
 
-# Put checkpoints under /tmp so they survive across docker runs. The
-# Makefile maps host `tmp/` → container `/tmp/` (NOT `/app/tmp/`), so the
-# previous ROOT/"tmp" path was writing to an ephemeral in-container dir
-# and losing state on every restart. Absolute `/tmp` is the mounted
-# location in docker and a reasonable fallback for local bare-metal runs
-# (Linux, macOS — always writable, per-user, persistent enough for
-# per-run stage checkpoints).
-_CHECKPOINT_ROOT = Path("/tmp") / "factuality"
+# Checkpoint root depends on the execution environment.
+#
+# * In docker: the Makefile maps host `tmp/` → container `/tmp/` (absolute
+#   root, NOT `/app/tmp/`). So checkpoints written under `ROOT/"tmp"`
+#   (== `/app/tmp`) die with the container; we must use absolute `/tmp`.
+# * Bare metal (server, local without docker): `/tmp` is the system tmp
+#   and often cleared on reboot. `ROOT/"tmp"` is a per-repo dir that
+#   survives reboots and is already gitignored — the right place.
+#
+# Detect docker via the presence of /.dockerenv (standard marker created
+# by the docker daemon in every container) and branch accordingly.
+def _default_checkpoint_root() -> Path:
+    if Path("/.dockerenv").is_file():
+        return Path("/tmp") / "factuality"
+    return ROOT / "tmp" / "factuality"
+
+_CHECKPOINT_ROOT = _default_checkpoint_root()
 
 
-def _checkpoint_dir(cfg: dict) -> Path:
-    """Per-variant directory for stage checkpoints.
+def _checkpoint_dir(cfg: dict, dataset_id: str, model_id: str) -> Path:
+    """Per-(dataset, model, variant) directory for stage checkpoints.
 
-    Encoding matches the results/scores/ output folder (``<judge>_<comment>
-    _<scope>_<src>_<agg>``) so both trees co-locate by config.
+    Path encoding mirrors the results/scores/ output folder exactly —
+    ``<dataset>_<model>_<judge>_<comment>_<scope>_<src>_<agg>`` — so
+    checkpoints for two different models don't collide under a shared
+    judge/scope/src/agg config.
     """
     run_id  = f"{cfg['judge_id']}_{cfg['judge_comment']}"
     variant = (
@@ -384,7 +395,7 @@ def _checkpoint_dir(cfg: dict) -> Path:
         f"_{cfg.get('evidence_source', 'abstract')}"
         f"_{cfg.get('evidence_aggregation', 'concat')}"
     )
-    return _CHECKPOINT_ROOT / f"{run_id}_{variant}"
+    return _CHECKPOINT_ROOT / f"{dataset_id}_{model_id}_{run_id}_{variant}"
 
 
 def _save_state(state_file: Path, state: dict) -> None:
@@ -422,6 +433,7 @@ def process_survey(
     alignscore_model,
     corpus_index: dict,
     sources_dir: Path,
+    checkpoint_dir: Path,
     *,
     global_tokens: TokenCounter | None = None,
     abstract_cache: dict | None = None,
@@ -530,7 +542,7 @@ def process_survey(
     per_tokens = TokenCounter()
 
     # Stage checkpoint — resume mid-pipeline after a crash or env fix.
-    state_file    = _checkpoint_dir(cfg) / f"{survey_id}.json"
+    state_file    = checkpoint_dir / f"{survey_id}.json"
     state         = _load_state(state_file)
     skip_classify = state is not None and state["stage"] in {"classified", "aligned"}
     skip_align    = state is not None and state["stage"] == "aligned"
@@ -1090,13 +1102,13 @@ def main() -> None:
         logger.error("Generation dir not found: %s", gen_dir)
         sys.exit(1)
 
-    # Sources directory follows the same <dataset>_<model> convention as
-    # gen_dir. Kept here (not derived from gen["dataset_id"]/["model_id"]
-    # inside process_survey) because some generators — e.g. the
-    # SurGE_reference converter — write a combined "SurGE_reference" as
-    # model_id, which would double-prefix the path if we used the file's
-    # own fields. CLI args are the single source of truth.
-    sources_dir = gen_dir / "sources"
+    # Sources + checkpoint directories both follow the same
+    # <dataset>_<model> convention as gen_dir. Computed from CLI args
+    # (not gen["dataset_id"]/["model_id"] fields), because some
+    # generators — e.g. the SurGE_reference converter — write a combined
+    # "SurGE_reference" as model_id, which would double-prefix otherwise.
+    sources_dir    = gen_dir / "sources"
+    checkpoint_dir = _checkpoint_dir(cfg, args.dataset, args.model)
 
     # Output dir encodes the factcheck variant (scope × source × aggregation)
     # so comparing runs side-by-side doesn't require overwriting.
@@ -1162,7 +1174,7 @@ def main() -> None:
                 res = process_survey(
                     gen, claims_dir, out_dir, cfg,
                     client, alignscore_model, corpus_index,
-                    sources_dir,
+                    sources_dir, checkpoint_dir,
                     global_tokens=global_tokens,
                     abstract_cache=abstract_cache,
                 )
