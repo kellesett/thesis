@@ -34,3 +34,7 @@ Thumbs.db
 .claudeignore
 CLAUDE.md
 TODO.md
+
+# notebooks
+tmp.ipynb
+analysis/

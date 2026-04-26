@@ -138,7 +138,17 @@ class BaseModel(ABC):
             )
 
         dataset = load_dataset_cls(dataset_id, registry[dataset_id])
-        instances = list(dataset)
+        # SurGE's surveys.json is NOT in numeric survey_id order (first 15 ids
+        # are [0, 1, 41, 42, …, 53]). Sort by numeric id so `n_surveys: N`
+        # means "first N by id" and results/generations/<...>/<N>.json
+        # sequence is predictable for downstream consumers (factuality,
+        # viewer). Non-numeric ids sort lexicographically after the numeric
+        # bucket.
+        instances = sorted(
+            dataset,
+            key=lambda inst: (0, int(inst.id)) if str(inst.id).isdigit()
+                             else (1, str(inst.id)),
+        )
         if n_surveys is not None:
             instances = instances[:n_surveys]
 

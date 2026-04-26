@@ -20,7 +20,19 @@ sys.path.insert(0, str(ROOT))
 
 from src.log_setup import setup_logging
 
-setup_logging("app")
+
+# Streamlit re-executes the entire script on every widget interaction, which
+# without protection fires `setup_logging("app")` dozens of times per session
+# and spams the "NEW RUN" banner into results/logs/app.log. `st.cache_resource`
+# runs the body exactly once per process — ideal for one-shot side effects
+# like logging setup.
+@st.cache_resource
+def _init_app_logging() -> bool:
+    setup_logging("app")
+    return True
+
+
+_init_app_logging()
 
 GENERATIONS_DIR = ROOT / "results" / "generations"
 SCORES_DIR      = ROOT / "results" / "scores"
@@ -822,6 +834,11 @@ def page_aggregated_metrics() -> None:
     # ── Expert metrics — per-model distributions ─────────────────────────────
     _render_expert_distributions(dataset)
 
+    st.divider()
+
+    # ── Factuality metrics — per-model distributions ─────────────────────────
+    _render_factuality_distributions(dataset)
+
 
 # ── Expert distributions renderer ─────────────────────────────────────────────
 
@@ -1000,7 +1017,7 @@ def _render_expert_distributions(dataset: str) -> None:
                     height=320,
                     margin=dict(l=40, r=20, t=40, b=40),
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
     # Modality category distribution (mean per model). Stacked bar summing
     # to 1.0 per model — skew-to-1 on the left reads "assertive", heavier
@@ -1031,7 +1048,7 @@ def _render_expert_distributions(dataset: str) -> None:
             height=400,
             margin=dict(l=40, r=20, t=20, b=40),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # ── Pairwise delta (M1 − M2) ──────────────────────────────────────────────
     # Collapsed by default — user asked for it under a `расхлоп`. Scoped to
@@ -1118,7 +1135,7 @@ def _render_expert_distributions(dataset: str) -> None:
                                     margin=dict(l=40, r=10, t=40, b=20),
                                     xaxis=dict(showticklabels=False),
                                 )
-                                st.plotly_chart(fig, use_container_width=True)
+                                st.plotly_chart(fig, width="stretch")
 
                     # Full-quantile summary: count, mean, std, min,
                     # 10/25/50/75/90%, max, plus win-rate. Gives a richer
@@ -1126,6 +1143,353 @@ def _render_expert_distributions(dataset: str) -> None:
                     # heavy tails or one-sided skew.
                     summary_rows = []
                     for metric_key, label in _EXPERT_SCALAR_METRICS:
+                        sub = merged[merged["metric"] == metric_key]
+                        if sub.empty:
+                            continue
+                        d = sub["delta"]
+                        summary_rows.append({
+                            "metric":      label,
+                            "n":           len(d),
+                            "mean Δ":      d.mean(),
+                            "std":         d.std(ddof=0),
+                            "min":         d.min(),
+                            "q10":         d.quantile(0.10),
+                            "q25":         d.quantile(0.25),
+                            "median":      d.median(),
+                            "q75":         d.quantile(0.75),
+                            "q90":         d.quantile(0.90),
+                            "max":         d.max(),
+                            "M1 > M2 (%)": 100.0 * (d > 0).mean(),
+                        })
+                    if summary_rows:
+                        sum_df = pd.DataFrame(summary_rows).set_index("metric")
+                        st.dataframe(
+                            sum_df.style.format({
+                                "n":           "{:.0f}",
+                                "mean Δ":      "{:+.4f}",
+                                "std":         "{:.4f}",
+                                "min":         "{:+.4f}",
+                                "q10":         "{:+.4f}",
+                                "q25":         "{:+.4f}",
+                                "median":      "{:+.4f}",
+                                "q75":         "{:+.4f}",
+                                "q90":         "{:+.4f}",
+                                "max":         "{:+.4f}",
+                                "M1 > M2 (%)": "{:.0f}%",
+                            }),
+                            width="stretch",
+                        )
+
+
+# ── Factuality distributions renderer ─────────────────────────────────────────
+
+# Per-category "supported-share" (CitCorrect_k), plus overall. Values are in
+# [0, 1]; per-survey scalars live in the factuality result JSON alongside
+# `category_counts` (used for the distribution bar below).
+_FACTUALITY_SCALAR_METRICS: list[tuple[str, str]] = [
+    ("cit_correct_overall", "Overall (cit_correct)"),
+    ("cit_correct_A",       "A — topical"),
+    ("cit_correct_B",       "B — methodological"),
+    ("cit_correct_C",       "C — quantitative"),
+    ("cit_correct_D",       "D — critical / comparative"),
+]
+
+# Colors for category shares in the distribution bar. Warmer for general
+# (abstract) content, cooler for methods/discussion — helps eyeball skew.
+_FACTUALITY_CATEGORY_COLORS = {
+    "A": "#fecc5c",   # topical — amber
+    "B": "#41b6c4",   # methodological — teal
+    "C": "#7fcdbb",   # quantitative — sea
+    "D": "#b10026",   # critical/comparative — red
+}
+_FACTUALITY_CATEGORY_LABELS = {
+    "A": "A · topical",
+    "B": "B · methodological",
+    "C": "C · quantitative",
+    "D": "D · critical",
+}
+
+
+def _render_factuality_distributions(dataset: str) -> None:
+    """Per-model distributions for factuality metric.
+
+    Mirrors :func:`_render_expert_distributions` but targets
+    ``CitCorrect_k`` scalars and per-category claim-share distribution:
+
+      * **Scalar metrics** (boxplots): overall citation correctness plus
+        the four per-category rates (A / B / C / D). Each plot shows every
+        survey as a point so skew and outliers are visible.
+      * **Category distribution** (stacked bar): share of each category in
+        each model's claim pool, averaged across surveys.
+      * **Pairwise delta** (expander): M1 − M2 across paired surveys for
+        each scalar metric, with a full-quantile summary table.
+    """
+    st.subheader("Factuality metrics — distributions across surveys")
+
+    all_models = _get_models_for_dataset(dataset)
+    models_with_fact = [
+        m for m in all_models if _list_score_runs(dataset, m, "factuality")
+    ]
+    if not models_with_fact:
+        st.caption(f"No factuality runs found for dataset **{dataset}**.")
+        return
+
+    # Gather all (model × factuality) runs, pull out suffixes. Factuality
+    # suffixes carry the full variant (judge + comment + scope + src + agg),
+    # so the selector is the natural way to pin one combination across
+    # models for a fair comparison.
+    all_runs: list[pathlib.Path] = []
+    for m in models_with_fact:
+        all_runs.extend(_list_score_runs(dataset, m, "factuality"))
+    all_runs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    suffixes: list[str] = []
+    seen: set[str] = set()
+    for r in all_runs:
+        s = _run_suffix(r, dataset, "factuality")
+        if s not in seen:
+            seen.add(s)
+            suffixes.append(s)
+
+    if len(suffixes) > 1:
+        variant = st.sidebar.selectbox(
+            "Factuality variant",
+            suffixes,
+            index=0,
+            format_func=lambda s: s.lstrip("_") or "(no suffix)",
+            key="agg_factuality_variant",
+            help=(
+                "Suffix after `_factuality` in the run folder. Encodes judge, "
+                "comment, claim_scope, evidence_source, and aggregation — same "
+                "variant is applied across all models for consistency."
+            ),
+        )
+    else:
+        variant = suffixes[0] if suffixes else ""
+
+    available = [
+        m for m in models_with_fact
+        if _find_run_with_suffix(dataset, m, "factuality", variant) is not None
+    ]
+    if not available:
+        st.info("No models have a factuality run with the chosen variant.")
+        return
+
+    selected = st.multiselect(
+        "Models",
+        options=available,
+        default=available,
+        key="agg_factuality_models",
+    )
+    if not selected:
+        st.info("Select at least one model to plot.")
+        return
+
+    # Long-format scalar rows + wide-format category-distribution rows.
+    rows:     list[dict] = []
+    cat_rows: list[dict] = []
+    for model in selected:
+        run_dir = _find_run_with_suffix(dataset, model, "factuality", variant)
+        if run_dir is None:
+            continue
+        for f in sorted(run_dir.glob("*.json"), key=_numeric_stem_key):
+            if f.stem == "summary":
+                continue
+            try:
+                d = load_json(f)
+            except Exception:
+                logger.debug(f"Failed to load factuality file {f}", exc_info=True)
+                continue
+            sid = str(d.get("survey_id") or d.get("id") or f.stem)
+            for metric_key, _ in _FACTUALITY_SCALAR_METRICS:
+                v = d.get(metric_key)
+                if isinstance(v, (int, float)):
+                    rows.append({
+                        "model":     model,
+                        "survey_id": sid,
+                        "metric":    metric_key,
+                        "value":     float(v),
+                    })
+            # category_counts shape:
+            #   {"A": {"n": int, "n_supported": int}, "B": ..., "C": ..., "D": ...}
+            cc = d.get("category_counts")
+            if isinstance(cc, dict):
+                total = sum(
+                    int(sub.get("n", 0))
+                    for sub in cc.values() if isinstance(sub, dict)
+                )
+                if total > 0:
+                    cat_rows.append({
+                        "model":     model,
+                        "survey_id": sid,
+                        **{
+                            c: (cc.get(c, {}).get("n", 0) / total
+                                if isinstance(cc.get(c), dict) else 0.0)
+                            for c in ("A", "B", "C", "D")
+                        },
+                    })
+
+    if not rows:
+        st.info("No factuality-metric data loaded for the selected models / variant.")
+        return
+
+    df = pd.DataFrame(rows)
+
+    # ── Scalar metrics — 5 plots in a 2-col grid (same layout as expert) ──
+    st.markdown("#### Scalar metrics (CitCorrect_k)")
+    cols_per_row = 2
+    for i in range(0, len(_FACTUALITY_SCALAR_METRICS), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for j, col in enumerate(cols):
+            if i + j >= len(_FACTUALITY_SCALAR_METRICS):
+                break
+            metric, label = _FACTUALITY_SCALAR_METRICS[i + j]
+            sub = df[df["metric"] == metric]
+            with col:
+                if sub.empty:
+                    st.caption(f"**{label}** — no data")
+                    continue
+                fig = go.Figure()
+                for model in selected:
+                    mdata = sub[sub["model"] == model]
+                    if mdata.empty:
+                        continue
+                    fig.add_trace(go.Box(
+                        y=mdata["value"],
+                        name=model,
+                        boxpoints="all",
+                        jitter=0.35,
+                        pointpos=0,
+                        marker=dict(size=4, opacity=0.6),
+                        line=dict(width=1),
+                        hovertemplate="<b>%{fullData.name}</b><br>value: %{y:.4f}<extra></extra>",
+                    ))
+                fig.update_layout(
+                    title=label,
+                    yaxis_title="value",
+                    yaxis=dict(range=[0, 1.02]),
+                    showlegend=False,
+                    height=320,
+                    margin=dict(l=40, r=20, t=40, b=40),
+                )
+                st.plotly_chart(fig, width="stretch")
+
+    # ── Category distribution (mean per model) — stacked bar ──────────────
+    # Shows how claim categories are split across a model's surveys. A
+    # skew toward A means the model mostly cites abstract-level stuff; a
+    # heavy D share means more critical / comparative claims.
+    if cat_rows:
+        st.markdown("#### Category distribution (mean across surveys)")
+        cdf = pd.DataFrame(cat_rows)
+        means = (
+            cdf.groupby("model")[["A", "B", "C", "D"]]
+               .mean()
+               .reindex(selected)
+               .dropna(how="all")
+        )
+        fig = go.Figure()
+        for cat in ("A", "B", "C", "D"):
+            fig.add_trace(go.Bar(
+                x=means.index,
+                y=means[cat],
+                name=_FACTUALITY_CATEGORY_LABELS[cat],
+                marker_color=_FACTUALITY_CATEGORY_COLORS[cat],
+                hovertemplate=(
+                    f"%{{x}}<br>{_FACTUALITY_CATEGORY_LABELS[cat]}: "
+                    "%{y:.3f}<extra></extra>"
+                ),
+            ))
+        fig.update_layout(
+            barmode="stack",
+            yaxis_title="mean share",
+            yaxis=dict(range=[0, 1.02]),
+            legend_title="category",
+            height=400,
+            margin=dict(l=40, r=20, t=20, b=40),
+        )
+        st.plotly_chart(fig, width="stretch")
+
+    # ── Pairwise delta (M1 − M2) ──────────────────────────────────────────
+    with st.expander("Pairwise delta (M1 − M2) across surveys", expanded=False):
+        if len(selected) < 2:
+            st.info(
+                "Pick at least 2 models in the multiselect above to compute "
+                "a pairwise delta."
+            )
+        else:
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                m1 = st.selectbox(
+                    "M1 (minuend)",
+                    options=selected,
+                    index=0,
+                    key="agg_fact_delta_m1",
+                )
+            with col_m2:
+                m2 = st.selectbox(
+                    "M2 (subtrahend)",
+                    options=selected,
+                    index=min(1, len(selected) - 1),
+                    key="agg_fact_delta_m2",
+                )
+            if m1 == m2:
+                st.info("Pick two different models.")
+            else:
+                left  = (df[df["model"] == m1]
+                         [["survey_id", "metric", "value"]]
+                         .rename(columns={"value": "v1"}))
+                right = (df[df["model"] == m2]
+                         [["survey_id", "metric", "value"]]
+                         .rename(columns={"value": "v2"}))
+                merged = left.merge(right, on=["survey_id", "metric"], how="inner")
+                merged["delta"] = merged["v1"] - merged["v2"]
+
+                if merged.empty:
+                    st.info(
+                        "No overlapping (survey_id × metric) pairs between "
+                        f"**{m1}** and **{m2}**."
+                    )
+                else:
+                    st.caption(f"**{m1} − {m2}** · paired survey deltas")
+
+                    non_empty = [
+                        (k, lbl) for k, lbl in _FACTUALITY_SCALAR_METRICS
+                        if not merged[merged["metric"] == k].empty
+                    ]
+                    if non_empty:
+                        cols = st.columns(len(non_empty))
+                        for col, (metric_key, label) in zip(cols, non_empty):
+                            sub = merged[merged["metric"] == metric_key]
+                            with col:
+                                fig = go.Figure()
+                                fig.add_trace(go.Box(
+                                    y=sub["delta"],
+                                    name=label,
+                                    boxpoints="all",
+                                    jitter=0.35,
+                                    pointpos=0,
+                                    marker=dict(size=5, opacity=0.65),
+                                    line=dict(width=1),
+                                    hovertemplate=(
+                                        "Δ: %{y:.4f}<br>"
+                                        "survey: %{customdata}<extra></extra>"
+                                    ),
+                                    customdata=sub["survey_id"],
+                                ))
+                                fig.add_hline(
+                                    y=0, line_dash="dash", line_color="gray",
+                                )
+                                fig.update_layout(
+                                    title=dict(text=label, font=dict(size=13)),
+                                    yaxis_title="Δ",
+                                    showlegend=False,
+                                    height=380,
+                                    margin=dict(l=40, r=10, t=40, b=20),
+                                    xaxis=dict(showticklabels=False),
+                                )
+                                st.plotly_chart(fig, width="stretch")
+
+                    summary_rows = []
+                    for metric_key, label in _FACTUALITY_SCALAR_METRICS:
                         sub = merged[merged["metric"] == metric_key]
                         if sub.empty:
                             continue
