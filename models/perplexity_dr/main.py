@@ -63,6 +63,45 @@ def _build_references_section(references: list[dict]) -> str:
 
 # ── Model class ───────────────────────────────────────────────────────────────
 
+def _extract_usage_stats(usage) -> tuple[dict, float | None]:
+    """Pull token counts + billed cost from an OpenAI-style usage object.
+
+    OpenRouter, when called with ``extra_body={"usage": {"include": True}}``,
+    returns the billed dollar cost as ``usage.cost`` (not part of the
+    upstream OpenAI schema). Token counts follow the standard layout, with
+    ``completion_tokens_details.reasoning_tokens`` populated for
+    reasoning-capable models (sonar-deep-research, o1, gpt-oss, ...).
+
+    Returns ``(tokens_dict, cost_or_None)``. ``cost_or_None`` is None when
+    OpenRouter didn't surface a precise cost (then a downstream caller
+    can fall back to per-token rate approximation).
+    """
+    if usage is None:
+        return ({"prompt": 0, "completion": 0, "reasoning": None}, None)
+
+    prompt     = getattr(usage, "prompt_tokens",     0) or 0
+    completion = getattr(usage, "completion_tokens", 0) or 0
+
+    # Reasoning tokens — only present for reasoning-capable models. Live
+    # under the `completion_tokens_details` sub-object; in OpenAI Python
+    # SDK this is a CompletionUsage._* nested object so use getattr.
+    reasoning = None
+    details = getattr(usage, "completion_tokens_details", None)
+    if details is not None:
+        reasoning = getattr(details, "reasoning_tokens", None)
+
+    # OpenRouter cost (in USD). Standard OpenAI usage doesn't have this;
+    # OpenRouter adds it when usage.include=True. Fall back to None.
+    cost = getattr(usage, "cost", None)
+    if cost is not None:
+        cost = round(float(cost), 6)
+
+    return (
+        {"prompt": int(prompt), "completion": int(completion), "reasoning": reasoning},
+        cost,
+    )
+
+
 class PerplexityDR(BaseModel):
     """Perplexity Sonar Deep Research via OpenAI-compatible API."""
 
@@ -162,33 +201,48 @@ class PerplexityDR(BaseModel):
         query = instance.query
         t0 = time.time()
         try:
-            extra: dict = {}
+            extra: dict = {
+                # Ask OpenRouter to embed exact billed cost into the
+                # response's `usage` object. Saves us from approximating
+                # via per-token rates (which differ per model and per
+                # search count for sonar-deep-research).
+                "usage": {"include": True},
+            }
             if self.search_domain_filter:
                 extra["search_domain_filter"] = self.search_domain_filter
 
-            response = self.client.chat.completions.create(
+            # Use ``with_raw_response`` so we can persist the raw HTTP
+            # body to disk BEFORE any parsing. Reasoning: when OpenRouter
+            # returns a truncated stream / HTML error page / partial JSON,
+            # the SDK's `.create()` call raises JSONDecodeError mid-parse
+            # and we never get a `response` object to dump. The earlier
+            # `<sid>_raw.json` write only happened on the success path
+            # and missed exactly the cases where post-mortem help is
+            # needed most.
+            raw_response = self.client.chat.completions.with_raw_response.create(
                 model=self.model,
                 messages=[{"role": "user", "content": query}],
                 stream=False,
-                extra_body=extra or None,
+                extra_body=extra,
             )
+
+            # Persist the raw body immediately. ``.txt`` (not ``.json``)
+            # because on the failure path the body may not be valid JSON.
+            # On success it's still parseable JSON text — just open it
+            # with ``json.loads(open(...).read())`` if needed.
+            if self.out_dir is not None:
+                raw_file = self.out_dir / f"{instance.id}_raw.txt"
+                raw_file.write_text(raw_response.text, encoding="utf-8")
+
+            # Parse — may still raise JSONDecodeError, but raw is on disk.
+            response = raw_response.parse()
+
             text  = response.choices[0].message.content or ""
             usage = response.usage
-            cost  = 0.0
-            if usage:
-                # Approximate cost: $1/M input + $5/M output tokens
-                cost = (usage.prompt_tokens * 1 + usage.completion_tokens * 5) / 1_000_000
+            tokens, cost = _extract_usage_stats(usage)
 
             references = self.enrich_with_arxiv_titles(self.extract_annotations(response))
             text_with_refs = replace_or_append_references(text, references)
-
-            # Save raw response for debugging
-            if self.out_dir is not None:
-                raw_file = self.out_dir / f"{instance.id}_raw.json"
-                raw_file.write_text(
-                    json.dumps(response.model_dump(), ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
 
             return {
                 "text":    text_with_refs,
@@ -196,7 +250,8 @@ class PerplexityDR(BaseModel):
                 "meta": {
                     "model":                self.model,
                     "latency_sec":          round(time.time() - t0, 2),
-                    "cost_usd":             round(cost, 5),
+                    "cost_usd":             cost,
+                    "tokens":               tokens,
                     "error":                None,
                     "search_domain_filter": self.search_domain_filter or None,
                     "references":           references,
@@ -212,6 +267,7 @@ class PerplexityDR(BaseModel):
                     "model":                self.model,
                     "latency_sec":          round(time.time() - t0, 2),
                     "cost_usd":             0.0,
+                    "tokens":               {"prompt": 0, "completion": 0, "reasoning": None},
                     "error":                f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
                     "search_domain_filter": self.search_domain_filter or None,
                     "references":           [],
