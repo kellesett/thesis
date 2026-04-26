@@ -1,6 +1,6 @@
 # Survey Generation Benchmark
 
-Исследовательская база магистерской диссертации:
+Исследовательская база бакалаврской ВКР:
 **«Evaluating effectiveness of agentic systems for scientific survey generation»**
 
 Цель — сравнить несколько систем автоматической генерации научных обзоров на едином бенчмарке и метриках.

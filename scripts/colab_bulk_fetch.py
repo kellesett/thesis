@@ -77,6 +77,17 @@ RATE_LIMIT_UNPAYWALL = 0.1
 # SS /paper/batch accepts up to 500 IDs per POST.
 SS_BATCH_SIZE = 500
 
+# arxiv Atom API accepts a comma-separated `id_list` — prefetch in chunks
+# to reduce per-id HTTP overhead. Arxiv recommends ≤100 ids per call.
+ARXIV_BATCH_SIZE = 50
+
+# Phase 3 worker count. Different APIs (arxiv / crossref / openalex /
+# unpaywall / oa_pdf) live in independent throttle buckets, so threads
+# calling DIFFERENT APIs run in parallel. Within one bucket, threads
+# serialize on the throttle. 8 is a safe default; raise to 16-32 for
+# heavy full-text runs (mostly waiting on PDF downloads).
+MAX_WORKERS = 8
+
 # PDF-parse caps — guard against 500-page theses bloating output.
 PDF_MAX_PAGES = 80
 PDF_MAX_CHARS = 200_000
@@ -95,10 +106,12 @@ import re
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 import zipfile
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -130,28 +143,56 @@ UA      = f"thesis-bulk-fetch/1.0 (mailto:{USER_EMAIL})"
 
 
 # ── Throttling ──────────────────────────────────────────────────────────────
+# Thread-safe per-bucket throttle. Each call reserves its execution slot
+# while holding the lock, then sleeps OUTSIDE the lock until that slot.
+# This means concurrent threads calling the same bucket queue up correctly,
+# while threads on different buckets proceed in parallel.
 
 _last_call_at: dict[str, float] = {}
+_throttle_lock = threading.Lock()
 
 
 def throttle(bucket: str, min_interval: float) -> None:
-    """Block until `min_interval` seconds have passed since the last call
-    tagged with `bucket`. Separate buckets throttle independently."""
-    last = _last_call_at.get(bucket, 0.0)
-    wait = min_interval - (time.monotonic() - last)
+    """Block until our reserved slot in `bucket` (≥ min_interval after the
+    previous reservation). Lock held only for slot reservation; the actual
+    wait happens lock-free."""
+    with _throttle_lock:
+        last      = _last_call_at.get(bucket, 0.0)
+        scheduled = max(time.monotonic(), last + min_interval)
+        _last_call_at[bucket] = scheduled
+    wait = scheduled - time.monotonic()
     if wait > 0:
         time.sleep(wait)
-    _last_call_at[bucket] = time.monotonic()
+
+
+# ── HTTP session ────────────────────────────────────────────────────────────
+# Reuse a single `requests.Session` for all calls — saves the TLS handshake
+# (~100-300ms) per request, big win for thousands of calls. Sessions are
+# thread-safe for concurrent gets/posts as long as we don't mutate session
+# state across threads (we don't — User-Agent is set at session init, and
+# never changed mid-run).
+
+_session: requests.Session | None = None
+
+
+def _get_session() -> requests.Session:
+    global _session
+    if _session is None:
+        _session = requests.Session()
+    # Sync UA on every access — main() may have changed it after init.
+    _session.headers["User-Agent"] = UA
+    return _session
 
 
 def http_get(url: str, *, bucket: str, delay: float, **kwargs) -> requests.Response | None:
-    """GET with throttle + bounded retry/backoff. Returns None on final fail."""
+    """GET with throttle + bounded retry/backoff. Returns None on final fail.
+    Uses a shared `requests.Session` for connection pooling."""
     kwargs.setdefault("timeout", TIMEOUT_SEC)
-    kwargs.setdefault("headers", {}).setdefault("User-Agent", UA)
+    sess = _get_session()
     for attempt in range(MAX_RETRIES):
         throttle(bucket, delay)
         try:
-            r = requests.get(url, **kwargs)
+            r = sess.get(url, **kwargs)
             r.raise_for_status()
             return r
         except (requests.Timeout, requests.ConnectionError, requests.HTTPError):
@@ -163,11 +204,11 @@ def http_get(url: str, *, bucket: str, delay: float, **kwargs) -> requests.Respo
 
 def http_post(url: str, *, bucket: str, delay: float, **kwargs) -> requests.Response | None:
     kwargs.setdefault("timeout", TIMEOUT_SEC)
-    kwargs.setdefault("headers", {}).setdefault("User-Agent", UA)
+    sess = _get_session()
     for attempt in range(MAX_RETRIES):
         throttle(bucket, delay)
         try:
-            r = requests.post(url, **kwargs)
+            r = sess.post(url, **kwargs)
             r.raise_for_status()
             return r
         except (requests.Timeout, requests.ConnectionError, requests.HTTPError):
@@ -252,10 +293,96 @@ def ss_batch_fetch(ids: list[str]) -> tuple[list[dict | None] | None, str | None
 
 # ── Abstract sources (return (text|None, error|None)) ───────────────────────
 
+# Pre-populated by `arxiv_abstract_batch` in main()'s Phase 2.5. Maps
+# bare arxiv_id → (text|None, error|None). `arxiv_abstract` consults this
+# before falling back to a single-id call. Read-only after Phase 2.5,
+# so no lock needed.
+_arxiv_abstract_cache: dict[str, tuple[str | None, str | None]] = {}
+
+# Match arxiv id in a response <id> element. Atom returns
+# `http://arxiv.org/abs/2010.12345v3` — we strip protocol, prefix, and
+# version suffix.
+_ARXIV_ID_FROM_ENTRY_RE = re.compile(r"arxiv\.org/abs/([^/v\s]+)")
+
+
+def arxiv_abstract_batch(arxiv_ids: list[str]) -> dict[str, tuple[str | None, str | None]]:
+    """Fetch many arxiv abstracts in batched calls (~50 ids per HTTP call).
+
+    Returns ``{bare_arxiv_id: (text_or_None, error_or_None)}``. IDs that
+    we asked for but didn't appear in the Atom response are recorded as
+    ``(None, "no_entry")``. On HTTP/parse failure for a chunk, every id
+    in that chunk gets the corresponding error tag.
+
+    This is the bulk-prefetch counterpart of :func:`arxiv_abstract`. After
+    populating the cache, single-id calls become near-instant lookups.
+    """
+    out: dict[str, tuple[str | None, str | None]] = {}
+    if not arxiv_ids:
+        return out
+
+    # Dedupe (preserving first-seen order) and strip versions.
+    bare_ids: list[str] = []
+    seen: set[str] = set()
+    for aid in arxiv_ids:
+        bid = bare_arxiv(aid)
+        if bid not in seen:
+            seen.add(bid)
+            bare_ids.append(bid)
+
+    chunks = list(range(0, len(bare_ids), ARXIV_BATCH_SIZE))
+    for cs in tqdm(chunks, desc="arxiv_batch", leave=False) if len(chunks) > 1 else chunks:
+        chunk = bare_ids[cs:cs + ARXIV_BATCH_SIZE]
+        r = http_get(
+            ARXIV_API_URL, bucket="arxiv", delay=RATE_LIMIT_ARXIV,
+            params={"id_list": ",".join(chunk), "max_results": len(chunk)},
+        )
+        if r is None:
+            for aid in chunk:
+                out[aid] = (None, "http_error")
+            continue
+        try:
+            root = ET.fromstring(r.text)
+        except ET.ParseError:
+            for aid in chunk:
+                out[aid] = (None, "xml_parse_error")
+            continue
+        # Walk Atom entries, map back via id field.
+        seen_in_response: set[str] = set()
+        for entry in root.findall(f"{{{ATOM_NS}}}entry"):
+            id_el = entry.find(f"{{{ATOM_NS}}}id")
+            if id_el is None or not id_el.text:
+                continue
+            m = _ARXIV_ID_FROM_ENTRY_RE.search(id_el.text)
+            if not m:
+                continue
+            entry_id = m.group(1)
+            seen_in_response.add(entry_id)
+            summary = entry.find(f"{{{ATOM_NS}}}summary")
+            if summary is None or not (summary.text or "").strip():
+                out[entry_id] = (None, "empty_summary")
+            else:
+                out[entry_id] = (normalize_ws(summary.text), None)
+        # IDs we requested but Atom didn't return entries for.
+        for aid in chunk:
+            if aid not in seen_in_response and aid not in out:
+                out[aid] = (None, "no_entry")
+    return out
+
+
 def arxiv_abstract(arxiv_id: str) -> tuple[str | None, str | None]:
+    """Single-id arxiv abstract fetch with cache.
+
+    Cache is populated by :func:`arxiv_abstract_batch` in Phase 2.5 of
+    `main()`. On cache miss (shouldn't happen if prefetch was thorough)
+    falls back to a fresh single-id Atom call.
+    """
+    bid = bare_arxiv(arxiv_id)
+    cached = _arxiv_abstract_cache.get(bid)
+    if cached is not None:
+        return cached
     r = http_get(
         ARXIV_API_URL, bucket="arxiv", delay=RATE_LIMIT_ARXIV,
-        params={"id_list": arxiv_id},
+        params={"id_list": bid},
     )
     if r is None:
         return None, "http_error"
@@ -609,6 +736,62 @@ def build_empty_entry(ref: dict) -> dict:
     }
 
 
+# ── Per-identifier cache (resume across crashes) ─────────────────────────────
+# Phase 3 is the slow part — for full-text runs, one ident can take 30-60s
+# (PDF download + pymupdf parse). On a 2000-paper run a Colab disconnect
+# at 80% would lose ~2h of work because per-survey files only get written
+# in Phase 4. Solution: persist each ident's resolved result immediately
+# to OUT_DIR/_resolved/<safe_ident>.json. Restart picks up where it left
+# off — at most one in-flight ident is lost.
+
+_RESOLVED_DIR_NAME = "_resolved"
+# Map ident → filesystem-safe basename: ":", "/" and other special chars
+# become "_". Reversal isn't needed (we don't read ident back from
+# filename), so this is a one-way encoding.
+_IDENT_UNSAFE_RE = re.compile(r"[^\w\-.]")
+
+
+def _safe_ident_filename(ident: str) -> str:
+    return _IDENT_UNSAFE_RE.sub("_", ident)
+
+
+def _resolved_cache_path(out_dir: Path, ident: str) -> Path:
+    return out_dir / _RESOLVED_DIR_NAME / f"{_safe_ident_filename(ident)}.json"
+
+
+def load_resolved_cache(path: Path, want_full_text: bool) -> dict | None:
+    """Read a cached resolved entry, or return None.
+
+    Returns None when:
+      * file is absent
+      * file is corrupt (json error / OSError) — treated as cache miss
+      * cached entry was abstract-only (``_fetch_full_text=False``) but
+        the current run wants full text — we re-resolve so PDF gets
+        fetched. Reverse direction (cached has text, current doesn't
+        need it) is fine: cached data is a superset, accept it.
+    """
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    cached_fft = bool(data.get("_fetch_full_text", False))
+    if want_full_text and not cached_fft:
+        return None
+    return data
+
+
+def save_resolved_cache(path: Path, data: dict) -> None:
+    """Atomic write of a per-ident cache entry via tmp-rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Main
 # ════════════════════════════════════════════════════════════════════════════
@@ -640,6 +823,8 @@ def main(
     rate_limit_openalex:   float = RATE_LIMIT_OPENALEX,
     rate_limit_unpaywall:  float = RATE_LIMIT_UNPAYWALL,
     ss_batch_size:         int   = SS_BATCH_SIZE,
+    arxiv_batch_size:      int   = ARXIV_BATCH_SIZE,
+    max_workers:           int   = MAX_WORKERS,
     pdf_max_pages:         int   = PDF_MAX_PAGES,
     pdf_max_chars:         int   = PDF_MAX_CHARS,
     timeout_sec:           int   = TIMEOUT_SEC,
@@ -672,7 +857,8 @@ def main(
     global USER_EMAIL, UA
     global RATE_LIMIT_SS, RATE_LIMIT_ARXIV, RATE_LIMIT_CROSSREF
     global RATE_LIMIT_OPENALEX, RATE_LIMIT_UNPAYWALL
-    global SS_BATCH_SIZE, PDF_MAX_PAGES, PDF_MAX_CHARS
+    global SS_BATCH_SIZE, ARXIV_BATCH_SIZE, MAX_WORKERS
+    global PDF_MAX_PAGES, PDF_MAX_CHARS
     global TIMEOUT_SEC, MAX_RETRIES, BACKOFF_BASE, FETCH_FULL_TEXT
 
     # pymupdf presence check — only matters when we'll actually fetch PDFs.
@@ -691,6 +877,8 @@ def main(
     RATE_LIMIT_OPENALEX  = rate_limit_openalex
     RATE_LIMIT_UNPAYWALL = rate_limit_unpaywall
     SS_BATCH_SIZE        = ss_batch_size
+    ARXIV_BATCH_SIZE     = arxiv_batch_size
+    MAX_WORKERS          = max_workers
     PDF_MAX_PAGES        = pdf_max_pages
     PDF_MAX_CHARS        = pdf_max_chars
     TIMEOUT_SEC          = timeout_sec
@@ -764,17 +952,66 @@ def main(
             else:
                 ss_errors[ident] = "not_found"
 
+    # ── Phase 2.5: Pre-fetch arxiv abstracts in batch ───────────────────
+    # arxiv Atom API supports `id_list=A,B,C,...` per call (~50/call).
+    # Without this we'd hit ~3.2s throttle once per ref reaching the
+    # arxiv tier — for 300 refs that's 16 minutes. Batched: ~30 seconds.
+    arxiv_to_prefetch: list[str] = []
+    for ident in unique_idents:
+        ss_info = ss_meta.get(ident)
+        if ss_info and ss_info.get("abstract"):
+            continue   # SS already covered it; arxiv tier won't be reached
+        ext = (ss_info or {}).get("externalIds") or {}
+        ref_example = ident_to_ref_example[ident]
+        arxiv_id = ref_example.get("arxiv_id") or ext.get("ArXiv")
+        if arxiv_id:
+            arxiv_to_prefetch.append(arxiv_id)
+
+    if arxiv_to_prefetch:
+        n_unique = len({bare_arxiv(a) for a in arxiv_to_prefetch})
+        print(f"Phase 2.5: pre-fetching {n_unique} arxiv abstracts "
+              f"in batches of {ARXIV_BATCH_SIZE} ...")
+        cache = arxiv_abstract_batch(arxiv_to_prefetch)
+        _arxiv_abstract_cache.update(cache)
+        n_hit = sum(1 for v in cache.values() if v[0])
+        print(f"  → {n_hit}/{n_unique} retrieved (rest stored as misses)")
+
     # ── Phase 3: Per-identifier waterfall (abstract + text) ─────────────
+    # Parallelized via ThreadPoolExecutor. Different APIs (arxiv /
+    # crossref / openalex / unpaywall / oa_pdf) have independent throttle
+    # buckets — workers calling distinct APIs run truly in parallel,
+    # while same-API calls queue up via the throttle lock.
+    #
+    # Per-ident cache at OUT_DIR/_resolved/<safe>.json: each completed
+    # ident is written to disk immediately, so a Colab disconnect/crash
+    # loses at most one in-flight ident, not the whole batch. Restart
+    # picks up where it left off.
+    n_cache_hits = 0
+    n_cache_lock = threading.Lock()  # only for the counter; cache files
+                                      # themselves don't need a lock since
+                                      # each ident maps to its own file.
+
     print(f"Phase 3: per-identifier waterfall "
-          f"(abstract{' + full_text' if FETCH_FULL_TEXT else ''}) ...")
-    ident_resolved: dict[str, dict] = {}
-    for ident in tqdm(unique_idents, desc="papers"):
+          f"(abstract{' + full_text' if FETCH_FULL_TEXT else ''}, "
+          f"workers={MAX_WORKERS}, cache={out_path / _RESOLVED_DIR_NAME}) ...")
+
+    def _resolve_one(ident: str) -> tuple[str, dict]:
+        nonlocal n_cache_hits
+
+        # Cache check — skip ALL work for already-resolved idents.
+        cache_file = _resolved_cache_path(out_path, ident)
+        cached = load_resolved_cache(cache_file, want_full_text=FETCH_FULL_TEXT)
+        if cached is not None:
+            with n_cache_lock:
+                n_cache_hits += 1
+            return ident, cached
+
         ref_example = ident_to_ref_example[ident]
         ss_info     = ss_meta.get(ident)
         ss_err      = ss_errors.get(ident)
 
-        # Merge identifiers we learned from SS back onto the example ref
-        # so the waterfall can also use SS-provided arxiv_id/DOI for refs
+        # Merge identifiers we learned from SS back onto the example ref so
+        # the waterfall can also use SS-provided arxiv_id/DOI for refs
         # that started with only an ss_id.
         ext = (ss_info or {}).get("externalIds") or {}
         enriched = dict(ref_example)
@@ -790,7 +1027,7 @@ def main(
         abstract = strip_control_chars(abstract)
         text     = strip_control_chars(text)
 
-        ident_resolved[ident] = {
+        result = {
             "abstract":    abstract,
             "text":        text,
             "abs_source":  abs_src,
@@ -801,7 +1038,25 @@ def main(
             # arxiv_id/DOI beyond what the ref carried originally.
             "_enriched_arxiv_id": enriched.get("arxiv_id"),
             "_enriched_doi":      enriched.get("doi"),
+            # Marker: did this run try to fetch full text? Used by
+            # `load_resolved_cache` to detect abstract-only entries when
+            # a later run wants full text.
+            "_fetch_full_text":   bool(FETCH_FULL_TEXT),
         }
+        # Persist before returning — the result is now durable across crashes.
+        save_resolved_cache(cache_file, result)
+        return ident, result
+
+    ident_resolved: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = [pool.submit(_resolve_one, ident) for ident in unique_idents]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="papers"):
+            ident, result = fut.result()
+            ident_resolved[ident] = result
+
+    if n_cache_hits:
+        print(f"  → {n_cache_hits}/{len(unique_idents)} resolved from cache, "
+              f"{len(unique_idents) - n_cache_hits} freshly fetched.")
 
     # ── Phase 4: Group per survey + write files ──────────────────────────
     print(f"Phase 4: assembling per-survey sources files → {out_path} ...")

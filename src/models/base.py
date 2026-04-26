@@ -43,6 +43,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from tqdm.auto import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,34 @@ ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.datasets import load_dataset as load_dataset_cls
+from src.log_setup import setup_logging
+
+
+def _fmt_k(n: int) -> str:
+    """Compact integer for tqdm postfix: `12345` → `12k`, `123` → `123`."""
+    return f"{n // 1000}k" if n >= 1000 else str(n)
+
+
+def _fmt_postfix(
+    sid: str, status: str,
+    cost: float, in_tok: int, out_tok: int, rsn_tok: int,
+    n_ok: int, n_skip: int, n_fail: int,
+) -> str:
+    """Build the per-iteration tqdm postfix string.
+
+    Shows `$cost in:Xk out:Yk rsn:Zk` only when the running totals are
+    non-zero (so for generators that don't surface usage we don't pollute
+    the bar with zeros). Always shows last instance id + outcome counters.
+    """
+    parts = [f"id={sid} [{status}]"]
+    if cost > 0 or in_tok > 0 or out_tok > 0:
+        parts.append(f"${cost:.4f}")
+        parts.append(f"in:{_fmt_k(in_tok)}")
+        parts.append(f"out:{_fmt_k(out_tok)}")
+        if rsn_tok > 0:
+            parts.append(f"rsn:{_fmt_k(rsn_tok)}")
+    parts.append(f"ok={n_ok}/skip={n_skip}/fail={n_fail}")
+    return "  ".join(parts)
 
 
 class BaseModel(ABC):
@@ -132,6 +162,12 @@ class BaseModel(ABC):
                 metrics. Non-numeric ids are dropped from the filtered set.
                 ``None`` → process all instances.
         """
+        # Centralised log file at results/logs/generate.log — append-mode,
+        # one banner per run. Without this the `logger.info("[SKIP] …")`
+        # / `[GEN] …` messages below are silently dropped (root logger
+        # has no handlers by default), and tqdm-on-stderr doesn't help.
+        setup_logging("generate")
+
         resume = self.cfg.get("resume", True)
 
         registry = self.load_registry(ROOT / "datasets" / "registry.yaml")
@@ -165,54 +201,111 @@ class BaseModel(ABC):
         print(f"Model    : {self.model_id}")
         print(f"Output   : {self.out_dir}\n")
 
-        for instance in instances:
-            out_file = self.out_dir / f"{instance.id}.json"
+        # Cumulative usage stats across all instances. We display whatever
+        # `generate()` surfaces in `meta`: if a generator writes
+        # `meta.cost_usd` and/or `meta.tokens.{prompt,completion,reasoning}`
+        # — we accumulate and show in the tqdm postfix. Generators that
+        # don't expose this info contribute zero (the postfix shows $0.00,
+        # which honestly reflects what we know).
+        total_cost  = 0.0
+        total_in    = 0
+        total_out   = 0
+        total_rsn   = 0
+        n_ok = n_skip = n_fail = 0
 
-            if resume and out_file.exists():
-                try:
-                    existing = json.loads(out_file.read_text(encoding="utf-8"))
-                    if existing.get("success") and existing.get("text"):
-                        logger.info(f"[SKIP] {instance.id}")
-                        continue
-                except Exception:
-                    pass
+        bar = tqdm(
+            instances,
+            desc=f"{self.model_id}", unit="survey",
+            dynamic_ncols=True, leave=True,
+        )
+        # `logging_redirect_tqdm` маршрутизирует всё что попадает в root
+        # logger (наши `[SKIP]`/`[GEN]`/`[OK]` строки) через `tqdm.write` —
+        # бар приостанавливается, строка печатается выше, бар
+        # перерисовывается ниже. Без этого `\n` от logger ломает `\r`-ные
+        # redraw'ы tqdm и они визуально перемешиваются.
+        with logging_redirect_tqdm():
+            for instance in bar:
+                out_file = self.out_dir / f"{instance.id}.json"
 
-            logger.info(f"[GEN]  {instance.id} | {instance.query[:70]}")
+                if resume and out_file.exists():
+                    try:
+                        existing = json.loads(out_file.read_text(encoding="utf-8"))
+                        if existing.get("success") and existing.get("text"):
+                            logger.info(f"[SKIP] {instance.id}")
+                            n_skip += 1
+                            bar.set_postfix_str(_fmt_postfix(
+                                instance.id, "skip",
+                                total_cost, total_in, total_out, total_rsn,
+                                n_ok, n_skip, n_fail,
+                            ), refresh=True)
+                            continue
+                    except Exception:
+                        pass
 
-            result = self.generate(instance)
+                logger.info(f"[GEN]  {instance.id} | {instance.query[:70]}")
+                result = self.generate(instance)
 
-            record = {
-                "id":         instance.id,
-                "dataset_id": dataset_id,
-                "model_id":   self.model_id,
-                "query":      instance.query,
-                "text":       result["text"],
-                "success":    result["success"],
-                "meta": {
-                    "generated_at": datetime.now(timezone.utc).isoformat(),
-                    **result["meta"],
-                },
-            }
+                record = {
+                    "id":         instance.id,
+                    "dataset_id": dataset_id,
+                    "model_id":   self.model_id,
+                    "query":      instance.query,
+                    "text":       result["text"],
+                    "success":    result["success"],
+                    "meta": {
+                        "generated_at": datetime.now(timezone.utc).isoformat(),
+                        **result["meta"],
+                    },
+                }
 
-            out_file.write_text(
-                json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+                out_file.write_text(
+                    json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
 
-            status = "OK" if result["success"] else "FAIL"
-            meta   = result["meta"]
-            parts  = [f"    [{status}]"]
-            if meta.get("latency_sec") is not None:
-                parts.append(f"latency={meta['latency_sec']}s")
-            if result["success"] and meta.get("references"):
-                parts.append(f"refs={len(meta['references'])}")
-            if meta.get("error"):
-                parts.append(f"error={str(meta['error'])[:80]}")
-            logger.info(" ".join(parts))
+                status = "OK" if result["success"] else "FAIL"
+                meta   = result["meta"]
+                parts  = [f"    [{status}]"]
+                if meta.get("latency_sec") is not None:
+                    parts.append(f"latency={meta['latency_sec']}s")
+                if result["success"] and meta.get("references"):
+                    parts.append(f"refs={len(meta['references'])}")
+                if meta.get("error"):
+                    parts.append(f"error={str(meta['error'])[:80]}")
+                logger.info(" ".join(parts))
 
-            if not result["success"]:
-                if self.fail_fast:
-                    sys.exit(1)
+                # Aggregate usage. Defensive on shapes — surveygen_i and
+                # surveyforge currently write `cost_usd: None` and no `tokens`
+                # field, so we coerce both to 0.
+                cost_usd = meta.get("cost_usd") or 0
+                total_cost += float(cost_usd)
+                tokens = meta.get("tokens") or {}
+                total_in  += int(tokens.get("prompt")     or 0)
+                total_out += int(tokens.get("completion") or 0)
+                total_rsn += int(tokens.get("reasoning")  or 0)
+
+                if result["success"]:
+                    n_ok += 1
                 else:
-                    logger.warning(f"Generation failed for {instance.id}, continuing")
+                    n_fail += 1
 
+                bar.set_postfix_str(_fmt_postfix(
+                    instance.id, status.lower(),
+                    total_cost, total_in, total_out, total_rsn,
+                    n_ok, n_skip, n_fail,
+                ), refresh=True)
+
+                if not result["success"]:
+                    if self.fail_fast:
+                        bar.close()
+                        sys.exit(1)
+                    else:
+                        logger.warning(f"Generation failed for {instance.id}, continuing")
+
+        bar.close()
         logger.info(f"Generations saved to: {self.out_dir}")
+        if total_cost > 0 or total_in > 0:
+            logger.info(
+                "Run usage: ok=%d skip=%d fail=%d  cost=$%.4f  in=%s  out=%s  rsn=%s",
+                n_ok, n_skip, n_fail, total_cost,
+                _fmt_k(total_in), _fmt_k(total_out), _fmt_k(total_rsn),
+            )
