@@ -38,3 +38,21 @@ TODO.md
 # notebooks
 tmp.ipynb
 analysis/
+
+# LaTeX build artifacts (theory/main/, etc.) — keep .tex / .bib sources,
+# ignore the PDF-render byproducts. Generic `*.log` is fine here: project
+# runtime logs live under `results/logs/` which is already ignored.
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
+*.lof
+*.lot
+*.nav
+*.snm
+*.vrb
