@@ -11,38 +11,60 @@
 
 ```
 thesis/
-├── models/                      # генерирующие системы
+├── models/                      # генерирующие системы (см. §Модели)
 │   ├── perplexity_dr/           #   Perplexity Sonar Deep Research
 │   ├── surveyforge/             #   SurveyForge (RAG + outline pipeline)
 │   ├── surveygen_i/             #   SurveyGen-I (LangGraph async)
 │   └── autosurvey/              #   AutoSurvey (конвертация baseline)
 │
-├── metrics/                     # метрики оценки
-│   ├── surge/                   #   SurGE — LLM-judge (5 осей качества)
-│   └── diversity/               #   Reference diversity (SPECTER2 + PCA)
+├── metrics/                     # метрики оценки (см. §Метрики)
+│   ├── claimify/                #   atomic-claim extraction (Claimify, 4-stage)
+│   ├── veriscore/               #   atomic-claim extraction (VeriScore, alt)
+│   ├── factuality/              #   B.1  CitCorrect_k (требует claimify/veriscore)
+│   ├── structural/              #   A.1 contr / A.2 term / A.3 rep
+│   ├── expert/                  #   C.1 crit / C.2 comp / C.3 open / C.4 modality
+│   ├── diversity/               #   Reference diversity (SPECTER2 + PCA)
+│   └── surge/                   #   SurGE — LLM-judge (структура + content)
 │
 ├── src/                         # общий код
 │   ├── models/base.py           #   BaseModel ABC
+│   ├── evaluators/surge.py      #   обёртка над repos/SurGE
 │   ├── datasets/                #   загрузка датасетов
+│   ├── log_setup.py             #   единая конфигурация логов
+│   ├── exceptions.py            #   ThesisError-иерархия
 │   └── utils/                   #   вспомогательные скрипты
 │
 ├── datasets/                    # данные (не в git)
 │   ├── registry.yaml            #   реестр датасетов
-│   └── SurGE/                   #   бенчмарк SurGE
+│   ├── SurGE/                   #   бенчмарк SurGE
+│   ├── factuality_cache/        #   кэш абстрактов (abstracts.json + full_texts/)
+│   └── surge/latex_src/         #   arxiv-tarball'ы для SurGE_reference
 │
 ├── results/                     # результаты (не в git)
-│   ├── generations/             #   <dataset>_<model>/<topic_id>.json
-│   └── scores/                  #   <dataset>_<model>/<metric>/<topic_id>.json
+│   ├── generations/             #   <dataset>_<model>/<sid>.json
+│   │   └── <ds>_<mdl>/sources/  #   per-survey sources-файлы (factuality)
+│   ├── scores/                  #   <dataset>_<model>_<metric>_<run_id>/<sid>.json
+│   │                            #   + summary.csv
+│   └── logs/                    #   <metric_name>.log (append-mode)
 │
 ├── repos/                       # клонированные репозитории (не в git)
-│   ├── SurGE/
-│   ├── SurveyForge/
-│   └── SurveyGen-I/
+│   ├── SurGE/                   #   используется metrics/surge
+│   ├── SurveyForge/             #   используется models/surveyforge
+│   ├── SurveyGen-I/             #   используется models/surveygen_i
+│   ├── AutoSurvey/              #   используется models/autosurvey
+│   ├── AlignScore/              #   используется metrics/factuality
+│   ├── VeriScore/               #   используется metrics/veriscore
+│   └── grobid/                  #   PDF-парсинг (опционально)
 │
-├── app/                         # Streamlit viewer
-├── scripts/                     # разовые скрипты
+├── app/main.py                  # Streamlit viewer
+├── scripts/                     # инструменты
+│   ├── colab_bulk_fetch.py      #   Colab: bulk-fetch evidence для factuality
+│   ├── colab_fetch_stats.py     #   Colab: статистика покрытия sources-файлов
+│   └── …                        #   (SurGE_reference pipeline + утилиты)
 ├── docker/                      # базовый Docker-образ
 │   └── Dockerfile.base
+├── tmp/                         # /tmp в контейнерах: stage-checkpoint'ы factuality, scratch
+├── models_cache/                # локальный HF-style кэш моделей (не в git)
 └── experiments/                 # ⚠️ DEPRECATED — см. ниже
 ```
 
@@ -67,36 +89,143 @@ thesis/
 
 ### Формат выходного файла
 
-`results/generations/<dataset>_<model>/<topic_id>.json`
+`results/generations/<dataset>_<model>/<sid>.json`
 
 ```json
 {
+  "id":         "0",
+  "dataset_id": "SurGE",
+  "model_id":   "perplexity_dr",
   "topic":      "Graph Neural Networks",
-  "text":       "## Introduction\n...",
+  "query":      "...",
+  "text":       "## Introduction [1]\n...",
   "success":    true,
   "meta": {
     "model":       "perplexity/sonar-deep-research",
     "latency_sec": 42.1,
     "cost_usd":    0.015,
-    "references":  ["2301.00123", "2210.05234"]
+    "references": [
+      {
+        "idx":             1,
+        "title":           "raw title string",
+        "url":             "https://arxiv.org/abs/2301.00123",
+        "arxiv_id":        "2301.00123",
+        "canonical_title": "Graph Neural Networks…",
+        "semantic_scholar_id": "abc123…",
+        "doc_id":          42
+      }
+    ]
   }
 }
 ```
+
+Inline-цитаты в `text` — `[N]` (1-indexed, матчатся с `meta.references[k].idx`),
+без пробела перед скобкой и без backslash. Несколько подряд: `[1][2]` или `[1, 2]`.
 
 ---
 
 ## Метрики
 
-### SurGE (`metrics/surge/`)
+Каждая метрика — отдельная директория `metrics/<name>/` с `main.py`,
+`config.yaml`, `Dockerfile`. Запуск через `make evaluate METRIC=<name>` (см.
+§Оценка). Per-survey файлы пишутся в
+`results/scores/<dataset>_<model>_<metric>_<run_id>/<sid>.json` плюс общий
+`summary.csv` рядом.
 
-LLM-judge оценка по 5 осям качества (Coverage, Relevance, Structure, Synthesis, Consistency).
-Реализован по методологии бенчмарка SurGE.
+### Preprocessing — извлечение atomic-claim'ов
 
-### Diversity (`metrics/diversity/`)
+`factuality` и `expert` работают на **per-claim** уровне, поэтому до них надо
+прогнать один из двух экстракторов claim'ов. Оба пишут в общую директорию
+`results/scores/<ds>_<mdl>_claims/` (так что не запускай оба последовательно
+без переименования — перезатрут).
 
-Разнообразие источников на основе эмбеддингов SPECTER2:
-- Новизна ссылок (NR), охват домена, PCA-визуализация
-- PCA обучается на **эталонных** ссылках из датасета — все модели проецируются в одно 2D-пространство
+| Метрика | Подход | Скорость | Качество |
+|---|---|---|---|
+| `claimify` | 4-stage pipeline (split → select → disambiguate → decompose), Metropolitansky & Larson ACL 2025 | медленно | выше |
+| `veriscore` | sentence-level LLM extraction | быстро | грубее |
+
+### A. Структурное качество — `metrics/structural/`
+
+Три под-метрики в одном run'е:
+
+- **A.1 `M_contr`** — кросс-секционные противоречия (NER → DeBERTa-NLI → LLM-судья)
+- **A.2 `M_term`** — терминологическая несогласованность (NER → SPECTER → HDBSCAN → LLM, *exploratory*)
+- **A.3 `M_rep`** — кросс-секционная повторяемость (SPECTER cosine + bi-NLI entailment)
+
+Все три — «чем меньше, тем лучше». Модели подгружаются из `models_cache/`
+лениво (NER, NLI, SPECTER).
+
+### B. Фактическая корректность — `metrics/factuality/`
+
+Метрика **B.1 `CitCorrect_k`** — доля поддержанных claim'ов в каждой из четырёх
+семантических категорий:
+
+1. LLM-судья присваивает claim'у одну из категорий **A** (general/topical),
+   **B** (methodology), **C** (quantitative), **D** (critical/comparative).
+2. AlignScore (RoBERTa-large) проверяет, поддерживается ли claim текстом
+   evidence (абстрактом цитируемой статьи).
+3. `CitCorrect_k = |{a : φ(a)=k ∧ Support(a)=1}| / |{a : φ(a)=k}|`.
+
+**Зависимости:** требует `claimify` или `veriscore` — иначе падает с понятным
+сообщением. Source-файлы (per-survey, со схемой
+[`metrics/factuality/sources_io.py`](metrics/factuality/sources_io.py)) живут в
+`results/generations/<ds>_<mdl>/sources/<sid>_sources.json`. Два режима по
+config'у `evidence_mode`:
+
+- `internal` — factuality сама строит файл по waterfall'у (cache → corpus.json
+  → arxiv Atom API → опц. Semantic Scholar). Существующий файл — checkpoint.
+- `external` — файл должен быть подготовлен заранее (например, скриптом
+  `scripts/colab_bulk_fetch.py` в Colab — обходит SS rate limits через
+  `/paper/batch` + waterfall arxiv/Crossref/OpenAlex). При отсутствии файла —
+  явная `FileNotFoundError`.
+
+Stage-чекпоинты classify/align — в `tmp/factuality/<variant>/<sid>.json`,
+переживают рестарты (resume автоматический).
+
+### C. Экспертные качества письма — `metrics/expert/`
+
+Четыре независимых per-claim суждения, считаются **одним общим LLM-вызовом**
+(`judge_all`) для эффективности:
+
+| Код | Что меряет |
+|---|---|
+| **C.1 `M_crit`** | доля критических claim'ов (ограничения, негативные результаты, противоречия, trade-offs) |
+| **C.2 `M_comp`** | доля явных сравнений + check валидности |
+| **C.3 `M_open`** | доля open questions / future work |
+| **C.4 `M_mod`** | распределение epistemic modality (categorical 1 → explicit uncertainty 5) + Shannon entropy |
+
+Гипотеза: human-written обзоры показывают больше C.1/C.3 и более сбалансированную
+C.4 по сравнению с LLM-генерациями. Скрипт валидации против ручной разметки —
+`metrics/expert/validate.py` (вход: `results/scores/expert_classes_test.json`,
+`expert_modalities_test.json`).
+
+### Diversity — `metrics/diversity/`
+
+Не в A/B/C-таксономии — оценивает не то, *как* написан survey, а *что*
+цитирует.
+
+- SPECTER2-эмбеддинги цитируемых статей
+- `citation_diversity` — средняя pairwise-cosine дистанция внутри survey'я
+- `distribution_shift` — cosine-расстояние centroid'а survey'я от centroid'а
+  всего corpus'а
+- Опционально PCA-визуализация в одном 2D-пространстве для всех моделей
+
+### SurGE — `metrics/surge/`
+
+Враппер над `repos/SurGE/` (метрики **из оригинальной статьи** SurGE
+benchmark'а). Это **не наш** baseline, а метрический suite авторов датасета,
+который мы переиспользуем для контекста.
+
+Поддержанные сейчас (через `eval_list` в config):
+- `structure_quality` — LLM-судья (0-5)
+- `logic` — LLM-судья (0-5)
+- `coverage` — overlap цитируемых статей с ground-truth survey'ём
+- `citation_count` / `corpus_match_rate` / `reference_self_cited` — наши
+  citation-метрики поверх их пайплайна
+
+**Не подключены** из их статьи: `SH-Recall` (требует FlagEmbedding, есть код,
+закомментирован в config'е), три NLI-relevance метрики (`Paper/Section/Sentence
+Level`), ROUGE/BLEU.
 
 ---
 
@@ -111,11 +240,17 @@ git clone <this-repo> thesis && cd thesis
 git clone https://github.com/weAIDB/SurveyForge   repos/SurveyForge
 git clone https://github.com/weAIDB/SurGE          repos/SurGE
 git clone https://github.com/xxx/SurveyGen-I       repos/SurveyGen-I
+git clone https://github.com/yzha/AlignScore      repos/AlignScore   # для metrics/factuality
 
-# Виртуальное окружение (для локальных утилит)
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+# .venv + полный набор зависимостей + spaCy/NLTK данные + патч AlignScore
+make setup
 ```
+
+`make setup` устанавливает `requirements.txt`, скачивает `spacy en_core_web_sm`
+и NLTK `punkt_tab`, `punkt`, ставит AlignScore из `repos/` в editable-режиме и
+применяет два совместимых патча через `scripts/patch_alignscore.py` (чинят
+`AdamW` import + `load_from_checkpoint` под современные `transformers` /
+`pytorch-lightning`). Идемпотентно.
 
 ### 2. Переменные окружения
 
@@ -142,29 +277,91 @@ make sfmodel        # скачать embedding-модель gte-large-en-v1.5
 ### 4. Собрать базовый Docker-образ
 
 ```bash
-make base           # собирается один раз, кэшируется
-make base-clean     # принудительная пересборка (после правок в docker/)
+make base                      # собирается один раз, кэшируется
+make base NO_CACHE=1           # принудительная пересборка (после правок в docker/)
 ```
+
+### 5. (Опц.) Скачать модели для метрик
+
+```bash
+make download-metric-models    # NER, DeBERTa-NLI, SPECTER2, AlignScore checkpoint
+```
+
+---
+
+## Запуск без Docker (bare-metal venv)
+
+Все таргеты `make generate` и `make evaluate` принимают флаг `DOCKER`:
+
+```
+DOCKER=1   (default) — собрать образ и запустить в контейнере
+DOCKER=0             — выполнить напрямую через .venv/bin/python
+```
+
+Сценарии bare-metal:
+- разработка / отладка на ноутбуке (нет docker daemon'а или дорого пересобирать)
+- сервер где docker недоступен / запрещён, есть GPU и venv
+
+Что нужно один раз, до первого `DOCKER=0`-прогона:
+
+```bash
+make setup                         # см. шаг 1 — устанавливает всё
+# .env должен лежать в корне репо: переменные подхватятся автоматически
+# (`set -a; . .env; set +a` встроен в Makefile-цели для DOCKER=0)
+```
+
+Дальше — те же команды, что и в docker-режиме, плюс `DOCKER=0`:
+
+```bash
+make generate MODEL=perplexity_dr DATASET=SurGE DOCKER=0
+
+make evaluate METRIC=claimify    DATASET=SurGE MODEL=perplexity_dr DOCKER=0
+make evaluate METRIC=expert      DATASET=SurGE MODEL=perplexity_dr DOCKER=0
+make evaluate METRIC=factuality  DATASET=SurGE MODEL=perplexity_dr DOCKER=0
+make evaluate METRIC=structural  DATASET=SurGE MODEL=perplexity_dr DOCKER=0
+```
+
+Поддерживаемые в bare-metal сейчас:
+- модели: `perplexity_dr`, `surveygen_i` (для последнего ещё нужен
+  `pip install -r models/surveygen_i/requirements.txt` — langchain/aiohttp/etc.)
+- метрики: `claimify`, `veriscore`, `expert`, `factuality`, `structural`,
+  `diversity`, `surge`
+
+**Не поддерживается** в bare-metal:
+- `surveyforge` (тяжёлая GPU-инсталляция, FAISS, отдельный `requirements`-сет —
+  держим только в docker)
+
+Логи, чекпоинты и кэши пишутся ровно в те же относительные пути, что и в
+docker-режиме (`results/`, `tmp/`, `models_cache/`, `datasets/...`).
+factuality умеет автоматически выбирать корень для stage-чекпоинтов:
+`/tmp/factuality/` в контейнере (через volume mount) и `tmp/factuality/`
+относительно репо на bare-metal.
 
 ---
 
 ## Генерация
 
+Универсальный таргет: `make generate MODEL=<name> DATASET=<id> [GPU=1]`.
+`MODEL` выбирает директорию `models/<name>/`, остальное собирается оттуда.
+
 ```bash
-# Универсальный запуск
+# OpenRouter-based, без GPU
 make generate MODEL=perplexity_dr DATASET=SurGE
 make generate MODEL=surveygen_i   DATASET=SurGE
 
-# Специализированные таргеты
-make generate-sf        DATASET=SurGE   # SurveyForge (GPU)
-make generate-sf-cpu    DATASET=SurGE   # SurveyForge (CPU, для отладки)
-make generate-sgi       DATASET=SurGE   # SurveyGen-I (CPU)
+# С GPU (RAG + outline)
+make generate MODEL=surveyforge   DATASET=SurGE GPU=1
 
-# AutoSurvey — конвертация готовых baseline результатов (без Docker)
-make convert-autosurvey DATASET=SurGE
+# AutoSurvey — конвертация готовых baseline результатов (без Docker, локально)
+make convert-autosurvey           DATASET=SurGE
 ```
 
-Результаты сохраняются в `results/generations/<DATASET>_<MODEL>/`.
+Результаты — в `results/generations/<DATASET>_<MODEL>/<sid>.json`. Сколько
+обзоров обсчитать — настройка `n_surveys` в `models/<name>/config.yaml`
+(дефолт мал, для полного прогона ставь больше).
+
+Resume автоматический: повторный запуск пропускает survey'и, у которых уже
+есть `<sid>.json` с `success=true` и непустым `text`.
 
 ---
 
@@ -255,15 +452,81 @@ datasets/surge/latex_src/<arxiv_id>/
 
 ## Оценка
 
-```bash
-# SurGE метрика
-make evaluate           DATASET=SurGE MODEL=perplexity_dr METRIC=surge
+Универсальный таргет: `make evaluate METRIC=<name> DATASET=<id> MODEL=<m>
+[LIMIT=N] [EXTRA_ARGS='--flag val']`.
 
-# Diversity метрика
-make evaluate-diversity DATASET=SurGE MODEL=perplexity_dr
+**Порядок запуска метрик:**
+
+```
+generate → claimify (или veriscore) → factuality
+                                   ↘ expert
+        → structural   (независимо)
+        → diversity    (независимо)
+        → surge        (независимо)
 ```
 
-Результаты сохраняются в `results/scores/<DATASET>_<MODEL>/`.
+```bash
+# Шаг 1: извлечь atomic-claim'ы (выбери ОДИН экстрактор; оба пишут в общий
+# results/scores/<ds>_<mdl>_claims/, не запускай оба последовательно)
+make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=claimify
+# или: METRIC=veriscore  (быстрее, но грубее)
+
+# Шаг 2: B-метрика факт-чека
+make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=factuality
+
+# Шаг 2': C-метрики экспертного письма
+make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=expert
+
+# Независимые
+make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=structural
+make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=diversity
+make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=surge
+
+# Лимит по survey_id (≤ N)
+make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=factuality LIMIT=10
+
+# Произвольные флаги для main.py метрики
+make evaluate DATASET=SurGE MODEL=perplexity_dr METRIC=factuality \
+    EXTRA_ARGS='--debug-claim-idx 5'
+```
+
+### Валидация промптов
+
+Для метрик `expert` и `factuality` есть скрипты валидации против ручной
+разметки (precision/recall LLM-классификаторов):
+
+```bash
+make validate METRIC=expert       # vs expert_classes_test + expert_modalities_test
+make validate METRIC=factuality   # vs factuality_classes_test
+```
+
+Результаты per-survey — в `results/scores/<DATASET>_<MODEL>_<METRIC>_<run_id>/`,
+плюс `summary.csv` рядом. `<run_id>` собирается из judge_id + judge_comment +
+variant из config'а соответствующей метрики.
+
+---
+
+## Colab: bulk-fetch evidence для factuality
+
+`metrics/factuality` в `evidence_mode: external` ожидает готовые
+`<sid>_sources.json` под `results/generations/<ds>_<mdl>/sources/`.
+Самый надёжный способ их собрать — Colab (Semantic Scholar анонимно жёстко
+лимитит сервер, но с Colab'овских IP отдаёт лучше).
+
+Два standalone-скрипта в `scripts/` (без CLI, всё через константы наверху —
+скопируй файл в ячейку Colab, поправь параметры, запусти):
+
+| Файл | Что делает |
+|---|---|
+| `scripts/colab_bulk_fetch.py` | Принимает архив с генерациями (`.tar.gz` / `.zip` / директория), извлекает все ss_id/arxiv_id из refs, прогоняет SS `/paper/batch` + waterfall arxiv Atom / Crossref / OpenAlex / Unpaywall / arxiv-PDF (pymupdf). На выходе — папка с `<sid>_sources.json`. |
+| `scripts/colab_fetch_stats.py` | Читает папку выхода, печатает coverage по абстрактам / full_text'у, breakdown по источникам и причинам провалов (`abs_errors` / `text_errors`), список refs которые не удалось найти. |
+
+После прогона — скачай папку `<OUT_DIR>/` и положи её содержимое
+в `results/generations/<dataset>_<model>/sources/` на сервере. Дальше
+factuality в external-режиме подхватит без лишних сетевых вызовов.
+
+Подробности схемы файлов и точек интеграции — в
+[`metrics/factuality/sources_io.py`](metrics/factuality/sources_io.py).
 
 ---
 

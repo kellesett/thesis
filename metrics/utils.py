@@ -147,10 +147,33 @@ def load_generation_files(gen_dir: Path) -> list[Path]:
         gen_dir: Path to ``results/generations/<dataset>_<model>/``.
 
     Returns:
-        Sorted list of ``.json`` files.
+        List of ``.json`` files sorted by numeric ``survey_id`` (filename
+        stem). Non-numeric stems (rare) sort lexicographically after the
+        numeric bucket. This avoids the classic ``"10.json" < "2.json"``
+        trap on sparse/large id sets like SurGE_reference.
     """
-    files = sorted(gen_dir.glob("*.json"))
+    files = sorted(
+        gen_dir.glob("*.json"),
+        key=lambda p: (0, int(p.stem)) if p.stem.isdigit() else (1, p.stem),
+    )
     return [f for f in files if not _RAW_OLD_RE.search(f.name)]
+
+
+def filter_by_limit(files: list[Path], limit: int | None) -> list[Path]:
+    """Apply id-based ``--limit`` filter: keep files where ``int(stem) <= limit``.
+
+    ID-based (NOT count-based): ``--limit 10`` on a sparse id set
+    {0, 1, 2, 5, 10, 41} returns {0, 1, 2, 5, 10}, NOT the first ten files.
+    Non-numeric stems are dropped from the result when ``limit`` is set
+    (callers that want them must pass ``limit=None``).
+
+    Args:
+        files: List of generation/score JSON paths (filename = ``<sid>.json``).
+        limit: Maximum survey id (inclusive), or ``None`` to disable filtering.
+    """
+    if limit is None:
+        return files
+    return [f for f in files if f.stem.isdigit() and int(f.stem) <= limit]
 
 
 # ── Resume-mode cache helper ─────────────────────────────────────────────────

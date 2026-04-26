@@ -224,6 +224,9 @@ class PerplexityDR(BaseModel):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate surveys with Perplexity Deep Research")
     parser.add_argument("--dataset", required=True, help="Dataset id (e.g. SurGE)")
+    parser.add_argument("--limit",   type=int, default=None,
+                        help="Generate only surveys with survey_id <= LIMIT "
+                             "(inclusive, id-based — not positional).")
     args = parser.parse_args()
 
-    PerplexityDR().run(args.dataset)
+    PerplexityDR().run(args.dataset, limit=args.limit)

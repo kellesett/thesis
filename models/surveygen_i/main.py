@@ -307,6 +307,9 @@ class SurveyGenI(BaseModel):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate surveys with SurveyGen-I")
     parser.add_argument("--dataset", required=True, help="Dataset id (e.g. SurGE)")
+    parser.add_argument("--limit",   type=int, default=None,
+                        help="Generate only surveys with survey_id <= LIMIT "
+                             "(inclusive, id-based — not positional).")
     args = parser.parse_args()
 
-    SurveyGenI().run(args.dataset)
+    SurveyGenI().run(args.dataset, limit=args.limit)

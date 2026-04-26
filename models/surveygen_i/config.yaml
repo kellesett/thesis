@@ -1,6 +1,7 @@
 model_id: surveygen_i
-n_surveys: 2
 resume: true
+# Сколько обзоров обсчитывать — флагом `--limit N` (id-based, ≤ N).
+# Через make: `make generate ... LIMIT=10`. Без флага — все.
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
 # SurveyGen-I использует OpenAI Responses API (client.responses.create).

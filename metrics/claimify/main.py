@@ -61,7 +61,7 @@ from metrics.claimify.claim_extractor import (
     _SEL_COMPLETIONS,
     _DIS_COMPLETIONS,
 )
-from metrics.utils import load_config, check_and_load_cache, load_generation_files
+from metrics.utils import load_config, check_and_load_cache, load_generation_files, filter_by_limit
 
 
 # ── Client creation ───────────────────────────────────────────────────────────
@@ -232,6 +232,9 @@ async def main_async() -> None:
     parser = argparse.ArgumentParser(description="Claimify — atomic claim extraction")
     parser.add_argument("--dataset", required=True, help="Dataset id (e.g. SurGE)")
     parser.add_argument("--model",   required=True, help="Model id (e.g. perplexity_dr)")
+    parser.add_argument("--limit",   type=int, default=None,
+                        help="Process only surveys with survey_id <= LIMIT "
+                             "(inclusive, id-based — not positional).")
     args = parser.parse_args()
 
     cfg       = load_config(CONFIG)
@@ -252,7 +255,7 @@ async def main_async() -> None:
     out_dir = ROOT / "results" / "scores" / f"{args.dataset}_{args.model}_claims"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    gen_files = load_generation_files(gen_dir)
+    gen_files = filter_by_limit(load_generation_files(gen_dir), args.limit)
 
     print(f"\n[claimify] {args.dataset} / {args.model}")
     print(f"           {len(gen_files)} surveys → {out_dir}")
