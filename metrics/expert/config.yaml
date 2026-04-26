@@ -6,7 +6,7 @@ judge_base_url:    https://openrouter.ai/api/v1
 judge_api_key_env: OPENROUTER_API_KEY
 # judge_provider:    deepinfra/bf16
 # judge_reasoning_effort: low     # "low" | "medium" | "high" — для моделей с reasoning budget (gpt-oss и т.д.)
-judge_disable_reasoning: false # отключить thinking токены — для Qwen3/DeepSeek (несовместимо с reasoning_effort)
+judge_reasoning:   true        # thinking токены — false для Qwen3/DeepSeek (несовместимо с reasoning_effort)
 judge_max_tokens:  4096
 judge_id:          gemma-4-31b
 judge_comment:     run1

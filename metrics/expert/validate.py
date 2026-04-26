@@ -189,7 +189,7 @@ def validate_classes(cfg: dict, client: OpenAI) -> None:
     model             = cfg["judge_model"]
     max_retries       = cfg.get("max_retries", 3)
     provider          = cfg.get("judge_provider")
-    disable_reasoning = cfg.get("judge_disable_reasoning", False)
+    disable_reasoning = not cfg.get("judge_reasoning", True)
     reasoning_effort  = cfg.get("judge_reasoning_effort") or None
     max_tokens        = cfg.get("judge_max_tokens") or None
     workers           = cfg.get("judge_workers", 8)
@@ -264,7 +264,7 @@ def validate_modalities(cfg: dict, client: OpenAI) -> None:
     model             = cfg["judge_model"]
     max_retries       = cfg.get("max_retries", 3)
     provider          = cfg.get("judge_provider")
-    disable_reasoning = cfg.get("judge_disable_reasoning", False)
+    disable_reasoning = not cfg.get("judge_reasoning", True)
     reasoning_effort  = cfg.get("judge_reasoning_effort") or None
     max_tokens        = cfg.get("judge_max_tokens") or None
     workers           = cfg.get("judge_workers", 8)
