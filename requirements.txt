@@ -1,11 +1,22 @@
-# requirements.txt
-# Минимальный набор для локальных make-команд и утилит:
-#   make setup, models, models-ping  — src/utils/check_local.py
-#   make download, inspect           — src/download.py
-#   make sfdb, sfdb-check, sfmodel   — src/utils/download_*.py
+# requirements.txt — единый набор для bare-metal venv.
 #
-# Docker-зависимости экспериментов — в experiments/exp0X/requirements.txt
+# Покрывает:
+#   * утилиты репо (download, models-ping, viewer, scripts/*)
+#   * генерацию models/perplexity_dr (только OpenRouter, ничего тяжёлого)
+#   * метрики claimify, veriscore, expert, factuality, structural
+#
+# НЕ включает:
+#   * SurveyGen-I — свой `models/surveygen_i/requirements.txt`
+#     (langchain/langgraph/aiohttp/faiss-cpu); ставь дополнительно
+#   * SurveyForge — свой `models/surveyforge/requirements.txt`;
+#     bare-metal-сценарий пока не поддерживается
+#   * `tensorboard`, `seaborn`, `matplotlib` — только для notebook-анализа
+#
+# После `pip install -r requirements.txt` нужно ещё дёрнуть spaCy/NLTK
+# данные и (если используется factuality) пропатчить AlignScore — это
+# делает `make setup`.
 
+# ── API / общее ──────────────────────────────────────────────────────────────
 openai
 anthropic
 huggingface_hub
@@ -16,3 +27,38 @@ streamlit
 plotly
 requests
 tqdm
+
+# ── Numerical ────────────────────────────────────────────────────────────────
+scipy
+numpy
+scikit-learn
+
+# ── Transformers ecosystem ──────────────────────────────────────────────────
+# Pin <5: AlignScore (repos/AlignScore) импортит `AdamW` из top-level
+# transformers, что убрано в 5.0. Остальные — обычные совместимые границы.
+torch
+transformers>=4.40,<5
+tokenizers>=0.19,<0.22
+sentence-transformers
+accelerate
+safetensors
+sentencepiece
+tiktoken
+
+# ── NLP-утилиты (данные models/punkt качаются make setup'ом) ────────────────
+spacy
+nltk
+
+# ── Datasets / streaming ────────────────────────────────────────────────────
+datasets
+ijson         # streaming больших JSON (corpus.json 1.6 GB)
+
+# ── Clustering (structural A.2) ─────────────────────────────────────────────
+hdbscan
+
+# ── AlignScore (factuality B.1) ─────────────────────────────────────────────
+pytorch-lightning
+jsonlines
+
+# ── Кэш LLM-вызовов (structural) ────────────────────────────────────────────
+diskcache

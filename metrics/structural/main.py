@@ -49,7 +49,8 @@ from tqdm import tqdm
 
 from src.log_setup import setup_logging
 from metrics.utils import (
-    make_client, load_config, check_and_load_cache, load_generation_files,
+    make_client, load_config, check_and_load_cache,
+    load_generation_files, filter_by_limit,
     write_summary_csv,
 )
 from metrics.structural.contradiction.aggregate import compute_m_contr
@@ -389,6 +390,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Structural quality metrics (A.1, A.2, A.3)")
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--model",   required=True)
+    parser.add_argument("--limit",   type=int, default=None,
+                        help="Process only surveys with survey_id <= LIMIT "
+                             "(inclusive, id-based — not positional).")
     args = parser.parse_args()
 
     cfg    = load_config(CONFIG)
@@ -416,7 +420,7 @@ def main() -> None:
     out_dir = ROOT / "results" / "scores" / f"{args.dataset}_{args.model}_structural_{run_id}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    gen_files = load_generation_files(gen_dir)
+    gen_files = filter_by_limit(load_generation_files(gen_dir), args.limit)
 
     tqdm.write(f"\n[structural] {args.dataset} / {args.model}")
     tqdm.write(f"             {len(gen_files)} surveys → {out_dir}\n")

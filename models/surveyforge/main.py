@@ -260,6 +260,9 @@ class SurveyForge(BaseModel):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate surveys with SurveyForge")
     parser.add_argument("--dataset", required=True, help="Dataset id (e.g. SurGE)")
+    parser.add_argument("--limit",   type=int, default=None,
+                        help="Generate only surveys with survey_id <= LIMIT "
+                             "(inclusive, id-based — not positional).")
     args = parser.parse_args()
 
-    SurveyForge().run(args.dataset)
+    SurveyForge().run(args.dataset, limit=args.limit)

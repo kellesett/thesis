@@ -39,6 +39,7 @@ sys.path.insert(0, str(ROOT))
 from src.log_setup import setup_logging
 from src.datasets import load_dataset as load_dataset_cls
 from src.evaluators import load_evaluator
+from metrics.utils import load_generation_files, filter_by_limit
 from src.evaluators.surge import JudgeFailedError
 
 
@@ -115,6 +116,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate generations with SurGE metrics")
     parser.add_argument("--dataset", required=True, help="Dataset id (e.g. SurGE)")
     parser.add_argument("--model",   required=True, help="Model id (e.g. perplexity_dr)")
+    parser.add_argument("--limit",   type=int, default=None,
+                        help="Process only surveys with survey_id <= LIMIT "
+                             "(inclusive, id-based — not positional).")
     args = parser.parse_args()
 
     with open(CONFIG, encoding="utf-8") as f:
@@ -151,10 +155,17 @@ def main() -> None:
     if not gen_dir.exists():
         raise SystemExit(f"Generations not found at {gen_dir}")
 
-    gen_files = sorted(
-        f for f in gen_dir.glob("*.json")
-        if re.fullmatch(r'\d+\.json', f.name)
-    )
+    # load_generation_files: numeric-by-stem sort + skip _raw/_old backups.
+    # filter_by_limit: id-based --limit (and as a side effect drops
+    # non-numeric stems from the filtered set, matching the previous
+    # ``r'\d+\.json'`` filter.)
+    gen_files = load_generation_files(gen_dir)
+    if args.limit is not None:
+        gen_files = filter_by_limit(gen_files, args.limit)
+    else:
+        # Even without --limit, keep numeric-only behaviour the surge
+        # evaluator was always relying on.
+        gen_files = [f for f in gen_files if f.stem.isdigit()]
     if not gen_files:
         raise SystemExit(f"No generation files (N.json) found in {gen_dir}")
 

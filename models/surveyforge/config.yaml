@@ -1,6 +1,7 @@
 model_id: surveyforge               # используется в пути results/generations/<dataset_id>_<model_id>/
-n_surveys: 40                        # сколько примеров взять из датасета
 resume: true                        # пропускать уже сгенерированные
+# Сколько обзоров обсчитывать — флагом `--limit N` (id-based, ≤ N).
+# Через make: `make generate ... LIMIT=10`. Без флага — все.
 
 # ── LLM backend ───────────────────────────────────────────────────────────────
 # "local"      — локальный OpenAI-compatible сервер (LOCAL_API_BASE, LOCAL_API_KEY в .env)

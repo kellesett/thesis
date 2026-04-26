@@ -16,6 +16,12 @@ MODEL   ?= perplexity_dr
 METRIC  ?= surge
 GPU     ?= 0
 
+# DOCKER=1 (default) — собирать и запускать в контейнере.
+# DOCKER=0           — запускать напрямую через .venv/bin/python (bare-metal).
+#                      Для bare-metal нужно: `make setup` (полный — с torch,
+#                      AlignScore, spaCy/NLTK данными), `.env` в корне репо.
+DOCKER  ?= 1
+
 # SurGE_reference pipeline knobs (used by `make surge-reference`):
 #   MODE=string|llm|hybrid  (default hybrid — string top-K + LLM re-ranker)
 #   LIMIT=N                 (default unset — process all surveys)
@@ -47,12 +53,15 @@ _GPU_FLAG = $(if $(filter 1,$(GPU)),--gpus all,)
 help:
 	@echo ""
 	@echo "  [Окружение]"
-	@echo "  make setup          — .venv + requirements.txt"
+	@echo "  make setup          — .venv + requirements.txt + spaCy/NLTK данные + AlignScore patch"
 	@echo "  make setup-sf       — .venv + requirements exp04 (torch, faiss, ...)"
 	@echo ""
 	@echo "  [Docker — base]"
 	@echo "  make base              — собрать thesis-base (кэшируется)"
 	@echo "  make base NO_CACHE=1   — пересобрать thesis-base без кэша"
+	@echo ""
+	@echo "  Любой target ниже принимает DOCKER=0 → запуск в bare-metal venv,"
+	@echo "  DOCKER=1 (default) → запуск в контейнере."
 	@echo ""
 	@echo "  [Генерация]"
 	@echo "  make generate MODEL=perplexity_dr  [DATASET=SurGE]"
@@ -89,6 +98,18 @@ setup:
 	python3 -m venv .venv
 	.venv/bin/pip install --upgrade pip -q
 	.venv/bin/pip install -r requirements.txt
+	# spaCy / NLTK данные нужны claimify, veriscore, factuality (sent_tokenize в AlignScore).
+	.venv/bin/python -m spacy download en_core_web_sm
+	.venv/bin/python -m nltk.downloader -d $(HOME)/nltk_data punkt_tab punkt
+	# AlignScore (для factuality) ставится отдельно из repos/ — патч под
+	# новую transformers/lightning применяется идемпотентно. Если репо
+	# AlignScore ещё не клонировано — шаги тихо скипаются.
+	@if [ -d repos/AlignScore ]; then \
+	    .venv/bin/pip install --no-deps -e repos/AlignScore ; \
+	    .venv/bin/python scripts/patch_alignscore.py ; \
+	else \
+	    echo "repos/AlignScore/ не найден — пропустил установку (factuality потребует его)" ; \
+	fi
 
 setup-sf:
 	.venv/bin/pip install -r experiments/exp04_surveyforge/requirements.txt
@@ -102,12 +123,20 @@ base:
 	docker build $(if $(filter 1,$(NO_CACHE)),--no-cache,) -f docker/Dockerfile.base -t thesis-base .
 
 ## ── Генерация ────────────────────────────────────────────────────────────────
+# DOCKER=1 (default) → собирает образ и запускает в контейнере.
+# DOCKER=0           → исполняет напрямую через $(PYTHON) (bare-metal venv).
+#                      `.env` подгружается inline через `set -a; . .env; set +a`.
 
-generate: base
+generate: $(if $(filter 1,$(DOCKER)),base,)
 	mkdir -p tmp models_cache results/logs
+ifeq ($(DOCKER),0)
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	    $(PYTHON) models/$(MODEL)/main.py --dataset $(DATASET) $(LIMIT_FLAG)
+else
 	docker build -f models/$(MODEL)/Dockerfile -t thesis-gen-$(MODEL) .
 	docker run --rm $(_GPU_FLAG) $(VOLUMES) thesis-gen-$(MODEL) \
-		python models/$(MODEL)/main.py --dataset $(DATASET)
+		python models/$(MODEL)/main.py --dataset $(DATASET) $(LIMIT_FLAG)
+endif
 
 ## ── AutoSurvey (конвертация baseline) ───────────────────────────────────────
 
@@ -137,8 +166,14 @@ surge-reference:
 # Чтобы кэшировать HuggingFace-модели (diversity/structural/...) добавь:
 #   -v "$(HOME)/.cache/huggingface:/root/.cache/huggingface"
 
-evaluate: base
+evaluate: $(if $(filter 1,$(DOCKER)),base,)
 	mkdir -p tmp models_cache results/logs
+ifeq ($(DOCKER),0)
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	    $(PYTHON) metrics/$(METRIC)/main.py \
+	        --dataset $(DATASET) --model $(MODEL) \
+	        $(LIMIT_FLAG) $(EXTRA_ARGS)
+else
 	docker build -f metrics/$(METRIC)/Dockerfile -t thesis-eval-$(METRIC) .
 	# -t allocates a pseudo-TTY inside the container so tqdm can do in-place
 	# bar redraws via \r and ANSI cursor codes. Without it every update
@@ -151,6 +186,7 @@ evaluate: base
 	TTY="$$(test -t 1 && echo -t || true)" ; \
 	docker run --rm $$TTY $(VOLUMES) thesis-eval-$(METRIC) \
 		python metrics/$(METRIC)/main.py --dataset $(DATASET) --model $(MODEL) $(LIMIT_FLAG) $(EXTRA_ARGS)
+endif
 
 validate: base
 	mkdir -p tmp

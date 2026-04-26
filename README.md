@@ -240,11 +240,17 @@ git clone <this-repo> thesis && cd thesis
 git clone https://github.com/weAIDB/SurveyForge   repos/SurveyForge
 git clone https://github.com/weAIDB/SurGE          repos/SurGE
 git clone https://github.com/xxx/SurveyGen-I       repos/SurveyGen-I
+git clone https://github.com/yzha/AlignScore      repos/AlignScore   # для metrics/factuality
 
-# Виртуальное окружение (для локальных утилит)
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+# .venv + полный набор зависимостей + spaCy/NLTK данные + патч AlignScore
+make setup
 ```
+
+`make setup` устанавливает `requirements.txt`, скачивает `spacy en_core_web_sm`
+и NLTK `punkt_tab`, `punkt`, ставит AlignScore из `repos/` в editable-режиме и
+применяет два совместимых патча через `scripts/patch_alignscore.py` (чинят
+`AdamW` import + `load_from_checkpoint` под современные `transformers` /
+`pytorch-lightning`). Идемпотентно.
 
 ### 2. Переменные окружения
 
@@ -280,6 +286,56 @@ make base NO_CACHE=1           # принудительная пересборк
 ```bash
 make download-metric-models    # NER, DeBERTa-NLI, SPECTER2, AlignScore checkpoint
 ```
+
+---
+
+## Запуск без Docker (bare-metal venv)
+
+Все таргеты `make generate` и `make evaluate` принимают флаг `DOCKER`:
+
+```
+DOCKER=1   (default) — собрать образ и запустить в контейнере
+DOCKER=0             — выполнить напрямую через .venv/bin/python
+```
+
+Сценарии bare-metal:
+- разработка / отладка на ноутбуке (нет docker daemon'а или дорого пересобирать)
+- сервер где docker недоступен / запрещён, есть GPU и venv
+
+Что нужно один раз, до первого `DOCKER=0`-прогона:
+
+```bash
+make setup                         # см. шаг 1 — устанавливает всё
+# .env должен лежать в корне репо: переменные подхватятся автоматически
+# (`set -a; . .env; set +a` встроен в Makefile-цели для DOCKER=0)
+```
+
+Дальше — те же команды, что и в docker-режиме, плюс `DOCKER=0`:
+
+```bash
+make generate MODEL=perplexity_dr DATASET=SurGE DOCKER=0
+
+make evaluate METRIC=claimify    DATASET=SurGE MODEL=perplexity_dr DOCKER=0
+make evaluate METRIC=expert      DATASET=SurGE MODEL=perplexity_dr DOCKER=0
+make evaluate METRIC=factuality  DATASET=SurGE MODEL=perplexity_dr DOCKER=0
+make evaluate METRIC=structural  DATASET=SurGE MODEL=perplexity_dr DOCKER=0
+```
+
+Поддерживаемые в bare-metal сейчас:
+- модели: `perplexity_dr`, `surveygen_i` (для последнего ещё нужен
+  `pip install -r models/surveygen_i/requirements.txt` — langchain/aiohttp/etc.)
+- метрики: `claimify`, `veriscore`, `expert`, `factuality`, `structural`,
+  `diversity`, `surge`
+
+**Не поддерживается** в bare-metal:
+- `surveyforge` (тяжёлая GPU-инсталляция, FAISS, отдельный `requirements`-сет —
+  держим только в docker)
+
+Логи, чекпоинты и кэши пишутся ровно в те же относительные пути, что и в
+docker-режиме (`results/`, `tmp/`, `models_cache/`, `datasets/...`).
+factuality умеет автоматически выбирать корень для stage-чекпоинтов:
+`/tmp/factuality/` в контейнере (через volume mount) и `tmp/factuality/`
+относительно репо на bare-metal.
 
 ---
 

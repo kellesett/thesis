@@ -122,13 +122,17 @@ class BaseModel(ABC):
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
-    def run(self, dataset_id: str) -> None:
+    def run(self, dataset_id: str, limit: int | None = None) -> None:
+        """Load the dataset and iterate instances, calling :meth:`generate`.
+
+        Args:
+            dataset_id: Registry key (e.g. ``"SurGE"``).
+            limit: If set, process only instances with numeric ``id <= limit``
+                — id-based, NOT positional. Same semantics as ``--limit`` in
+                metrics. Non-numeric ids are dropped from the filtered set.
+                ``None`` → process all instances.
         """
-        Load the dataset and iterate over instances, calling self.generate()
-        for each one, then serialise the result to JSON.
-        """
-        n_surveys = self.cfg.get("n_surveys", None)
-        resume    = self.cfg.get("resume", True)
+        resume = self.cfg.get("resume", True)
 
         registry = self.load_registry(ROOT / "datasets" / "registry.yaml")
         if dataset_id not in registry:
@@ -139,23 +143,24 @@ class BaseModel(ABC):
 
         dataset = load_dataset_cls(dataset_id, registry[dataset_id])
         # SurGE's surveys.json is NOT in numeric survey_id order (first 15 ids
-        # are [0, 1, 41, 42, …, 53]). Sort by numeric id so `n_surveys: N`
-        # means "first N by id" and results/generations/<...>/<N>.json
-        # sequence is predictable for downstream consumers (factuality,
-        # viewer). Non-numeric ids sort lexicographically after the numeric
-        # bucket.
+        # are [0, 1, 41, 42, …, 53]). Sort by numeric id so iteration matches
+        # the ordering expected by downstream consumers (factuality, viewer).
+        # Non-numeric ids sort lexicographically after the numeric bucket.
         instances = sorted(
             dataset,
             key=lambda inst: (0, int(inst.id)) if str(inst.id).isdigit()
                              else (1, str(inst.id)),
         )
-        if n_surveys is not None:
-            instances = instances[:n_surveys]
+        if limit is not None:
+            instances = [
+                inst for inst in instances
+                if str(inst.id).isdigit() and int(inst.id) <= limit
+            ]
 
         self.out_dir = ROOT / "results" / "generations" / f"{dataset_id}_{self.model_id}"
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
-        n_label = f"using first {n_surveys}" if n_surveys else "all"
+        n_label = f"limit={limit} → {len(instances)}" if limit is not None else f"all ({len(instances)})"
         print(f"Dataset  : {dataset_id} ({len(dataset)} surveys, {n_label})")
         print(f"Model    : {self.model_id}")
         print(f"Output   : {self.out_dir}\n")
