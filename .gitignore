@@ -58,3 +58,5 @@ analysis/
 *.nav
 *.snm
 *.vrb
+
+theory/
