@@ -41,7 +41,7 @@ def normalize_string(s: str) -> str:
 
 # ── Title cleaning for Perplexity-returned references ────────────────────────
 
-def clean_perplexity_title(title: str) -> str:
+def clean_perplexity_title(title: str | None) -> str:
     """
     Strip noise from titles returned by Perplexity via OpenRouter annotations.
 
@@ -53,6 +53,8 @@ def clean_perplexity_title(title: str) -> str:
 
     After cleaning, the title should match the corpus Title field.
     """
+    if not title:
+        return ""
     t = title.strip()
     # Remove [PDF] prefix
     t = re.sub(r'^\[PDF\]\s*', '', t, flags=re.IGNORECASE)
@@ -93,7 +95,7 @@ def detect_self_citation(references: list[dict], survey_title: str) -> bool:
         if canonical and normalize_string(canonical) == target_key:
             return True
         # Fallback: cleaned Perplexity title
-        clean = clean_perplexity_title(ref.get("title", ""))
+        clean = clean_perplexity_title(ref.get("title"))
         if clean and normalize_string(clean) == target_key:
             return True
     return False
@@ -180,7 +182,7 @@ class CitationEvaluator:
                     results.append(doc_id)
                     continue
             # Fallback: clean Perplexity title
-            clean = clean_perplexity_title(ref.get('title', ''))
+            clean = clean_perplexity_title(ref.get('title'))
             key   = normalize_string(clean)
             results.append(self._index.get(key))
         return results

@@ -40,6 +40,7 @@ torch
 transformers>=4.40,<5
 tokenizers>=0.19,<0.22
 sentence-transformers
+FlagEmbedding
 accelerate
 safetensors
 sentencepiece
@@ -59,6 +60,10 @@ hdbscan
 # ── AlignScore (factuality B.1) ─────────────────────────────────────────────
 pytorch-lightning
 jsonlines
+
+# ── Original SurGE metrics ──────────────────────────────────────────────────
+rouge-score
+sacrebleu
 
 # ── Кэш LLM-вызовов (structural) ────────────────────────────────────────────
 diskcache

@@ -48,6 +48,38 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.\-]", "_", text)
 
 
+def _score_fields(eval_list: list[str]) -> list[str]:
+    """Expand compound config metrics into concrete score keys."""
+    fields: list[str] = []
+    for metric in eval_list:
+        if metric == "rouge_bleu":
+            fields.extend(["rouge_1", "rouge_2", "rouge_l", "bleu"])
+        else:
+            fields.append(metric)
+    return fields
+
+
+def _json_safe(value):
+    """Convert numpy/scalar containers returned by SurGE libs to JSON-safe values."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "tolist"):
+        try:
+            return _json_safe(value.tolist())
+        except (TypeError, ValueError):
+            pass
+    if hasattr(value, "item"):
+        try:
+            return _json_safe(value.item())
+        except (TypeError, ValueError):
+            pass
+    return value
+
+
 def load_registry(registry_path: Path) -> dict[str, str]:
     """Load dataset registry from YAML.
 
@@ -125,6 +157,7 @@ def main() -> None:
         cfg = yaml.safe_load(f)
 
     eval_list     = cfg["eval_list"]
+    score_fields  = _score_fields(eval_list)
     judge_comment = cfg.get("judge_comment", "")
     resume        = cfg.get("resume", True)
 
@@ -188,10 +221,20 @@ def main() -> None:
 
         if resume and score_file.exists():
             try:
-                all_results.append(json.loads(score_file.read_text(encoding="utf-8")))
-                print(f"  [SKIP] {gid}")
-                log(f"skip survey {gid}: already scored (resume=true)")
-                continue
+                cached = json.loads(score_file.read_text(encoding="utf-8"))
+                cached_scores = cached.get("scores") or {}
+                missing_scores = [
+                    key for key in score_fields
+                    if key not in cached_scores
+                ]
+                if missing_scores:
+                    print(f"  [WARN] {gid}: cached score misses {missing_scores}, re-evaluating")
+                    log(f"warn survey {gid}: cached score misses {missing_scores}, re-evaluating")
+                else:
+                    all_results.append(cached)
+                    print(f"  [SKIP] {gid}")
+                    log(f"skip survey {gid}: already scored (resume=true)")
+                    continue
             except Exception as e:
                 print(f"  [WARN] {gid}: corrupt score file, re-evaluating — {e}")
                 log(f"warn survey {gid}: corrupt score file, re-evaluating — {e}")
@@ -227,8 +270,8 @@ def main() -> None:
         t0 = time.time()
         try:
             out = evaluator.evaluate(generation, flush_fn=flush_fn, log_fn=log)
-            scores           = out["scores"]
-            judge_log_ref[:] = out["judge_log"]
+            scores           = _json_safe(out["scores"])
+            judge_log_ref[:] = _json_safe(out["judge_log"])
         except JudgeFailedError as e_:
             print(f"  [FAIL] Evaluation aborted: {e_}")
             log(f"FAIL survey {gid}: judge exhausted retries — {e_}")
@@ -269,7 +312,7 @@ def main() -> None:
     csv_path = scores_dir / "summary.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["id", "dataset_id", "model_id", "survey_title"] + eval_list
+            f, fieldnames=["id", "dataset_id", "model_id", "survey_title"] + score_fields
         )
         writer.writeheader()
         for r in all_results:
@@ -279,14 +322,14 @@ def main() -> None:
                 "model_id":     r["model_id"],
                 "survey_title": r["survey_title"],
             }
-            for key in eval_list:
+            for key in score_fields:
                 row[key] = r["scores"].get(key)
             writer.writerow(row)
 
     # ── Aggregate stats ───────────────────────────────────────────────────────
     print(f"\n{'─' * 60}")
     print(f"  Results: {len(all_results)} survey(s)")
-    for key in eval_list:
+    for key in score_fields:
         vals = [r["scores"][key] for r in all_results if r["scores"].get(key) is not None]
         if vals:
             avg = sum(vals) / len(vals)

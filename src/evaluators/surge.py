@@ -1,6 +1,6 @@
 """
 src/evaluators/surge.py
-SurGE evaluator: SH-Recall, Structure_Quality, Logic.
+SurGE evaluator: ROUGE/BLEU, SH-Recall, Structure_Quality, Logic.
 
 Wraps the core evaluation logic (monkey-patching, LLM judge, metrics)
 previously in src/surge_evaluate.py into a BaseEvaluator subclass.
@@ -20,6 +20,7 @@ import time
 import tempfile
 import logging
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +41,8 @@ CORPUS_PATH = ROOT / "datasets" / "SurGE" / "corpus.json"
 INDEX_PATH  = ROOT / "datasets" / "SurGE" / "title_index.json"
 
 CITATION_METRICS = {"citation_count", "corpus_match_rate", "coverage", "reference_self_cited"}
+SURGE_TEXT_METRICS = {"rouge_bleu", "sh_recall", "structure_quality", "logic"}
+SUPPORTED_METRICS = SURGE_TEXT_METRICS | CITATION_METRICS
 
 MAX_JUDGE_TRIES = 5
 MAX_RETRY_DELAY = 32  # seconds, cap for exponential backoff
@@ -71,6 +74,26 @@ def build_judge_client(config: dict) -> tuple[OpenAI, str]:
     if not api_key:
         raise SystemExit(f"Env var '{config['judge_api_key_env']}' is not set")
     return OpenAI(base_url=config["judge_base_url"], api_key=api_key), config["judge_model"]
+
+
+@contextmanager
+def _flag_embedding_transformers_compat():
+    """Translate FlagEmbedding 1.4's dtype kwarg for older transformers 4.x."""
+    from transformers import AutoModel
+
+    original_from_pretrained = AutoModel.from_pretrained
+
+    @classmethod
+    def from_pretrained_compat(cls, *args, **kwargs):
+        if "dtype" in kwargs and "torch_dtype" not in kwargs:
+            kwargs["torch_dtype"] = kwargs.pop("dtype")
+        return original_from_pretrained(*args, **kwargs)
+
+    AutoModel.from_pretrained = from_pretrained_compat
+    try:
+        yield
+    finally:
+        AutoModel.from_pretrained = original_from_pretrained
 
 
 # ── Monkey-patch factory ──────────────────────────────────────────────────────
@@ -191,6 +214,10 @@ def _run_metrics(
     Returns scores dict: {metric_name: value}.
     Raises JudgeFailedError if the judge fails on any paragraph.
     """
+    unknown = set(eval_list) - SURGE_TEXT_METRICS
+    if unknown:
+        raise ValueError(f"unsupported SurGE text metric(s): {sorted(unknown)}")
+
     import structureFuncs
     import informationFuncs
     from markdownParser import parse_markdown
@@ -208,6 +235,24 @@ def _run_metrics(
         informationFuncs.chat_openai = patched
         psg_node = parse_markdown(str(md_path))
         scores   = {}
+
+        if "rouge_bleu" in eval_list:
+            import rougeBleuFuncs
+
+            if log_fn: log_fn("metric start  rouge_bleu")
+            r1, r2, rl, bleu = rougeBleuFuncs.eval_rougeBleu(target_survey, psg_node)
+            scores.update({
+                "rouge_1": float(r1),
+                "rouge_2": float(r2),
+                "rouge_l": float(rl),
+                "bleu":    float(bleu),
+            })
+            if log_fn:
+                log_fn(
+                    "metric done   rouge_bleu = "
+                    f"rouge_1={scores['rouge_1']} rouge_2={scores['rouge_2']} "
+                    f"rouge_l={scores['rouge_l']} bleu={scores['bleu']}"
+                )
 
         if "sh_recall" in eval_list:
             if log_fn: log_fn("metric start  sh_recall")
@@ -265,6 +310,9 @@ class SurGEEvaluator(BaseEvaluator):
         _add_surge_to_path()
 
         self.eval_list = config["eval_list"]
+        unknown = set(self.eval_list) - SUPPORTED_METRICS
+        if unknown:
+            raise SystemExit(f"Unsupported SurGE metric(s) in eval_list: {sorted(unknown)}")
         self.judge_client, self.judge_model = build_judge_client(config)
 
         self.flag_model = None
@@ -276,7 +324,15 @@ class SurGEEvaluator(BaseEvaluator):
                 raise SystemExit("FlagEmbedding is required for sh_recall: pip install FlagEmbedding")
             emb_model = config.get("embedding_model", "BAAI/bge-large-en-v1.5")
             print(f"Loading embedding model: {emb_model}")
-            self.flag_model = FlagModel(emb_model, use_fp16=torch.cuda.is_available())
+            with _flag_embedding_transformers_compat():
+                self.flag_model = FlagModel(
+                    emb_model,
+                    query_instruction_for_retrieval=(
+                        "Generate a representation for this title to calculate "
+                        "the similarity between titles:"
+                    ),
+                    use_fp16=torch.cuda.is_available(),
+                )
 
         # Citation evaluator (corpus-based)
         self.citation_evaluator = None
