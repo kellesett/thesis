@@ -11,7 +11,7 @@ judge_base_url:    https://openrouter.ai/api/v1
 judge_api_key_env: OPENROUTER_API_KEY
 # judge_provider:         alibaba   # опционально — явно указать провайдера
 #judge_reasoning_effort: low     # "low"|"medium"|"high" — для reasoning-моделей (gpt-oss и т.д.)
-judge_reasoning:         true    # отключить thinking токены (Qwen3/DeepSeek, несовместимо с reasoning_effort)
+judge_reasoning:         true    # thinking токены; false для Qwen3/DeepSeek (несовместимо с reasoning_effort)
 judge_id:          gemma-4-31b
 judge_comment:     run1
 
@@ -30,11 +30,15 @@ claim_scope:            section     # paragraph | section
 # None = все ancestor'ы включаются; 0 = только own section; 1 = + immediate
 # parent; N = + N ближайших ancestors. YAML `null` → None в Python.
 section_max_ancestor_depth: 1
-evidence_source:        abstract    # abstract | full_text (arxiv-source LaTeX)
+evidence_source:        full_text_or_abstract  # abstract | full_text | full_text_or_abstract
 evidence_aggregation:   per_ref      # concat (faster, no attribution) | per_ref (slower, keeps argmax)
 
-# ── Fetch-цепочка абстрактов (режим evidence_source=abstract) ───────────────
-# Приоритет в fetch_abstract:
+# ── Fetch-цепочка evidence ───────────────────────────────────────────────────
+# full_text_or_abstract конкатенирует доступные abstract и full_text для ref.
+# В internal-режиме это означает, что factuality пытается собрать оба поля.
+# В external-режиме используются поля, уже лежащие в <sid>_sources.json.
+#
+# Для abstract-части приоритет в fetch_abstract:
 #   1. disk cache (любая запись — hit или miss; чтобы форсировать re-fetch,
 #                  удали abstracts.json или конкретные ключи вручную)
 #   2. corpus.json[doc_id]

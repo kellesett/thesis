@@ -35,7 +35,8 @@ Schema (top-level)::
       "dataset_id":            "SurGE",
       "model_id":              "reference",
       "fetched_at":            "2026-04-19T14:22:03Z",
-      "fetch_provider":        "colab" | "internal_abstract" | "internal_full_text",
+      "fetch_provider":        "colab" | "internal_abstract" | "internal_full_text"
+                               | "internal_full_text_or_abstract",
 
       # Aggregate counters (summaries of `refs` below — redundant but
       # cheap to re-use at dashboard time).

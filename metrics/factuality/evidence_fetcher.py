@@ -9,6 +9,8 @@ Two sources (modes):
                      Expensive — tarball download + latexpand + pandoc.
                      Without an ``arxiv_id`` we currently skip (GROBID /
                      openAccessPdf PDF-parsing is future work).
+    * ``full_text_or_abstract`` — combined evidence: concatenate every
+                     available abstract/full-text field for the reference.
 
 Output shape is uniform across modes::
 
@@ -604,6 +606,26 @@ from metrics.factuality.sources_io import (                  # noqa: E402
 )
 
 
+def _combine_evidence(entry: dict) -> tuple[str | None, str]:
+    """Return combined abstract + full-text evidence for one sources entry."""
+    parts: list[str] = []
+    labels: list[str] = []
+
+    abstract = entry.get("abstract")
+    if abstract:
+        parts.append(f"Abstract:\n{abstract}")
+        labels.append(entry.get("abs_source") or "abstract")
+
+    full_text = entry.get("text")
+    if full_text:
+        parts.append(f"Full text:\n{full_text}")
+        labels.append(entry.get("text_source") or "full_text")
+
+    if not parts:
+        return (None, "miss")
+    return ("\n\n\n".join(parts), "combined:" + "+".join(labels))
+
+
 def _sources_to_key_evidence(
     sources: dict, evidence_source: str,
 ) -> dict[str, tuple[str | None, str]]:
@@ -611,22 +633,27 @@ def _sources_to_key_evidence(
 
     ``ref_key`` mirrors :func:`_ref_key`'s priority rule so the same keys
     work across in-memory `refs` dicts and the persisted sources file.
-    ``evidence_source`` selects which field (``abstract`` or ``text``) to
-    surface as the downstream AlignScore premise.
+    ``evidence_source`` selects which field(s) to surface as the downstream
+    AlignScore premise.
     """
     if evidence_source == "abstract":
         text_field, source_field = "abstract", "abs_source"
     elif evidence_source == "full_text":
         text_field, source_field = "text", "text_source"
+    elif evidence_source == "full_text_or_abstract":
+        text_field = source_field = None
     else:
         raise ValueError(f"unknown evidence_source: {evidence_source!r}")
 
     out: dict[str, tuple[str | None, str]] = {}
     for entry in sources.get("refs", {}).values():
         key = _ref_key(entry)
-        text = entry.get(text_field)
-        src  = entry.get(source_field) or "miss"
-        out[key] = (text, src)
+        if evidence_source == "full_text_or_abstract":
+            out[key] = _combine_evidence(entry)
+        else:
+            text = entry.get(text_field)
+            src  = entry.get(source_field) or "miss"
+            out[key] = (text, src)
     return out
 
 
@@ -658,7 +685,7 @@ def _build_sources_internal(
 
     for ref in refs:
         entry = build_empty_entry(ref)
-        if evidence_source == "abstract":
+        if evidence_source in {"abstract", "full_text_or_abstract"}:
             text, source = fetch_abstract(
                 ref, abstract_cache,
                 corpus_index=corpus_index,
@@ -669,12 +696,14 @@ def _build_sources_internal(
             if text:
                 entry["abstract"]   = text
                 entry["abs_source"] = source
-        elif evidence_source == "full_text":
+
+        if evidence_source in {"full_text", "full_text_or_abstract"}:
             text, source = fetch_full_text(ref, cache_dir=cache_dir)
             if text:
                 entry["text"]         = text
                 entry["text_source"]  = source
-        else:
+
+        if evidence_source not in {"abstract", "full_text", "full_text_or_abstract"}:
             raise ValueError(f"unknown evidence_source: {evidence_source!r}")
 
         per_ref[str(ref["idx"])] = entry
