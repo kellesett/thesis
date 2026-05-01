@@ -7,6 +7,7 @@
         convert-autosurvey surge-reference \
         viewer enrich \
         download inspect models models-ping \
+        push-results pull-results \
         sfdb sfdb-check sfmodel \
         download-metric-models clean
 
@@ -35,6 +36,17 @@ LIMIT_FLAG = $(if $(LIMIT),--limit $(LIMIT),)
 # dedicated Makefile variables (factuality's --claim-scope,
 # --evidence-source, etc.).
 EXTRA_ARGS ?=
+
+# Remote sync over plain ssh+tar (useful when the server has no rsync).
+# SYNC_CONFLICT=overwrite — target files are overwritten.
+# SYNC_CONFLICT=fail      — extraction uses tar -k and fails on existing files.
+REMOTE ?= admin@188.44.57.13
+REMOTE_REPO ?= ~/dolgushevgleb/thesis
+SYNC_CONFLICT ?= overwrite
+ifneq ($(filter $(SYNC_CONFLICT),overwrite fail),$(SYNC_CONFLICT))
+$(error SYNC_CONFLICT must be overwrite or fail)
+endif
+TAR_EXTRACT_FLAGS = $(if $(filter fail,$(SYNC_CONFLICT)),-xzkf,-xzf)
 
 # Shared volumes for all containers
 VOLUMES = --env-file .env \
@@ -90,6 +102,8 @@ help:
 	@echo ""
 	@echo "  [Утилиты]"
 	@echo "  make enrich / models / models-ping / clean"
+	@echo "  make push-results [REMOTE=...] [REMOTE_REPO=...] [SYNC_CONFLICT=overwrite|fail]"
+	@echo "  make pull-results [REMOTE=...] [REMOTE_REPO=...] [SYNC_CONFLICT=overwrite|fail]"
 	@echo ""
 
 ## ── Локальное окружение ───────────────────────────────────────────────────────
@@ -228,6 +242,17 @@ models:
 
 models-ping:
 	$(PYTHON) src/utils/check_local.py --ping
+
+## ── Синхронизация results без rsync ─────────────────────────────────────────
+
+push-results:
+	@echo "local results/ -> $(REMOTE):$(REMOTE_REPO)/results/  (conflict=$(SYNC_CONFLICT))"
+	tar -C results -czf - . | ssh $(REMOTE) 'mkdir -p $(REMOTE_REPO)/results && tar -C $(REMOTE_REPO)/results $(TAR_EXTRACT_FLAGS) -'
+
+pull-results:
+	@echo "$(REMOTE):$(REMOTE_REPO)/results/ -> local results/  (conflict=$(SYNC_CONFLICT))"
+	mkdir -p results
+	ssh $(REMOTE) 'cd $(REMOTE_REPO)/results && tar -czf - .' | tar -C results $(TAR_EXTRACT_FLAGS) -
 
 ## ── Загрузка моделей для метрик ──────────────────────────────────────────────
 

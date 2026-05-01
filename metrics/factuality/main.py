@@ -345,7 +345,7 @@ def _legacy_or_new_sources(claim: dict) -> list[dict]:
     return []
 
 
-# ── Stage checkpoints (tmp/factuality/<variant>/<sid>.json) ──────────────────
+# ── Stage checkpoints (tmp/factuality/{classify,align}/.../<sid>.json) ───────
 #
 # Two costly stages in process_survey (classification = LLM money, AlignScore =
 # CPU-minutes) each persist a checkpoint after completion. A crash between them
@@ -358,9 +358,9 @@ def _legacy_or_new_sources(claim: dict) -> list[dict]:
 #    "n_no_evidence": int,                      # only present when stage="aligned"
 #    "n_scope_failed": int}                     # idem
 #
-# Variant encoding in the directory name matches the `results/scores/` output
-# folder, so config changes (scope / evidence_source / aggregation / judge)
-# naturally invalidate stale checkpoints — they simply live in a different dir.
+# Classification does not depend on scope / evidence_source / aggregation, so
+# that cache is shared across factuality variants. AlignScore does depend on
+# those knobs, so its cache remains variant-specific.
 
 # Checkpoint root. Default — repo-relative `tmp/factuality/`, which is
 # persistent (survives reboots) and already gitignored. The default is
@@ -381,21 +381,29 @@ def _default_checkpoint_root() -> Path:
 _CHECKPOINT_ROOT = _default_checkpoint_root()
 
 
-def _checkpoint_dir(cfg: dict, dataset_id: str, model_id: str) -> Path:
-    """Per-(dataset, model, variant) directory for stage checkpoints.
+def _run_id(cfg: dict) -> str:
+    return f"{cfg['judge_id']}_{cfg['judge_comment']}"
 
-    Path encoding mirrors the results/scores/ output folder exactly —
-    ``<dataset>_<model>_<judge>_<comment>_<scope>_<src>_<agg>`` — so
-    checkpoints for two different models don't collide under a shared
-    judge/scope/src/agg config.
-    """
-    run_id  = f"{cfg['judge_id']}_{cfg['judge_comment']}"
-    variant = (
+
+def _variant_id(cfg: dict) -> str:
+    return (
         f"{cfg.get('claim_scope', 'section')}"
         f"_{cfg.get('evidence_source', 'abstract')}"
         f"_{cfg.get('evidence_aggregation', 'concat')}"
     )
-    return _CHECKPOINT_ROOT / f"{dataset_id}_{model_id}_{run_id}_{variant}"
+
+
+def _classification_checkpoint_dir(cfg: dict, dataset_id: str, model_id: str) -> Path:
+    """Per-(dataset, model, judge) directory for LLM classification checkpoints."""
+    return _CHECKPOINT_ROOT / "classify" / f"{dataset_id}_{model_id}_{_run_id(cfg)}"
+
+
+def _align_checkpoint_dir(cfg: dict, dataset_id: str, model_id: str) -> Path:
+    """Per-(dataset, model, factuality variant) directory for AlignScore checkpoints."""
+    return (
+        _CHECKPOINT_ROOT / "align"
+        / f"{dataset_id}_{model_id}_{_run_id(cfg)}_{_variant_id(cfg)}"
+    )
 
 
 def _save_state(state_file: Path, state: dict) -> None:
@@ -424,6 +432,37 @@ def _load_state(state_file: Path) -> dict | None:
     return data
 
 
+_CLASSIFICATION_CACHE_DROP_KEYS = {
+    "supported",
+    "alignscore",
+    "alignscore_per_ref",
+    "alignscore_best",
+    "evidence_refs",
+    "scope_resolution",
+    "n_sources_resolved",
+    "n_sources_total",
+    "scope_citations",
+}
+
+
+def _classification_cache_payload(categorized: list[dict]) -> list[dict]:
+    """Keep only claim + category fields for the evidence-agnostic cache."""
+    return [
+        {k: v for k, v in c.items() if k not in _CLASSIFICATION_CACHE_DROP_KEYS}
+        for c in categorized
+    ]
+
+
+def _save_classification_state_if_missing(state_file: Path, categorized: list[dict]) -> None:
+    """Seed classification cache from an existing result without overwriting it."""
+    if state_file.exists() or not categorized:
+        return
+    _save_state(state_file, {
+        "stage":       "classified",
+        "categorized": _classification_cache_payload(categorized),
+    })
+
+
 def process_survey(
     gen: dict,
     claims_dir: Path,
@@ -433,7 +472,8 @@ def process_survey(
     alignscore_model,
     corpus_index: dict,
     sources_dir: Path,
-    checkpoint_dir: Path,
+    classification_checkpoint_dir: Path,
+    align_checkpoint_dir: Path,
     *,
     global_tokens: TokenCounter | None = None,
     abstract_cache: dict | None = None,
@@ -476,9 +516,17 @@ def process_survey(
     """
     survey_id = gen["id"]
     out_file  = out_path / f"{survey_id}.json"
+    classification_state_file = classification_checkpoint_dir / f"{survey_id}.json"
+    align_state_file          = align_checkpoint_dir / f"{survey_id}.json"
 
     cached = check_and_load_cache(out_file, cfg, survey_id)
     if cached is not None:
+        cached_claims = cached.get("claims", [])
+        if isinstance(cached_claims, list):
+            _save_classification_state_if_missing(
+                classification_state_file, cached_claims,
+            )
+
         # Promote-from-classify-only workflow: if the cached file was
         # produced with alignscore disabled but this run has alignscore
         # on, the cached result is stale (supported=None everywhere).
@@ -541,15 +589,21 @@ def process_survey(
     t0 = time.time()
     per_tokens = TokenCounter()
 
-    # Stage checkpoint — resume mid-pipeline after a crash or env fix.
-    state_file    = checkpoint_dir / f"{survey_id}.json"
-    state         = _load_state(state_file)
-    skip_classify = state is not None and state["stage"] in {"classified", "aligned"}
-    skip_align    = state is not None and state["stage"] == "aligned"
-    if state is not None:
+    # Stage checkpoints — classification is shared across factuality variants;
+    # AlignScore remains variant-specific because it consumes evidence.
+    classification_state      = _load_state(classification_state_file)
+    align_state               = _load_state(align_state_file)
+    skip_align                = align_state is not None and align_state["stage"] == "aligned"
+    skip_classify             = skip_align or classification_state is not None
+    if classification_state is not None:
         logger.info(
-            "[RESUME] sid=%s — loaded state stage=%s (skip_classify=%s skip_align=%s)",
-            survey_id, state["stage"], skip_classify, skip_align,
+            "[RESUME] sid=%s — loaded classification state stage=%s",
+            survey_id, classification_state["stage"],
+        )
+    if align_state is not None:
+        logger.info(
+            "[RESUME] sid=%s — loaded align state stage=%s (skip_align=%s)",
+            survey_id, align_state["stage"], skip_align,
         )
 
     text     = gen.get("text", "")
@@ -693,7 +747,8 @@ def process_survey(
         if skip_classify:
             # Load categorized from checkpoint; tokens are NOT re-added to
             # global_tokens (they belong to the original run).
-            categorized = state["categorized"]   # type: ignore[index]
+            classify_source_state = align_state if skip_align else classification_state
+            categorized = classify_source_state["categorized"]   # type: ignore[index]
             classify_bar.update(classify_bar.total)
             logger.info(
                 "[RESUME] sid=%s — skipped classify, %d claims loaded",
@@ -732,9 +787,9 @@ def process_survey(
             categorized = [r for r in results if r is not None]
             # Persist classify output BEFORE running AlignScore — if align
             # then crashes, a re-run only repeats align, not the LLM calls.
-            _save_state(state_file, {
+            _save_state(classification_state_file, {
                 "stage":       "classified",
-                "categorized": categorized,
+                "categorized": _classification_cache_payload(categorized),
             })
 
         # DEBUG DUMP: category for the debug claim.
@@ -788,10 +843,10 @@ def process_survey(
             # from the checkpoint if they were saved there; otherwise
             # recompute from categorized (only ``n_scope_failed`` needs
             # claim_scopes, which is cheap enough to always hold).
-            n_no_evidence  = state.get("n_no_evidence", sum(     # type: ignore[union-attr]
+            n_no_evidence  = align_state.get("n_no_evidence", sum(     # type: ignore[union-attr]
                 1 for c in categorized if not c.get("evidence_refs")
             ))
-            n_scope_failed = state.get("n_scope_failed", sum(    # type: ignore[union-attr]
+            n_scope_failed = align_state.get("n_scope_failed", sum(    # type: ignore[union-attr]
                 1 for s in claim_scopes if s["resolution"] == "failed"
             ))
             align_bar.update(align_bar.total)
@@ -841,7 +896,7 @@ def process_survey(
             # Persist full align result before computing the summary: if we
             # crash between here and the final write, the next re-run picks
             # up here instead of repeating the alignscore pass.
-            _save_state(state_file, {
+            _save_state(align_state_file, {
                 "stage":          "aligned",
                 "categorized":    categorized,
                 "n_no_evidence":  n_no_evidence,
@@ -951,16 +1006,14 @@ def process_survey(
     with open(out_file, "w") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
-    # Survey fully complete — the checkpoint in tmp/ can be dropped. EXCEPT
-    # when alignscore is disabled: the final file carries supported=None
-    # across the board, so a future alignscore-enabled re-run would want to
-    # pick up classify from state rather than re-spending on LLM calls.
-    # Keep the state_file (still stage="classified") in that case.
+    # Survey fully complete — the variant-specific AlignScore checkpoint can
+    # be dropped. Keep the classification checkpoint: it is evidence-agnostic
+    # and lets another factuality variant reuse the LLM classification pass.
     if alignscore_enabled:
         try:
-            state_file.unlink(missing_ok=True)
+            align_state_file.unlink(missing_ok=True)
         except OSError as e:
-            logger.debug("could not remove state file %s: %s", state_file, e)
+            logger.debug("could not remove state file %s: %s", align_state_file, e)
 
     if alignscore_enabled:
         logger.info(
@@ -1106,22 +1159,21 @@ def main() -> None:
         logger.error("Generation dir not found: %s", gen_dir)
         sys.exit(1)
 
-    # Sources + checkpoint directories both follow the same
-    # <dataset>_<model> convention as gen_dir. Computed from CLI args
+    # Sources + checkpoint directories follow the same <dataset>_<model>
+    # convention as gen_dir. Computed from CLI args
     # (not gen["dataset_id"]/["model_id"] fields), because some
     # generators — e.g. the SurGE_reference converter — write a combined
     # "SurGE_reference" as model_id, which would double-prefix otherwise.
-    sources_dir    = gen_dir / "sources"
-    checkpoint_dir = _checkpoint_dir(cfg, args.dataset, args.model)
+    sources_dir = gen_dir / "sources"
+    classification_checkpoint_dir = _classification_checkpoint_dir(
+        cfg, args.dataset, args.model,
+    )
+    align_checkpoint_dir = _align_checkpoint_dir(cfg, args.dataset, args.model)
 
     # Output dir encodes the factcheck variant (scope × source × aggregation)
     # so comparing runs side-by-side doesn't require overwriting.
-    run_id  = f"{cfg['judge_id']}_{cfg['judge_comment']}"
-    variant = (
-        f"{cfg.get('claim_scope', 'section')}"
-        f"_{cfg.get('evidence_source', 'abstract')}"
-        f"_{cfg.get('evidence_aggregation', 'concat')}"
-    )
+    run_id  = _run_id(cfg)
+    variant = _variant_id(cfg)
     out_dir = (
         ROOT / "results" / "scores"
         / f"{args.dataset}_{args.model}_factuality_{run_id}_{variant}"
@@ -1178,7 +1230,7 @@ def main() -> None:
                 res = process_survey(
                     gen, claims_dir, out_dir, cfg,
                     client, alignscore_model, corpus_index,
-                    sources_dir, checkpoint_dir,
+                    sources_dir, classification_checkpoint_dir, align_checkpoint_dir,
                     global_tokens=global_tokens,
                     abstract_cache=abstract_cache,
                 )

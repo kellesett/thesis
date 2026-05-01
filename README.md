@@ -179,8 +179,10 @@ config'у `evidence_mode`:
   `/paper/batch` + waterfall arxiv/Crossref/OpenAlex). При отсутствии файла —
   явная `FileNotFoundError`.
 
-Stage-чекпоинты classify/align — в `tmp/factuality/<variant>/<sid>.json`,
-переживают рестарты (resume автоматический).
+Stage-чекпоинты переживают рестарты (resume автоматический). LLM-классификация
+лежит в `tmp/factuality/classify/<ds>_<mdl>_<judge>/<sid>.json` и шарится между
+вариантами evidence; AlignScore-чекпоинты остаются variant-specific:
+`tmp/factuality/align/<ds>_<mdl>_<judge>_<variant>/<sid>.json`.
 
 ### C. Экспертные качества письма — `metrics/expert/`
 
