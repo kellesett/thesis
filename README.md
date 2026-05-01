@@ -228,14 +228,13 @@ benchmark'а). Это **не наш** baseline, а метрический suite 
 Поддержанные сейчас (через `eval_list` в config):
 - `rouge_bleu` → `rouge_1`, `rouge_2`, `rouge_l`, `bleu`
 - `sh_recall` — soft heading recall (FlagEmbedding)
+- `relevance_paper` / `relevance_section` / `relevance_sentence` — NLI
+  relevance из оригинального SurGE (`cross-encoder/nli-deberta-v3-base`)
 - `structure_quality` — LLM-судья (0-5)
 - `logic` — LLM-судья (0-5)
 - `coverage` — overlap цитируемых статей с ground-truth survey'ём
 - `citation_count` / `corpus_match_rate` / `reference_self_cited` — наши
   citation-метрики поверх их пайплайна
-
-**Не подключены** из их статьи: три NLI-relevance метрики
-(`Paper/Section/Sentence Level`).
 
 ---
 

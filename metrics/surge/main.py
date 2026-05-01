@@ -18,6 +18,7 @@ import argparse
 import csv
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -29,6 +30,9 @@ import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 logger = logging.getLogger(__name__)
 
@@ -177,12 +181,6 @@ def main() -> None:
     dataset = load_dataset_cls(args.dataset, registry[args.dataset])
     print(f"Dataset  : {args.dataset} ({len(dataset)} surveys)")
 
-    # ── Load evaluator (initialised once for the whole run) ───────────────────
-    evaluator = load_evaluator(cfg["evaluator_id"], cfg, dataset)
-    print(f"Evaluator: surge | judge={cfg['judge_model']} ({cfg['judge_id']})")
-    print(f"Metrics  : {eval_list}")
-    print(f"Scores → {scores_dir}\n")
-
     # ── Load generations ──────────────────────────────────────────────────────
     gen_dir = ROOT / "results" / "generations" / f"{args.dataset}_{args.model}"
     if not gen_dir.exists():
@@ -201,6 +199,16 @@ def main() -> None:
         gen_files = [f for f in gen_files if f.stem.isdigit()]
     if not gen_files:
         raise SystemExit(f"No generation files (N.json) found in {gen_dir}")
+
+    # Give the evaluator the exact run set so relevance metrics can stream-load
+    # only the corpus abstracts needed for these generations.
+    cfg["_surge_generation_files"] = [str(p) for p in gen_files]
+
+    # ── Load evaluator (initialised once for the whole run) ───────────────────
+    evaluator = load_evaluator(cfg["evaluator_id"], cfg, dataset)
+    print(f"Evaluator: surge | judge={cfg['judge_model']} ({cfg['judge_id']})")
+    print(f"Metrics  : {eval_list}")
+    print(f"Scores → {scores_dir}\n")
 
     print(f"Evaluating {len(gen_files)} file(s), metrics: {eval_list}\n")
 

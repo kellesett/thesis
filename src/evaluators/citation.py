@@ -187,6 +187,10 @@ class CitationEvaluator:
             results.append(self._index.get(key))
         return results
 
+    def match_references(self, references: list[dict]) -> list[int | None]:
+        """Public wrapper for callers that need the same title→doc_id mapping."""
+        return self._match_references(references)
+
     def evaluate(
         self,
         generation: dict,

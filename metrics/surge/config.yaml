@@ -1,7 +1,8 @@
 evaluator_id: surge
-eval_list: [rouge_bleu, sh_recall, structure_quality, logic, citation_count, corpus_match_rate, coverage, reference_self_cited]
+eval_list: [rouge_bleu, sh_recall, relevance_paper, relevance_section, relevance_sentence, structure_quality, logic, citation_count, corpus_match_rate, coverage, reference_self_cited]
 # Original SurGE subset currently wired here:
-#   rouge_bleu, sh_recall, structure_quality, coverage, logic
+#   rouge_bleu, sh_recall, relevance_paper, relevance_section,
+#   relevance_sentence, structure_quality, coverage, logic
 # Plus local citation diagnostics:
 #   citation_count, corpus_match_rate, reference_self_cited
 
@@ -14,5 +15,9 @@ judge_comment: run1                    # свободный комментари
 
 # Embedding-модель для SH-Recall (игнорируется если sh_recall не в eval_list)
 embedding_model: BAAI/bge-large-en-v1.5
+
+# NLI-модель для relevance_* метрик из оригинального SurGE
+nli_model: cross-encoder/nli-deberta-v3-base
+# nli_device: cuda
 
 resume: true                           # пропускать уже оценённые генерации
