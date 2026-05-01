@@ -12,6 +12,7 @@ results/
 eval_results/
 models_cache/
 tmp*/
+*tar.gz
 
 # Репозитории (клонируются вручную)
 repos/
@@ -36,6 +37,7 @@ CLAUDE.md
 CLAUDE_old.md
 TODO.md
 HANDOFF.md
+AGENTS.md
 
 # notebooks
 tmp.ipynb

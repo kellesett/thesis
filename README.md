@@ -96,7 +96,6 @@ thesis/
   "id":         "0",
   "dataset_id": "SurGE",
   "model_id":   "perplexity_dr",
-  "topic":      "Graph Neural Networks",
   "query":      "...",
   "text":       "## Introduction [1]\n...",
   "success":    true,
@@ -333,9 +332,10 @@ make evaluate METRIC=structural  DATASET=SurGE MODEL=perplexity_dr DOCKER=0
 
 Логи, чекпоинты и кэши пишутся ровно в те же относительные пути, что и в
 docker-режиме (`results/`, `tmp/`, `models_cache/`, `datasets/...`).
-factuality умеет автоматически выбирать корень для stage-чекпоинтов:
-`/tmp/factuality/` в контейнере (через volume mount) и `tmp/factuality/`
-относительно репо на bare-metal.
+Корень для stage-чекпоинтов factuality задаётся переменной окружения
+`FACTUALITY_CHECKPOINT_ROOT`: Makefile в `DOCKER=1` пробрасывает
+`/tmp/factuality` (через volume mount), в `DOCKER=0` переменная не
+задаётся и используется дефолт — `tmp/factuality/` относительно репо.
 
 ---
 
@@ -356,9 +356,13 @@ make generate MODEL=surveyforge   DATASET=SurGE GPU=1
 make convert-autosurvey           DATASET=SurGE
 ```
 
-Результаты — в `results/generations/<DATASET>_<MODEL>/<sid>.json`. Сколько
-обзоров обсчитать — настройка `n_surveys` в `models/<name>/config.yaml`
-(дефолт мал, для полного прогона ставь больше).
+Результаты — в `results/generations/<DATASET>_<MODEL>/<sid>.json`. Без
+`LIMIT` обрабатываются все обзоры датасета. Чтобы ограничить — `LIMIT=N`
+(id-based, инклюзивно: только обзоры с `int(sid) <= N`):
+
+```bash
+make generate MODEL=perplexity_dr DATASET=SurGE LIMIT=10
+```
 
 Resume автоматический: повторный запуск пропускает survey'и, у которых уже
 есть `<sid>.json` с `success=true` и непустым `text`.
@@ -551,14 +555,16 @@ make viewer
 Все модели наследуются от `src/models/base.py`:
 
 ```python
+from pathlib import Path
+from src.datasets.base import DatasetInstance
 from src.models.base import BaseModel
 
 class MyModel(BaseModel):
     def __init__(self):
         super().__init__(Path(__file__).parent)   # читает config.yaml
 
-    def generate(self, instance: dict) -> dict:
-        # instance: {"id": ..., "topic": ..., "references": [...]}
+    def generate(self, instance: DatasetInstance) -> dict:
+        # доступно: instance.id, instance.query, instance.reference, instance.meta
         ...
         return {
             "text":    survey_text,
@@ -569,9 +575,10 @@ class MyModel(BaseModel):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="SurGE")
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
-    MyModel().run(args.dataset)
+    MyModel().run(args.dataset, limit=args.limit)
 ```
 
 `BaseModel.run()` обрабатывает датасет, сохраняет результаты и поддерживает `resume`.
