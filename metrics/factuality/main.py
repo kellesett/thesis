@@ -340,6 +340,14 @@ def _score_alignscore_pairs(
     return scores
 
 
+def _set_topk_bar_postfix(bar, chunks_to_align: int, abstract_skipped: int) -> None:
+    if bar is not None:
+        bar.set_postfix_str(
+            f"chunks={chunks_to_align}  abs-skip={abstract_skipped}",
+            refresh=False,
+        )
+
+
 def _alignscore_style_chunks(text: str, chunk_words: int) -> list[str]:
     """Split text into ~AlignScore-sized chunks (sentence groups, ~350 words)."""
     from nltk.tokenize import sent_tokenize
@@ -467,6 +475,9 @@ def _alignscore_per_ref_fulltext_topk(
     abstract_meta: list[dict] = []
     fallback_pairs: list[dict] = []
     extra_fallback_scores = 0
+    abstract_skipped = 0
+    chunks_to_align = 0
+    _set_topk_bar_postfix(bar, chunks_to_align, abstract_skipped)
 
     for claim_i, evs in enumerate(per_claim_evidence):
         records: list[dict] = []
@@ -512,6 +523,8 @@ def _alignscore_per_ref_fulltext_topk(
                 if not full_text or abs_score >= abstract_skip_threshold:
                     rec["score"] = abs_score
                     rec["evidence_source"] = "abstract"
+                    if full_text:
+                        abstract_skipped += 1
                     continue
                 rec["score"] = abs_score
                 rec["evidence_source"] = "abstract"
@@ -526,6 +539,7 @@ def _alignscore_per_ref_fulltext_topk(
                     "total_chunk_count": 0,
                 })
 
+    _set_topk_bar_postfix(bar, chunks_to_align, abstract_skipped)
     if bar is not None and extra_fallback_scores:
         bar.total = (bar.total or 0) + extra_fallback_scores
         bar.refresh()
@@ -553,6 +567,9 @@ def _alignscore_per_ref_fulltext_topk(
         fallback_meta.append(pair)
         fallback_claims.append(categorized[pair["claim_i"]]["claim"])
         fallback_premises.append("\n\n\n".join(premise_parts))
+
+    chunks_to_align = sum(pair.get("selected_chunk_count", 0) for pair in fallback_meta)
+    _set_topk_bar_postfix(bar, chunks_to_align, abstract_skipped)
 
     if bar is not None:
         skipped_fallback = len(fallback_pairs) - len(fallback_meta)
@@ -640,6 +657,9 @@ def _alignscore_concat_fulltext_topk(
     abstract_premises: list[str] = []
     abstract_meta: list[tuple[int, list[dict]]] = []
     no_evidence = 0
+    abstract_skipped = 0
+    chunks_to_align = 0
+    _set_topk_bar_postfix(bar, chunks_to_align, abstract_skipped)
 
     for claim_i, evs in enumerate(per_claim_evidence):
         abstract_refs = [(ref, abstract) for ref, abstract, _ in evs if abstract]
@@ -677,6 +697,8 @@ def _alignscore_concat_fulltext_topk(
         abs_score = abstract_score_by_claim.get(claim_i)
         has_full_text = any(full_text for _, _, full_text in evs)
         if abs_score is not None and (not has_full_text or abs_score >= abstract_skip_threshold):
+            if has_full_text:
+                abstract_skipped += 1
             categorized[claim_i]["supported"]     = bool(abs_score >= threshold)
             categorized[claim_i]["alignscore"]    = round(float(abs_score), 4)
             categorized[claim_i]["evidence_refs"] = [
@@ -702,6 +724,7 @@ def _alignscore_concat_fulltext_topk(
             })
             fallback_claims.add(claim_i)
 
+    _set_topk_bar_postfix(bar, chunks_to_align, abstract_skipped)
     extra_fallback_scores = sum(
         1 for claim_i in fallback_claims
         if claim_i in abstract_score_by_claim
@@ -725,6 +748,13 @@ def _alignscore_concat_fulltext_topk(
         if not selected_full_text:
             continue
         fallback_by_claim.setdefault(pair["claim_i"], []).append((pair, selected_full_text))
+
+    chunks_to_align = sum(
+        pair.get("selected_chunk_count", 0)
+        for pairs in fallback_by_claim.values()
+        for pair, _ in pairs
+    )
+    _set_topk_bar_postfix(bar, chunks_to_align, abstract_skipped)
 
     fallback_claim_indices = sorted(fallback_by_claim)
     fallback_premises: list[str] = []
