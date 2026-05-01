@@ -63,6 +63,7 @@ from metrics.factuality.evidence_fetcher import (
     fetch_evidence, load_abstract_cache, save_abstract_cache,
     prepare_key_evidence,
 )
+from metrics.factuality.sources_io import load_gen_sources
 
 
 # ── Corpus loading ────────────────────────────────────────────────────────────
@@ -321,6 +322,478 @@ def _alignscore_per_ref(
         }
 
 
+def _score_alignscore_pairs(
+    premises: list[str],
+    claims: list[str],
+    alignscore_model,
+    bar = None,
+) -> list[float]:
+    """Score premise/claim pairs with chunked calls for visible progress."""
+    scores: list[float] = []
+    for start in range(0, len(premises), _ALIGN_CHUNK_SIZE):
+        chunk_p = premises[start:start + _ALIGN_CHUNK_SIZE]
+        chunk_c = claims[start:start + _ALIGN_CHUNK_SIZE]
+        chunk_scores = alignscore_model.score(contexts=chunk_p, claims=chunk_c)
+        scores.extend(float(s) for s in chunk_scores)
+        if bar is not None:
+            bar.update(len(chunk_c))
+    return scores
+
+
+def _alignscore_style_chunks(text: str, chunk_words: int) -> list[str]:
+    """Split text into ~AlignScore-sized chunks (sentence groups, ~350 words)."""
+    from nltk.tokenize import sent_tokenize
+
+    sents = sent_tokenize(text)
+    sents = sents or [""]
+    n_chunk = len(text.strip().split()) // max(chunk_words, 1) + 1
+    n_chunk = max(len(sents) // n_chunk, 1)
+    chunks: list[str] = []
+    for i in range(0, len(sents), n_chunk):
+        chunk = " ".join(sents[i:i + n_chunk]).strip()
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def _load_chunk_embedder(cfg: dict):
+    """Load the semantic embedder used for cheap full-text chunk preselection."""
+    from sentence_transformers import SentenceTransformer
+
+    model_name = str(cfg.get("full_text_chunk_embedder") or "datasets/gte-large-en-v1.5")
+    model_path = Path(model_name)
+    if not model_path.is_absolute() and (ROOT / model_path).exists():
+        model_name = str(ROOT / model_path)
+    device = cfg.get("full_text_chunk_embedder_device", "cpu")
+    logger.info("Loading full-text chunk embedder: %s (device=%s)", model_name, device)
+    try:
+        return SentenceTransformer(model_name, device=device, trust_remote_code=True)
+    except TypeError:
+        return SentenceTransformer(model_name, device=device)
+
+
+def _select_top_chunks_by_similarity(
+    *,
+    categorized: list[dict],
+    fallback_pairs: list[dict],
+    chunk_embedder,
+    top_k: int,
+    chunk_words: int,
+    batch_size: int,
+) -> dict[int, str]:
+    """Return selected full-text premises keyed by fallback-pair index."""
+    import numpy as np
+
+    ref_chunks: dict[str, list[str]] = {}
+    for pair in fallback_pairs:
+        key = pair["ref_key"]
+        if key not in ref_chunks:
+            ref_chunks[key] = _alignscore_style_chunks(pair["full_text"], chunk_words)
+
+    flat_chunks: list[str] = []
+    chunk_ranges: dict[str, tuple[int, int]] = {}
+    for key, chunks in ref_chunks.items():
+        start = len(flat_chunks)
+        flat_chunks.extend(chunks)
+        chunk_ranges[key] = (start, len(flat_chunks))
+
+    if not flat_chunks:
+        return {}
+
+    chunk_emb = chunk_embedder.encode(
+        flat_chunks,
+        batch_size=batch_size,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+
+    claim_indices = sorted({pair["claim_i"] for pair in fallback_pairs})
+    claim_texts = [categorized[i]["claim"] for i in claim_indices]
+    claim_emb = chunk_embedder.encode(
+        claim_texts,
+        batch_size=batch_size,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+    claim_vec_by_i = {
+        claim_i: claim_emb[pos]
+        for pos, claim_i in enumerate(claim_indices)
+    }
+
+    selected: dict[int, str] = {}
+    for pair_i, pair in enumerate(fallback_pairs):
+        start, end = chunk_ranges[pair["ref_key"]]
+        if start == end:
+            continue
+        chunks = ref_chunks[pair["ref_key"]]
+        scores = np.asarray(chunk_emb[start:end]) @ np.asarray(claim_vec_by_i[pair["claim_i"]])
+        k = min(top_k, len(chunks))
+        if k <= 0:
+            continue
+        best = np.argsort(scores)[-k:][::-1]
+        # Restore document order after selecting by similarity; AlignScore then
+        # sees a coherent local evidence slice rather than score-sorted scraps.
+        best_doc_order = sorted(int(i) for i in best)
+        selected[pair_i] = "\n\n".join(chunks[i] for i in best_doc_order)
+        pair["selected_chunk_count"] = len(best_doc_order)
+        pair["total_chunk_count"] = len(chunks)
+    return selected
+
+
+def _alignscore_per_ref_fulltext_topk(
+    categorized: list[dict],
+    per_claim_evidence: list[list[tuple[dict, str | None, str | None]]],
+    alignscore_model,
+    threshold: float,
+    abstract_skip_threshold: float,
+    top_k: int,
+    chunk_words: int,
+    chunk_embedder,
+    embed_batch_size: int,
+    bar = None,
+) -> None:
+    """Per-ref AlignScore with abstract cascade and top-k full-text chunks.
+
+    For each (claim, ref) pair, first score the abstract when available. If
+    that score is high enough, keep it and skip full text. Otherwise select
+    top-k full-text chunks by semantic similarity to the claim and score only
+    those chunks. Final per-ref score is max(abstract_score, selected_text_score).
+    """
+    records_by_claim: list[list[dict]] = []
+    abstract_claims: list[str] = []
+    abstract_premises: list[str] = []
+    abstract_meta: list[dict] = []
+    fallback_pairs: list[dict] = []
+    extra_fallback_scores = 0
+
+    for claim_i, evs in enumerate(per_claim_evidence):
+        records: list[dict] = []
+        for ref, abstract, full_text in evs:
+            rec = {
+                "ref": ref,
+                "ref_key": _evidence_key(ref),
+                "abstract_score": None,
+                "full_text_score": None,
+                "score": None,
+                "selected_chunk_count": 0,
+                "total_chunk_count": 0,
+                "evidence_source": None,
+            }
+            records.append(rec)
+            if abstract:
+                abstract_meta.append(rec)
+                abstract_claims.append(categorized[claim_i]["claim"])
+                abstract_premises.append(abstract)
+            elif full_text:
+                fallback_pairs.append({
+                    "claim_i": claim_i,
+                    "record": rec,
+                    "ref_key": rec["ref_key"],
+                    "abstract": abstract,
+                    "full_text": full_text,
+                    "selected_chunk_count": 0,
+                    "total_chunk_count": 0,
+                })
+        records_by_claim.append(records)
+
+    abstract_scores = _score_alignscore_pairs(
+        abstract_premises, abstract_claims, alignscore_model, bar=bar,
+    )
+    for rec, score in zip(abstract_meta, abstract_scores):
+        rec["abstract_score"] = score
+
+    # Decide which abstract-scored pairs still need selected full text.
+    for claim_i, evs in enumerate(per_claim_evidence):
+        for rec, (_, abstract, full_text) in zip(records_by_claim[claim_i], evs):
+            abs_score = rec["abstract_score"]
+            if abs_score is not None:
+                if not full_text or abs_score >= abstract_skip_threshold:
+                    rec["score"] = abs_score
+                    rec["evidence_source"] = "abstract"
+                    continue
+                rec["score"] = abs_score
+                rec["evidence_source"] = "abstract"
+                extra_fallback_scores += 1
+                fallback_pairs.append({
+                    "claim_i": claim_i,
+                    "record": rec,
+                    "ref_key": rec["ref_key"],
+                    "abstract": abstract,
+                    "full_text": full_text,
+                    "selected_chunk_count": 0,
+                    "total_chunk_count": 0,
+                })
+
+    if bar is not None and extra_fallback_scores:
+        bar.total = (bar.total or 0) + extra_fallback_scores
+        bar.refresh()
+
+    selected = _select_top_chunks_by_similarity(
+        categorized=categorized,
+        fallback_pairs=fallback_pairs,
+        chunk_embedder=chunk_embedder,
+        top_k=top_k,
+        chunk_words=chunk_words,
+        batch_size=embed_batch_size,
+    ) if fallback_pairs else {}
+
+    fallback_claims: list[str] = []
+    fallback_premises: list[str] = []
+    fallback_meta: list[dict] = []
+    for pair_i, pair in enumerate(fallback_pairs):
+        selected_full_text = selected.get(pair_i)
+        if not selected_full_text:
+            continue
+        premise_parts = []
+        if pair.get("abstract"):
+            premise_parts.append(f"Abstract:\n{pair['abstract']}")
+        premise_parts.append(f"Full text:\n{selected_full_text}")
+        fallback_meta.append(pair)
+        fallback_claims.append(categorized[pair["claim_i"]]["claim"])
+        fallback_premises.append("\n\n\n".join(premise_parts))
+
+    if bar is not None:
+        skipped_fallback = len(fallback_pairs) - len(fallback_meta)
+        if skipped_fallback:
+            bar.update(skipped_fallback)
+
+    fallback_scores = _score_alignscore_pairs(
+        fallback_premises, fallback_claims, alignscore_model, bar=bar,
+    )
+    for pair, score in zip(fallback_meta, fallback_scores):
+        rec = pair["record"]
+        rec["full_text_score"] = score
+        rec["selected_chunk_count"] = pair.get("selected_chunk_count", 0)
+        rec["total_chunk_count"] = pair.get("total_chunk_count", 0)
+        if rec["abstract_score"] is None or score > rec["abstract_score"]:
+            rec["score"] = score
+            rec["evidence_source"] = (
+                "full_text_or_abstract_top_k"
+                if pair.get("abstract") else "full_text_top_k"
+            )
+        else:
+            rec["score"] = rec["abstract_score"]
+            rec["evidence_source"] = "abstract"
+
+    for claim_i, records in enumerate(records_by_claim):
+        scored = [rec for rec in records if rec["score"] is not None]
+        if not scored:
+            categorized[claim_i]["supported"]          = None
+            categorized[claim_i]["alignscore"]         = None
+            categorized[claim_i]["evidence_refs"]      = []
+            categorized[claim_i]["alignscore_per_ref"] = []
+            categorized[claim_i]["alignscore_best"]    = None
+            continue
+
+        best = max(scored, key=lambda rec: rec["score"])
+        categorized[claim_i]["supported"]     = bool(best["score"] >= threshold)
+        categorized[claim_i]["alignscore"]    = round(float(best["score"]), 4)
+        categorized[claim_i]["evidence_refs"] = [rec["ref"]["idx"] for rec in scored]
+        categorized[claim_i]["alignscore_per_ref"] = [
+            {
+                "ref_idx": rec["ref"]["idx"],
+                "score": round(float(rec["score"]), 4),
+                "abstract_score": (
+                    round(float(rec["abstract_score"]), 4)
+                    if rec["abstract_score"] is not None else None
+                ),
+                "full_text_score": (
+                    round(float(rec["full_text_score"]), 4)
+                    if rec["full_text_score"] is not None else None
+                ),
+                "evidence_source": rec["evidence_source"],
+                "selected_chunk_count": rec["selected_chunk_count"],
+                "total_chunk_count": rec["total_chunk_count"],
+            }
+            for rec in scored
+        ]
+        categorized[claim_i]["alignscore_best"] = {
+            "ref_idx": best["ref"]["idx"],
+            "score": round(float(best["score"]), 4),
+            "evidence_source": best["evidence_source"],
+        }
+
+
+def _alignscore_concat_fulltext_topk(
+    categorized: list[dict],
+    per_claim_evidence: list[list[tuple[dict, str | None, str | None]]],
+    alignscore_model,
+    threshold: float,
+    abstract_skip_threshold: float,
+    top_k: int,
+    chunk_words: int,
+    chunk_embedder,
+    embed_batch_size: int,
+    bar = None,
+) -> None:
+    """Concat AlignScore with top-k full-text chunks selected per claim+ref.
+
+    Abstracts, when present, are scored as a cheap claim-level cascade. If the
+    concatenated abstracts already clear ``abstract_skip_threshold``, full
+    texts are skipped for that claim. Otherwise every full-text ref contributes
+    up to ``top_k`` semantically nearest AlignScore-style chunks, and those
+    selected slices are concatenated into one claim-level premise.
+    """
+    abstract_claims: list[str] = []
+    abstract_premises: list[str] = []
+    abstract_meta: list[tuple[int, list[dict]]] = []
+    no_evidence = 0
+
+    for claim_i, evs in enumerate(per_claim_evidence):
+        abstract_refs = [(ref, abstract) for ref, abstract, _ in evs if abstract]
+        if abstract_refs:
+            abstract_meta.append((claim_i, [ref for ref, _ in abstract_refs]))
+            abstract_claims.append(categorized[claim_i]["claim"])
+            abstract_premises.append(
+                "\n\n\n".join(f"Abstract:\n{abstract}" for _, abstract in abstract_refs)
+            )
+        elif not any(full_text for _, _, full_text in evs):
+            categorized[claim_i]["supported"]     = None
+            categorized[claim_i]["alignscore"]    = None
+            categorized[claim_i]["evidence_refs"] = []
+            categorized[claim_i]["alignscore_topk_refs"] = []
+            no_evidence += 1
+
+    if bar is not None and no_evidence:
+        bar.update(no_evidence)
+
+    abstract_scores = _score_alignscore_pairs(
+        abstract_premises, abstract_claims, alignscore_model, bar=bar,
+    )
+
+    abstract_score_by_claim: dict[int, float] = {}
+    abstract_refs_by_claim: dict[int, list[dict]] = {}
+    for (claim_i, refs), score in zip(abstract_meta, abstract_scores):
+        abstract_score_by_claim[claim_i] = score
+        abstract_refs_by_claim[claim_i] = refs
+
+    fallback_pairs: list[dict] = []
+    fallback_claims: set[int] = set()
+    for claim_i, evs in enumerate(per_claim_evidence):
+        if not evs:
+            continue
+        abs_score = abstract_score_by_claim.get(claim_i)
+        has_full_text = any(full_text for _, _, full_text in evs)
+        if abs_score is not None and (not has_full_text or abs_score >= abstract_skip_threshold):
+            categorized[claim_i]["supported"]     = bool(abs_score >= threshold)
+            categorized[claim_i]["alignscore"]    = round(float(abs_score), 4)
+            categorized[claim_i]["evidence_refs"] = [
+                ref["idx"] for ref in abstract_refs_by_claim.get(claim_i, [])
+            ]
+            categorized[claim_i]["alignscore_topk_refs"] = []
+            categorized[claim_i]["alignscore_best"] = {
+                "score": round(float(abs_score), 4),
+                "evidence_source": "abstract",
+            }
+            continue
+        for ref, abstract, full_text in evs:
+            if not full_text:
+                continue
+            fallback_pairs.append({
+                "claim_i": claim_i,
+                "ref": ref,
+                "ref_key": _evidence_key(ref),
+                "abstract": abstract,
+                "full_text": full_text,
+                "selected_chunk_count": 0,
+                "total_chunk_count": 0,
+            })
+            fallback_claims.add(claim_i)
+
+    extra_fallback_scores = sum(
+        1 for claim_i in fallback_claims
+        if claim_i in abstract_score_by_claim
+    )
+    if bar is not None and extra_fallback_scores:
+        bar.total = (bar.total or 0) + extra_fallback_scores
+        bar.refresh()
+
+    selected = _select_top_chunks_by_similarity(
+        categorized=categorized,
+        fallback_pairs=fallback_pairs,
+        chunk_embedder=chunk_embedder,
+        top_k=top_k,
+        chunk_words=chunk_words,
+        batch_size=embed_batch_size,
+    ) if fallback_pairs else {}
+
+    fallback_by_claim: dict[int, list[tuple[dict, str]]] = {}
+    for pair_i, pair in enumerate(fallback_pairs):
+        selected_full_text = selected.get(pair_i)
+        if not selected_full_text:
+            continue
+        fallback_by_claim.setdefault(pair["claim_i"], []).append((pair, selected_full_text))
+
+    fallback_claim_indices = sorted(fallback_by_claim)
+    fallback_premises: list[str] = []
+    fallback_claim_texts: list[str] = []
+    for claim_i in fallback_claim_indices:
+        parts: list[str] = []
+        seen_abstract_refs: set[str] = set()
+        for ref, abstract, _ in per_claim_evidence[claim_i]:
+            if not abstract:
+                continue
+            key = _evidence_key(ref)
+            if key in seen_abstract_refs:
+                continue
+            seen_abstract_refs.add(key)
+            parts.append(f"Abstract:\n{abstract}")
+        for pair, selected_full_text in fallback_by_claim[claim_i]:
+            parts.append(f"Full text:\n{selected_full_text}")
+        fallback_premises.append("\n\n\n".join(parts))
+        fallback_claim_texts.append(categorized[claim_i]["claim"])
+
+    skipped_fallback_claims = len(fallback_claims) - len(fallback_claim_indices)
+    if bar is not None and skipped_fallback_claims:
+        bar.update(skipped_fallback_claims)
+
+    fallback_scores = _score_alignscore_pairs(
+        fallback_premises, fallback_claim_texts, alignscore_model, bar=bar,
+    )
+    fallback_score_by_claim = dict(zip(fallback_claim_indices, fallback_scores))
+
+    for claim_i, evs in enumerate(per_claim_evidence):
+        if not evs:
+            continue
+        abs_score = abstract_score_by_claim.get(claim_i)
+        fallback_score = fallback_score_by_claim.get(claim_i)
+        if abs_score is None and fallback_score is None:
+            continue
+        if fallback_score is not None and (abs_score is None or fallback_score > abs_score):
+            score = fallback_score
+            evidence_source = "full_text_or_abstract_top_k" if abs_score is not None else "full_text_top_k"
+        else:
+            score = abs_score
+            evidence_source = "abstract"
+
+        topk_pairs = fallback_by_claim.get(claim_i, [])
+        evidence_ref_ids = {ref["idx"] for ref, abstract, full_text in evs if abstract or full_text}
+        categorized[claim_i]["supported"]     = bool(score >= threshold)
+        categorized[claim_i]["alignscore"]    = round(float(score), 4)
+        categorized[claim_i]["evidence_refs"] = sorted(evidence_ref_ids)
+        categorized[claim_i]["alignscore_topk_refs"] = [
+            {
+                "ref_idx": pair["ref"]["idx"],
+                "selected_chunk_count": pair.get("selected_chunk_count", 0),
+                "total_chunk_count": pair.get("total_chunk_count", 0),
+            }
+            for pair, _ in topk_pairs
+        ]
+        categorized[claim_i]["alignscore_best"] = {
+            "score": round(float(score), 4),
+            "abstract_score": (
+                round(float(abs_score), 4) if abs_score is not None else None
+            ),
+            "full_text_score": (
+                round(float(fallback_score), 4)
+                if fallback_score is not None else None
+            ),
+            "evidence_source": evidence_source,
+        }
+
+
 # ── Per-survey processing ─────────────────────────────────────────────────────
 
 
@@ -385,12 +858,28 @@ def _run_id(cfg: dict) -> str:
     return f"{cfg['judge_id']}_{cfg['judge_comment']}"
 
 
-def _variant_id(cfg: dict) -> str:
+def _full_text_topk_enabled(cfg: dict) -> bool:
     return (
+        cfg.get("evidence_source", "abstract") in {"full_text", "full_text_or_abstract"}
+        and cfg.get("evidence_aggregation", "concat") in {"concat", "per_ref"}
+        and int(cfg.get("full_text_top_k_chunks", 0) or 0) > 0
+    )
+
+
+def _variant_id(cfg: dict) -> str:
+    variant = (
         f"{cfg.get('claim_scope', 'section')}"
         f"_{cfg.get('evidence_source', 'abstract')}"
         f"_{cfg.get('evidence_aggregation', 'concat')}"
     )
+    if _full_text_topk_enabled(cfg):
+        top_k = int(cfg.get("full_text_top_k_chunks", 0))
+        variant += f"_topk{top_k}"
+        if cfg.get("evidence_source", "abstract") == "full_text_or_abstract":
+            threshold = float(cfg.get("full_text_abstract_skip_threshold", 0.75))
+            threshold_tag = str(threshold).replace(".", "")
+            variant += f"_abs{threshold_tag}"
+    return variant
 
 
 def _classification_checkpoint_dir(cfg: dict, dataset_id: str, model_id: str) -> Path:
@@ -438,6 +927,7 @@ _CLASSIFICATION_CACHE_DROP_KEYS = {
     "alignscore_per_ref",
     "alignscore_best",
     "evidence_refs",
+    "alignscore_topk_refs",
     "scope_resolution",
     "n_sources_resolved",
     "n_sources_total",
@@ -474,6 +964,7 @@ def process_survey(
     sources_dir: Path,
     classification_checkpoint_dir: Path,
     align_checkpoint_dir: Path,
+    chunk_embedder = None,
     *,
     global_tokens: TokenCounter | None = None,
     abstract_cache: dict | None = None,
@@ -575,11 +1066,22 @@ def process_survey(
     evidence_source    = cfg.get("evidence_source", "abstract")
     evidence_aggregation = cfg.get("evidence_aggregation", "concat")
     alignscore_threshold = cfg.get("alignscore_threshold", 0.5)
+    full_text_top_k_chunks = int(cfg.get("full_text_top_k_chunks", 0) or 0)
+    full_text_chunk_words = int(cfg.get("full_text_chunk_words", 350) or 350)
+    full_text_abstract_skip_threshold = float(
+        cfg.get("full_text_abstract_skip_threshold", 0.75)
+    )
+    full_text_chunk_embedder_batch_size = int(
+        cfg.get("full_text_chunk_embedder_batch_size", 32) or 32
+    )
     ss_api_key         = os.environ.get(cfg.get("ss_api_key_env", "SEMANTIC_SCHOLAR_API_KEY"))
     ss_enabled         = bool(cfg.get("ss_enabled", False))
     evidence_mode      = cfg.get("evidence_mode", "internal")
-
+    use_full_text_topk = _full_text_topk_enabled(cfg)
     alignscore_enabled = alignscore_model is not None
+    if alignscore_enabled and use_full_text_topk and chunk_embedder is None:
+        raise RuntimeError("full_text_top_k_chunks > 0 requires a loaded chunk embedder")
+
     logger.info(
         "[PROC] sid=%s | %s | %d claims | scope=%s src=%s agg=%s alignscore=%s",
         survey_id, gen.get("query", "")[:50], len(claims),
@@ -722,6 +1224,7 @@ def process_survey(
     )
 
     key_to_evidence: dict[str, tuple[str | None, str]] = {}
+    raw_key_to_evidence: dict[str, tuple[str | None, str | None]] = {}
     try:
         # Classification context — the local survey prose around the claim
         # (first resolved source's paragraph span from `resolve_claim_scope`).
@@ -818,6 +1321,18 @@ def process_survey(
                 ss_enabled=ss_enabled,
                 progress_bar=fetch_bar,
             )
+            if use_full_text_topk:
+                sources = load_gen_sources(sources_dir, survey_id)
+                if sources is None:
+                    sources_path = sources_dir / f"{survey_id}_sources.json"
+                    raise FileNotFoundError(
+                        f"sources file disappeared while preparing top-k evidence: "
+                        f"{sources_path}"
+                    )
+                raw_key_to_evidence = {
+                    _evidence_key(entry): (entry.get("abstract"), entry.get("text"))
+                    for entry in sources.get("refs", {}).values()
+                }
         else:
             # AlignScore off / no refs / align already done — sweep the bar
             # to completion so the display stays honest.
@@ -855,20 +1370,69 @@ def process_survey(
             n_no_evidence  = 0
             n_scope_failed = 0
             per_claim_evidence: list[list[tuple[dict, str]]] = []
+            per_claim_raw_evidence: list[list[tuple[dict, str | None, str | None]]] = []
             for i in range(len(categorized)):
                 refs_i = _scope_refs_for(claim_scopes[i])
-                evs = [
-                    (r, key_to_evidence.get(_evidence_key(r), (None, None))[0])
-                    for r in refs_i
-                ]
-                evs = [(r, t) for r, t in evs if t]   # drop misses
-                per_claim_evidence.append(evs)
-                if not evs:
-                    n_no_evidence += 1
+                if use_full_text_topk:
+                    raw_evs = []
+                    for r in refs_i:
+                        abstract, full_text = raw_key_to_evidence.get(
+                            _evidence_key(r), (None, None)
+                        )
+                        if evidence_source == "full_text":
+                            abstract = None
+                        raw_evs.append((r, abstract, full_text))
+                    raw_evs = [
+                        (r, abstract, full_text)
+                        for r, abstract, full_text in raw_evs
+                        if (full_text if evidence_source == "full_text" else abstract or full_text)
+                    ]
+                    per_claim_raw_evidence.append(raw_evs)
+                    if not raw_evs:
+                        n_no_evidence += 1
+                else:
+                    evs = [
+                        (r, key_to_evidence.get(_evidence_key(r), (None, None))[0])
+                        for r in refs_i
+                    ]
+                    evs = [(r, t) for r, t in evs if t]   # drop misses
+                    per_claim_evidence.append(evs)
+                    if not evs:
+                        n_no_evidence += 1
                 if claim_scopes[i]["resolution"] == "failed":
                     n_scope_failed += 1
 
-            if evidence_aggregation == "concat":
+            if use_full_text_topk:
+                if evidence_aggregation == "concat":
+                    align_bar.reset(total=max(len(categorized), 1))
+                    align_bar.unit = "score"
+                    _alignscore_concat_fulltext_topk(
+                        categorized, per_claim_raw_evidence,
+                        alignscore_model, alignscore_threshold,
+                        full_text_abstract_skip_threshold,
+                        full_text_top_k_chunks,
+                        full_text_chunk_words,
+                        chunk_embedder,
+                        full_text_chunk_embedder_batch_size,
+                        bar=align_bar,
+                    )
+                elif evidence_aggregation == "per_ref":
+                    pair_count = sum(len(evs) for evs in per_claim_raw_evidence)
+                    align_bar.reset(total=max(pair_count, 1))
+                    align_bar.unit = "score"
+                    _alignscore_per_ref_fulltext_topk(
+                        categorized, per_claim_raw_evidence,
+                        alignscore_model, alignscore_threshold,
+                        full_text_abstract_skip_threshold,
+                        full_text_top_k_chunks,
+                        full_text_chunk_words,
+                        chunk_embedder,
+                        full_text_chunk_embedder_batch_size,
+                        bar=align_bar,
+                    )
+                else:
+                    raise ValueError(f"unknown evidence_aggregation: {evidence_aggregation!r}")
+            elif evidence_aggregation == "concat":
                 # Bar total already == len(claims), which equals the total
                 # updates concat mode will emit (one per scored claim + one
                 # per no-evidence claim at the end). No reset needed.
@@ -984,6 +1548,14 @@ def process_survey(
         "section_max_ancestor_depth":   max_ancestor_depth,
         "evidence_source":              evidence_source,
         "evidence_aggregation":         evidence_aggregation,
+        "full_text_top_k_chunks":       full_text_top_k_chunks if use_full_text_topk else None,
+        "full_text_chunk_words":        full_text_chunk_words if use_full_text_topk else None,
+        "full_text_abstract_skip_threshold": (
+            full_text_abstract_skip_threshold if use_full_text_topk else None
+        ),
+        "full_text_chunk_embedder": (
+            cfg.get("full_text_chunk_embedder") if use_full_text_topk else None
+        ),
         "alignscore_enabled":           alignscore_enabled,
         "alignscore_threshold":         alignscore_threshold,
         "cit_correct_overall":          cit_correct_overall,
@@ -1118,6 +1690,11 @@ def main() -> None:
 
     logger.info("[factuality] Loading models ...")
     alignscore_model = load_alignscore(cfg) if alignscore_enabled else None
+    chunk_embedder = (
+        _load_chunk_embedder(cfg)
+        if alignscore_enabled and _full_text_topk_enabled(cfg)
+        else None
+    )
     if not alignscore_enabled:
         logger.info("AlignScore disabled — running LLM categorization only")
     corpus_index = build_corpus_index(args.dataset)
@@ -1231,6 +1808,7 @@ def main() -> None:
                     gen, claims_dir, out_dir, cfg,
                     client, alignscore_model, corpus_index,
                     sources_dir, classification_checkpoint_dir, align_checkpoint_dir,
+                    chunk_embedder=chunk_embedder,
                     global_tokens=global_tokens,
                     abstract_cache=abstract_cache,
                 )

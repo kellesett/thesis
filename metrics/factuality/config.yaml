@@ -33,6 +33,19 @@ section_max_ancestor_depth: 1
 evidence_source:        full_text_or_abstract  # abstract | full_text | full_text_or_abstract
 evidence_aggregation:   per_ref      # concat (faster, no attribution) | per_ref (slower, keeps argmax)
 
+# ── full-text top-k optimization ─────────────────────────────────────────────
+# Включается для evidence_source=full_text/full_text_or_abstract в concat и
+# per_ref. evidence_source=abstract не меняется. Для каждой пары claim+ref из
+# full text берутся top-k AlignScore-style chunk'ов по semantic similarity.
+# В full_text_or_abstract дополнительно сначала скорится abstract; если score
+# >= skip_threshold, full text для этой пары/claim можно не трогать.
+full_text_top_k_chunks:              5      # 0 = отключить top-k и скорить весь evidence
+full_text_chunk_words:               350    # размер chunk'а как в AlignScore
+full_text_abstract_skip_threshold:   0.75   # abstract-score, при котором ref уже достаточно подтвержден
+full_text_chunk_embedder:            datasets/gte-large-en-v1.5
+full_text_chunk_embedder_device:     cpu    # cpu | cuda
+full_text_chunk_embedder_batch_size: 32
+
 # ── Fetch-цепочка evidence ───────────────────────────────────────────────────
 # full_text_or_abstract конкатенирует доступные abstract и full_text для ref.
 # В internal-режиме это означает, что factuality пытается собрать оба поля.
