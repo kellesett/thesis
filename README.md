@@ -162,7 +162,8 @@ Inline-цитаты в `text` — `[N]` (1-indexed, матчатся с `meta.re
 1. LLM-судья присваивает claim'у одну из категорий **A** (general/topical),
    **B** (methodology), **C** (quantitative), **D** (critical/comparative).
 2. AlignScore (RoBERTa-large) проверяет, поддерживается ли claim текстом
-   evidence (абстрактом цитируемой статьи).
+   evidence: abstract, full text или их конкатенацией
+   (`full_text_or_abstract`).
 3. `CitCorrect_k = |{a : φ(a)=k ∧ Support(a)=1}| / |{a : φ(a)=k}|`.
 
 **Зависимости:** требует `claimify` или `veriscore` — иначе падает с понятным

@@ -459,7 +459,7 @@ def process_survey(
         cfg: Config dict. Factcheck-specific knobs:
             ``claim_scope`` (paragraph|section),
             ``section_max_ancestor_depth`` (None=unlimited, 0=own-only),
-            ``evidence_source`` (abstract|full_text),
+            ``evidence_source`` (abstract|full_text|full_text_or_abstract),
             ``evidence_aggregation`` (concat|per_ref),
             ``alignscore_threshold`` (float, default 0.5).
         client: OpenAI client instance.
@@ -1025,8 +1025,12 @@ def main() -> None:
     # Factcheck knobs — override config.yaml at the CLI.
     parser.add_argument("--claim-scope", choices=("paragraph", "section"), default=None,
                         help="Override cfg.claim_scope.")
-    parser.add_argument("--evidence-source", choices=("abstract", "full_text"), default=None,
-                        help="Override cfg.evidence_source.")
+    parser.add_argument(
+        "--evidence-source",
+        choices=("abstract", "full_text", "full_text_or_abstract"),
+        default=None,
+        help="Override cfg.evidence_source.",
+    )
     parser.add_argument("--evidence-aggregation", choices=("concat", "per_ref"), default=None,
                         help="Override cfg.evidence_aggregation.")
     parser.add_argument("--max-ancestor-depth", type=int, default=None,
