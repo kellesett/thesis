@@ -2,12 +2,12 @@
 # Запускай из корня репозитория.
 # Предварительно: cp .env.example .env && заполни ключи
 
-.PHONY: help setup setup-sf base \
+.PHONY: help setup setup-sf setup-scisage base \
         generate evaluate validate \
         convert-autosurvey surge-reference \
         viewer enrich \
         download inspect models models-ping \
-        push-results pull-results \
+        push-results pull-results pull-new-results \
         sfdb sfdb-check sfmodel \
         download-metric-models clean
 
@@ -40,11 +40,12 @@ EXTRA_ARGS ?=
 # Remote sync over plain ssh+tar (useful when the server has no rsync).
 # SYNC_CONFLICT=overwrite — target files are overwritten.
 # SYNC_CONFLICT=fail      — extraction uses tar -k and fails on existing files.
+# SYNC_CONFLICT=skip      — pull only: keep existing local files, extract missing files.
 REMOTE ?= admin@188.44.57.13
 REMOTE_REPO ?= ~/dolgushevgleb/thesis
 SYNC_CONFLICT ?= overwrite
-ifneq ($(filter $(SYNC_CONFLICT),overwrite fail),$(SYNC_CONFLICT))
-$(error SYNC_CONFLICT must be overwrite or fail)
+ifneq ($(filter $(SYNC_CONFLICT),overwrite fail skip),$(SYNC_CONFLICT))
+$(error SYNC_CONFLICT must be overwrite, fail, or skip)
 endif
 TAR_EXTRACT_FLAGS = $(if $(filter fail,$(SYNC_CONFLICT)),-xzkf,-xzf)
 
@@ -52,6 +53,7 @@ TAR_EXTRACT_FLAGS = $(if $(filter fail,$(SYNC_CONFLICT)),-xzkf,-xzf)
 VOLUMES = --env-file .env \
           -e FACTUALITY_CHECKPOINT_ROOT=/tmp/factuality \
           -v "$(PWD)/tmp:/tmp" \
+          -v "$(PWD)/tmp:/app/tmp" \
           -v "$(PWD)/repos:/app/repos" \
           -v "$(PWD)/datasets:/app/datasets" \
           -v "$(PWD)/results:/app/results" \
@@ -67,6 +69,7 @@ help:
 	@echo "  [Окружение]"
 	@echo "  make setup          — .venv + requirements.txt + spaCy/NLTK данные + AlignScore patch"
 	@echo "  make setup-sf       — .venv + requirements exp04 (torch, faiss, ...)"
+	@echo "  make setup-scisage  — зависимости SciSage поверх текущего .venv"
 	@echo ""
 	@echo "  [Docker — base]"
 	@echo "  make base              — собрать thesis-base (кэшируется)"
@@ -79,6 +82,7 @@ help:
 	@echo "  make generate MODEL=perplexity_dr  [DATASET=SurGE]"
 	@echo "  make generate MODEL=surveyforge    [DATASET=SurGE] [GPU=1]"
 	@echo "  make generate MODEL=surveygen_i   [DATASET=SurGE]"
+	@echo "  make generate MODEL=scisage       [DATASET=SurGE]"
 	@echo "  make convert-autosurvey           [DATASET=SurGE]  — baseline (локально, без Docker)"
 	@echo "  make surge-reference              [MODE=hybrid] [LIMIT=N] — human-written SurGE surveys → generation format"
 	@echo ""
@@ -103,7 +107,8 @@ help:
 	@echo "  [Утилиты]"
 	@echo "  make enrich / models / models-ping / clean"
 	@echo "  make push-results [REMOTE=...] [REMOTE_REPO=...] [SYNC_CONFLICT=overwrite|fail]"
-	@echo "  make pull-results [REMOTE=...] [REMOTE_REPO=...] [SYNC_CONFLICT=overwrite|fail]"
+	@echo "  make pull-results [REMOTE=...] [REMOTE_REPO=...] [SYNC_CONFLICT=overwrite|fail|skip]"
+	@echo "  make pull-new-results [REMOTE=...] [REMOTE_REPO=...]"
 	@echo ""
 
 ## ── Локальное окружение ───────────────────────────────────────────────────────
@@ -127,6 +132,9 @@ setup:
 
 setup-sf:
 	.venv/bin/pip install -r experiments/exp04_surveyforge/requirements.txt
+
+setup-scisage:
+	$(PYTHON) -m pip install -r models/scisage/requirements.txt
 
 ## ── Docker base ──────────────────────────────────────────────────────────────
 
@@ -247,12 +255,23 @@ models-ping:
 
 push-results:
 	@echo "local results/ -> $(REMOTE):$(REMOTE_REPO)/results/  (conflict=$(SYNC_CONFLICT))"
+	@if [ "$(SYNC_CONFLICT)" = "skip" ]; then \
+	    echo "SYNC_CONFLICT=skip is supported for pull-results only; use overwrite or fail for push-results."; \
+	    exit 2; \
+	fi
 	tar -C results -czf - . | ssh $(REMOTE) 'mkdir -p $(REMOTE_REPO)/results && tar -C $(REMOTE_REPO)/results $(TAR_EXTRACT_FLAGS) -'
 
 pull-results:
 	@echo "$(REMOTE):$(REMOTE_REPO)/results/ -> local results/  (conflict=$(SYNC_CONFLICT))"
 	mkdir -p results
+ifeq ($(SYNC_CONFLICT),skip)
+	ssh $(REMOTE) 'cd $(REMOTE_REPO)/results && tar -czf - .' | $(PYTHON) scripts/extract_new_from_tar.py --dest results
+else
 	ssh $(REMOTE) 'cd $(REMOTE_REPO)/results && tar -czf - .' | tar -C results $(TAR_EXTRACT_FLAGS) -
+endif
+
+pull-new-results:
+	$(MAKE) pull-results SYNC_CONFLICT=skip
 
 ## ── Загрузка моделей для метрик ──────────────────────────────────────────────
 

@@ -8,6 +8,7 @@ from openai import OpenAI
 
 from .llm_utils import TokenCounter, llm_json_cached
 from .prompts import (
+    PARAGRAPH_TOPIC_FILTER_PROMPT,
     TOPIC_FILTER_PROMPT,
     TOPIC_FILTER_SCHEMA_COMPACT,
     TOPIC_FILTER_SCHEMA_FULL,
@@ -24,12 +25,20 @@ def _filter_one(
     cache,
     token_counter: TokenCounter | None,
     log_reasoning: bool,
+    paragraph_max_chars: int,
 ) -> dict:
     schema = TOPIC_FILTER_SCHEMA_FULL if log_reasoning else TOPIC_FILTER_SCHEMA_COMPACT
-    prompt = TOPIC_FILTER_PROMPT.format(schema=schema, s1=cand["s1"][:400], s2=cand["s2"][:400])
+    is_paragraph = cand.get("unit") == "paragraph"
+    max_chars = paragraph_max_chars if is_paragraph else 400
+    prompt_template = PARAGRAPH_TOPIC_FILTER_PROMPT if is_paragraph else TOPIC_FILTER_PROMPT
+    prompt = prompt_template.format(
+        schema=schema,
+        s1=cand["s1"][:max_chars],
+        s2=cand["s2"][:max_chars],
+    )
     result = llm_json_cached(
         client, model, prompt,
-        cand["s1"], cand["s2"], "topic",
+        cand["s1"], cand["s2"], "topic_paragraph" if is_paragraph else "topic",
         cache, max_retries, disable_reasoning, provider,
         token_counter=token_counter,
     )
@@ -70,6 +79,7 @@ def run_topic_filter(
     disable_reasoning = not cfg.get("judge_reasoning", True)
     provider          = cfg.get("judge_provider")
     concurrency       = cfg.get("judge_workers", 25)
+    paragraph_max_chars = cfg.get("paragraph_max_chars", 1800)
 
     results: list[dict | None] = [None] * len(candidates)
     n_selected = 0
@@ -79,7 +89,7 @@ def run_topic_filter(
             ex.submit(
                 _filter_one, cand, client, model,
                 max_retries, disable_reasoning, provider, cache,
-                token_counter, log_reasoning,
+                token_counter, log_reasoning, paragraph_max_chars,
             ): i
             for i, cand in enumerate(candidates)
         }

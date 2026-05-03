@@ -5,10 +5,18 @@
 import json
 from pathlib import Path
 
-from .candidates import generate_candidates
+from .candidates import generate_candidates, generate_paragraph_candidates
 from .check import run_contradiction_check
 from .llm_utils import TokenCounter
 from .topic_filter import run_topic_filter
+
+
+def _count_paragraphs(sections: list[dict]) -> int:
+    total = 0
+    for sec in sections:
+        paragraphs = sec.get("paragraphs")
+        total += len(paragraphs) if paragraphs else len(sec.get("sentences", []))
+    return total
 
 
 def compute_m_contr(
@@ -49,7 +57,19 @@ def compute_m_contr(
     """
     stage_dir.mkdir(parents=True, exist_ok=True)
 
-    threshold  = cfg.get("similarity_threshold", 0.6)
+    unit = cfg.get("contradiction_unit", "sentence")
+    if unit not in {"sentence", "paragraph"}:
+        raise ValueError(f"Unknown contradiction_unit: {unit}")
+
+    if unit == "paragraph":
+        threshold = cfg.get(
+            "paragraph_min_similarity_threshold",
+            cfg.get("min_similarity_threshold", cfg.get("similarity_threshold", 0.6)),
+        )
+        top_k = cfg.get("paragraph_top_k")
+    else:
+        threshold = cfg.get("min_similarity_threshold", cfg.get("similarity_threshold", 0.6))
+        top_k = cfg.get("top_k_per_sentence")
     batch_size = cfg.get("embedding_batch_size", 32)
 
     # ── Stage 1 — SPECTER similarity candidates ───────────────────────────────
@@ -58,17 +78,30 @@ def compute_m_contr(
         candidates = json.loads(cands_file.read_text())
         if specter_bar is not None:
             # Loaded from cache — fast-forward bar and show cached count
-            n = sum(len(s["sentences"]) for s in sections)
-            n_pairs = n * (n - 1) // 2
-            specter_bar.reset(total=n_pairs)
-            specter_bar.update(n_pairs)
+            n = _count_paragraphs(sections) if unit == "paragraph" else sum(len(s["sentences"]) for s in sections)
+            n_units = n if top_k else n * (n - 1) // 2
+            specter_bar.reset(total=n_units)
+            specter_bar.update(n_units)
             specter_bar.set_postfix_str(f"→ {len(candidates)} sel (cached)")
     else:
-        n = sum(len(s["sentences"]) for s in sections)
-        n_pairs = n * (n - 1) // 2
+        n = _count_paragraphs(sections) if unit == "paragraph" else sum(len(s["sentences"]) for s in sections)
+        n_units = n if top_k else n * (n - 1) // 2
         if specter_bar is not None:
-            specter_bar.reset(total=n_pairs)
-        candidates = generate_candidates(sections, embedder, threshold, batch_size, pbar=specter_bar)
+            specter_bar.reset(total=n_units)
+        if unit == "paragraph":
+            candidates = generate_paragraph_candidates(
+                sections, embedder, threshold,
+                top_k_per_paragraph=top_k,
+                batch_size=batch_size,
+                pbar=specter_bar,
+            )
+        else:
+            candidates = generate_candidates(
+                sections, embedder, threshold,
+                top_k_per_sentence=top_k,
+                batch_size=batch_size,
+                pbar=specter_bar,
+            )
         cands_file.write_text(json.dumps(candidates, ensure_ascii=False))
 
     if not candidates:
@@ -91,6 +124,7 @@ def compute_m_contr(
     # ── Stage 2 — LLM topic filter ────────────────────────────────────────────
     topic_file = stage_dir / "topic_filtered.json"
     topic_counter = TokenCounter()
+    log_reasoning = cfg.get("judge_log_reasoning", True)
 
     if topic_file.exists():
         after_topic = json.loads(topic_file.read_text())
@@ -102,7 +136,6 @@ def compute_m_contr(
     else:
         if topic_bar is not None:
             topic_bar.reset(total=len(candidates))
-        log_reasoning = cfg.get("judge_log_reasoning", True)
         after_topic = run_topic_filter(
             candidates, client, cfg, cache,
             pbar=topic_bar, token_counter=topic_counter,
@@ -147,19 +180,37 @@ def compute_m_contr(
     n_failed         = n_failed_topic + n_failed_check
     m_contr = round(n_contradictions / n_after_topic, 4) if n_after_topic > 0 else None
 
-    contradiction_records = [
-        {
-            "sentence_i":         {"section": p["t1"], "text": p["s1"]},
-            "sentence_j":         {"section": p["t2"], "text": p["s2"]},
-            "similarity":         p["similarity"],
-            "contradiction_type": p.get("contradiction_type", "none"),
-            "reasoning":          p.get("reasoning", ""),
-        }
-        for p in contradictions
-    ]
+    contradiction_records = []
+    for p in contradictions:
+        if p.get("unit") == "paragraph":
+            contradiction_records.append({
+                "paragraph_i": {
+                    "section": p["t1"],
+                    "index": p.get("paragraph_i"),
+                    "text": p["s1"],
+                },
+                "paragraph_j": {
+                    "section": p["t2"],
+                    "index": p.get("paragraph_j"),
+                    "text": p["s2"],
+                },
+                "sentence_pairs": p.get("sentence_pairs", []),
+                "similarity": p["similarity"],
+                "contradiction_type": p.get("contradiction_type", "none"),
+                "reasoning": p.get("reasoning", ""),
+            })
+        else:
+            contradiction_records.append({
+                "sentence_i":         {"section": p["t1"], "text": p["s1"]},
+                "sentence_j":         {"section": p["t2"], "text": p["s2"]},
+                "similarity":         p["similarity"],
+                "contradiction_type": p.get("contradiction_type", "none"),
+                "reasoning":          p.get("reasoning", ""),
+            })
 
     return {
         "m_contr":              m_contr,
+        "contradiction_unit":   unit,
         "n_candidates_stage1":  n_candidates,
         "n_after_topic_filter": n_after_topic,
         "n_contradictions":     n_contradictions,

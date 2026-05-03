@@ -11,6 +11,9 @@ from .prompts import (
     CONTRADICTION_PROMPT,
     CONTRADICTION_SCHEMA_COMPACT,
     CONTRADICTION_SCHEMA_FULL,
+    PARAGRAPH_CONTRADICTION_PROMPT,
+    PARAGRAPH_CONTRADICTION_SCHEMA_COMPACT,
+    PARAGRAPH_CONTRADICTION_SCHEMA_FULL,
 )
 
 
@@ -24,21 +27,55 @@ def _check_one(
     cache,
     token_counter: TokenCounter | None,
     log_reasoning: bool,
+    paragraph_max_chars: int,
 ) -> dict:
-    schema = CONTRADICTION_SCHEMA_FULL if log_reasoning else CONTRADICTION_SCHEMA_COMPACT
-    prompt = CONTRADICTION_PROMPT.format(
-        schema=schema,
-        section_i=pair["t1"],
-        s1=pair["s1"][:400],
-        section_j=pair["t2"],
-        s2=pair["s2"][:400],
-    )
+    is_paragraph = pair.get("unit") == "paragraph"
+    if is_paragraph:
+        schema = (
+            PARAGRAPH_CONTRADICTION_SCHEMA_FULL
+            if log_reasoning else
+            PARAGRAPH_CONTRADICTION_SCHEMA_COMPACT
+        )
+        prompt = PARAGRAPH_CONTRADICTION_PROMPT.format(
+            schema=schema,
+            section_i=pair["t1"],
+            s1=pair["s1"][:paragraph_max_chars],
+            section_j=pair["t2"],
+            s2=pair["s2"][:paragraph_max_chars],
+        )
+        suffix = "paragraph_contradiction"
+    else:
+        schema = CONTRADICTION_SCHEMA_FULL if log_reasoning else CONTRADICTION_SCHEMA_COMPACT
+        prompt = CONTRADICTION_PROMPT.format(
+            schema=schema,
+            section_i=pair["t1"],
+            s1=pair["s1"][:400],
+            section_j=pair["t2"],
+            s2=pair["s2"][:400],
+        )
+        suffix = "contradiction"
+
     result = llm_json_cached(
         client, model, prompt,
-        pair["s1"], pair["s2"], "contradiction",
+        pair["s1"], pair["s2"], suffix,
         cache, max_retries, disable_reasoning, provider,
         token_counter=token_counter,
     )
+    if is_paragraph:
+        contradictions = result.get("contradictions") or []
+        has_contradiction = bool(result.get("has_contradiction", False) or contradictions)
+        first_type = "none"
+        if contradictions:
+            first_type = contradictions[0].get("contradiction_type", "none")
+        return {
+            **pair,
+            "is_contradiction": has_contradiction,
+            "sentence_pairs": contradictions,
+            "reasoning": result.get("reasoning", ""),
+            "contradiction_type": first_type,
+            "status": result.get("status", "ok"),
+        }
+
     return {
         **pair,
         "is_contradiction":   result.get("is_contradiction", False),
@@ -77,6 +114,7 @@ def run_contradiction_check(
     disable_reasoning = not cfg.get("judge_reasoning", True)
     provider          = cfg.get("judge_provider")
     concurrency       = cfg.get("judge_workers", 25)
+    paragraph_max_chars = cfg.get("paragraph_max_chars", 1800)
 
     results: list[dict | None] = [None] * len(pairs)
     n_confirmed = 0
@@ -86,7 +124,7 @@ def run_contradiction_check(
             ex.submit(
                 _check_one, pair, client, model,
                 max_retries, disable_reasoning, provider, cache,
-                token_counter, log_reasoning,
+                token_counter, log_reasoning, paragraph_max_chars,
             ): i
             for i, pair in enumerate(pairs)
         }

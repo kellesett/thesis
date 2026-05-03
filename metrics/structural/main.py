@@ -36,6 +36,8 @@ import yaml
 from dotenv import load_dotenv
 from openai import OpenAI
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -64,10 +66,22 @@ def build_hyperparams_id(cfg: dict) -> str:
     Used as part of the intermediate stage path so that runs with different
     thresholds or judge models don't share cached intermediate results.
     """
-    sim = cfg.get("similarity_threshold", 0.6)
+    unit = cfg.get("contradiction_unit", "sentence")
     rp  = cfg.get("rep_embedding_prefilter", 0.7)
     jid = cfg.get("judge_id", "judge")
-    return f"sim{sim}_rp{rp}_{jid}"
+    if unit == "paragraph":
+        sim = cfg.get(
+            "paragraph_min_similarity_threshold",
+            cfg.get("min_similarity_threshold", cfg.get("similarity_threshold", 0.6)),
+        )
+        tk = cfg.get("paragraph_top_k")
+        tk_id = f"ptk{tk}" if tk else "ptkall"
+        return f"para_sim{sim}_{tk_id}_rp{rp}_{jid}"
+
+    sim = cfg.get("min_similarity_threshold", cfg.get("similarity_threshold", 0.6))
+    tk = cfg.get("top_k_per_sentence")
+    tk_id = f"tk{tk}" if tk else "tkall"
+    return f"sim{sim}_{tk_id}_rp{rp}_{jid}"
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -95,6 +109,7 @@ def load_specter(path: str):
 
 _HEADING_RE = re.compile(r"^#{1,3}\s+(.+)$", re.MULTILINE)
 _SENT_RE    = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
+_PARA_RE    = re.compile(r"\n\s*\n+")
 
 
 def split_to_sentences(text: str) -> list[str]:
@@ -105,8 +120,17 @@ def split_to_sentences(text: str) -> list[str]:
     return [s.strip() for s in _SENT_RE.split(text) if len(s.strip()) > 30]
 
 
+def split_to_paragraphs(text: str) -> list[dict]:
+    paragraphs = []
+    for block in _PARA_RE.split(text):
+        sents = split_to_sentences(block)
+        if sents:
+            paragraphs.append({"text": " ".join(sents), "sentences": sents})
+    return paragraphs
+
+
 def split_sections(text: str) -> list[dict]:
-    """Return list of {"title": str, "sentences": list[str]}."""
+    """Return list of {"title": str, "sentences": list[str], "paragraphs": list[dict]}."""
     headings = list(_HEADING_RE.finditer(text))
     sections = []
     for i, m in enumerate(headings):
@@ -114,12 +138,14 @@ def split_sections(text: str) -> list[dict]:
         start = m.end()
         end   = headings[i + 1].start() if i + 1 < len(headings) else len(text)
         body  = text[start:end].strip()
-        sents = split_to_sentences(body)
+        paragraphs = split_to_paragraphs(body)
+        sents = [sent for par in paragraphs for sent in par["sentences"]]
         if sents:
-            sections.append({"title": title, "sentences": sents})
+            sections.append({"title": title, "sentences": sents, "paragraphs": paragraphs})
     if not sections:
-        sents = split_to_sentences(text)
-        sections = [{"title": "Full text", "sentences": sents}]
+        paragraphs = split_to_paragraphs(text)
+        sents = [sent for par in paragraphs for sent in par["sentences"]]
+        sections = [{"title": "Full text", "sentences": sents, "paragraphs": paragraphs}]
     return sections
 
 
@@ -322,26 +348,32 @@ def process_survey(
     n_sents  = sum(len(s["sentences"]) for s in sections)
     tqdm.write(f"  [PROC] {survey_id} | {len(sections)} sec / {n_sents} sent")
 
-    contr_stage_dir = stage_base / "contradiction" / dataset_id / model_id / hparams_id / survey_id
-    rep_stage_dir   = stage_base / "repetition"    / dataset_id / model_id / hparams_id / survey_id
+    run_m_contr = cfg.get("run_m_contr", True)
+    run_m_rep   = cfg.get("run_m_rep", True)
 
-    try:
-        contr = compute_m_contr(
-            survey_id, sections, specter_model, client, cfg, cache, contr_stage_dir,
-            specter_bar=specter_bar, topic_bar=topic_bar, contr_bar=contr_bar,
-        )
-    except Exception:
-        logger.exception(f"Error computing m_contr for {survey_id}")
-        raise
+    contr = None
+    if run_m_contr:
+        contr_stage_dir = stage_base / "contradiction" / dataset_id / model_id / hparams_id / survey_id
+        try:
+            contr = compute_m_contr(
+                survey_id, sections, specter_model, client, cfg, cache, contr_stage_dir,
+                specter_bar=specter_bar, topic_bar=topic_bar, contr_bar=contr_bar,
+            )
+        except Exception:
+            logger.exception(f"Error computing m_contr for {survey_id}")
+            raise
 
-    try:
-        rep = compute_m_rep(
-            sections, specter_model, nli_pipe, cfg, rep_stage_dir,
-            rep_bar=rep_bar, nli_bar=nli_bar,
-        )
-    except Exception:
-        logger.exception(f"Error computing m_rep for {survey_id}")
-        raise
+    rep = None
+    if run_m_rep:
+        rep_stage_dir = stage_base / "repetition" / dataset_id / model_id / hparams_id / survey_id
+        try:
+            rep = compute_m_rep(
+                sections, specter_model, nli_pipe, cfg, rep_stage_dir,
+                rep_bar=rep_bar, nli_bar=nli_bar,
+            )
+        except Exception:
+            logger.exception(f"Error computing m_rep for {survey_id}")
+            raise
 
     result = {
         "survey_id":   survey_id,
@@ -350,23 +382,30 @@ def process_survey(
         "query":       gen.get("query", ""),
         "n_sections":  len(sections),
         "n_sentences": n_sents,
-        **{f"contr_{k}": v for k, v in contr.items()},
-        **{f"rep_{k}":   v for k, v in rep.items()},
+        "run_m_contr": run_m_contr,
+        "run_m_rep":   run_m_rep,
         "latency_sec": round(time.time() - t0, 1),
         "timestamp":   datetime.now(timezone.utc).isoformat(),
     }
+    if contr is not None:
+        result.update({f"contr_{k}": v for k, v in contr.items()})
+    if rep is not None:
+        result.update({f"rep_{k}": v for k, v in rep.items()})
 
     with open(out_file, "w") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
-    tqdm.write(
-        f"         ✓ m_contr={contr.get('m_contr')}  "
-        f"(cands={contr.get('n_candidates_stage1')} "
-        f"topic={contr.get('n_after_topic_filter')} "
-        f"confirmed={contr.get('n_contradictions')})  "
-        f"m_rep={rep.get('m_rep')}  "
-        f"({result['latency_sec']}s)"
-    )
+    summary_parts = []
+    if contr is not None:
+        summary_parts.append(
+            f"m_contr={contr.get('m_contr')} "
+            f"(cands={contr.get('n_candidates_stage1')} "
+            f"topic={contr.get('n_after_topic_filter')} "
+            f"confirmed={contr.get('n_contradictions')})"
+        )
+    if rep is not None:
+        summary_parts.append(f"m_rep={rep.get('m_rep')}")
+    tqdm.write(f"         ✓ {'  '.join(summary_parts)}  ({result['latency_sec']}s)")
     return result
 
 
@@ -374,8 +413,8 @@ def process_survey(
 
 def write_summary(results: list[dict], out_path: Path) -> None:
     fields = [
-        "survey_id", "query",
-        "contr_m_contr", "contr_n_candidates_stage1",
+        "survey_id", "query", "run_m_contr", "run_m_rep",
+        "contr_m_contr", "contr_contradiction_unit", "contr_n_candidates_stage1",
         "contr_n_after_topic_filter", "contr_n_contradictions", "contr_n_failed",
         "rep_m_rep", "rep_n_total_sentences", "rep_n_duplicates",
         "latency_sec",
@@ -393,14 +432,45 @@ def main() -> None:
     parser.add_argument("--limit",   type=int, default=None,
                         help="Process only surveys with survey_id <= LIMIT "
                              "(inclusive, id-based — not positional).")
+    parser.add_argument("--contradiction-unit", choices=("sentence", "paragraph"), default=None)
+    parser.add_argument("--top-k-per-sentence", type=int, default=None)
+    parser.add_argument("--min-similarity-threshold", type=float, default=None)
+    parser.add_argument("--paragraph-top-k", type=int, default=None)
+    parser.add_argument("--paragraph-min-similarity-threshold", type=float, default=None)
+    parser.add_argument("--only-m-contr", action="store_true",
+                        help="Run only M_contr; skip M_rep and NLI model loading.")
+    parser.add_argument("--only-m-rep", action="store_true",
+                        help="Run only M_rep; skip M_contr and LLM judge calls.")
     args = parser.parse_args()
 
     cfg    = load_config(CONFIG)
-    client = make_client(cfg)
+    if args.only_m_contr and args.only_m_rep:
+        parser.error("--only-m-contr and --only-m-rep are mutually exclusive")
+    if args.only_m_contr:
+        cfg["run_m_contr"] = True
+        cfg["run_m_rep"] = False
+    if args.only_m_rep:
+        cfg["run_m_contr"] = False
+        cfg["run_m_rep"] = True
+    if args.contradiction_unit is not None:
+        cfg["contradiction_unit"] = args.contradiction_unit
+    if args.top_k_per_sentence is not None:
+        cfg["top_k_per_sentence"] = args.top_k_per_sentence or None
+    if args.min_similarity_threshold is not None:
+        cfg["min_similarity_threshold"] = args.min_similarity_threshold
+    if args.paragraph_top_k is not None:
+        cfg["paragraph_top_k"] = args.paragraph_top_k or None
+    if args.paragraph_min_similarity_threshold is not None:
+        cfg["paragraph_min_similarity_threshold"] = args.paragraph_min_similarity_threshold
+    run_m_contr = cfg.get("run_m_contr", True)
+    run_m_rep   = cfg.get("run_m_rep", True)
+    if not run_m_contr and not run_m_rep:
+        parser.error("At least one of run_m_contr/run_m_rep must be enabled")
+    client = make_client(cfg) if run_m_contr else None
 
     print("\n[structural] Loading models...")
-    nli_pipe      = load_nli_model(cfg["nli_model_path"])
     specter_model = load_specter(cfg["specter_model_path"])
+    nli_pipe      = load_nli_model(cfg["nli_model_path"]) if run_m_rep else None
 
     cache_dir = Path(cfg.get("cache_dir", "/tmp/structural/cache"))
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -417,22 +487,26 @@ def main() -> None:
         sys.exit(1)
 
     run_id  = f"{cfg['judge_id']}_{cfg['judge_comment']}"
-    out_dir = ROOT / "results" / "scores" / f"{args.dataset}_{args.model}_structural_{run_id}"
+    run_mode = "all" if run_m_contr and run_m_rep else "contr" if run_m_contr else "rep"
+    run_suffix = "" if run_mode == "all" else f"_{run_mode}"
+    out_dir = ROOT / "results" / "scores" / f"{args.dataset}_{args.model}_structural_{run_id}{run_suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     gen_files = filter_by_limit(load_generation_files(gen_dir), args.limit)
 
     tqdm.write(f"\n[structural] {args.dataset} / {args.model}")
     tqdm.write(f"             {len(gen_files)} surveys → {out_dir}\n")
+    tqdm.write(f"             mode: M_contr={'on' if run_m_contr else 'off'}  M_rep={'on' if run_m_rep else 'off'}\n")
 
     # ── Progress bars (all leave=True, reset between surveys) ─────────────────
     # position=5 = top line, position=0 = bottom line
     survey_bar  = tqdm(total=len(gen_files), desc="Surveys         ", position=0, leave=True, unit="survey")
-    specter_bar = tqdm(total=1, desc="  1/5 SPECTER   ", position=1, leave=True, unit="pair")
-    topic_bar   = tqdm(total=1, desc="  2/5 topic flt ", position=2, leave=True, unit="pair")
-    contr_bar   = tqdm(total=1, desc="  3/5 contr chk ", position=3, leave=True, unit="pair")
-    rep_bar     = tqdm(total=1, desc="  4/5 rep SPECTER", position=4, leave=True, unit="pair")
-    nli_bar     = tqdm(total=1, desc="  5/5 NLI       ", position=5, leave=True, unit="pair")
+    specter_bar = tqdm(total=1, desc="  1/5 SPECTER   ", position=1, leave=True, unit="pair") if run_m_contr else None
+    topic_bar   = tqdm(total=1, desc="  2/5 topic flt ", position=2, leave=True, unit="pair") if run_m_contr else None
+    contr_bar   = tqdm(total=1, desc="  3/5 contr chk ", position=3, leave=True, unit="pair") if run_m_contr else None
+    rep_bar     = tqdm(total=1, desc="  4/5 rep SPECTER", position=4, leave=True, unit="pair") if run_m_rep else None
+    nli_bar     = tqdm(total=1, desc="  5/5 NLI       ", position=5, leave=True, unit="pair") if run_m_rep else None
+    inner_bars = [bar for bar in [specter_bar, topic_bar, contr_bar, rep_bar, nli_bar] if bar is not None]
 
     all_results = []
     try:
@@ -453,12 +527,13 @@ def main() -> None:
                 all_results.append(res)
 
             # Reset inner bars — clears postfix so next survey starts fresh
-            for bar in [specter_bar, topic_bar, contr_bar, rep_bar, nli_bar]:
+            for bar in inner_bars:
                 bar.reset(total=1)
                 bar.set_postfix_str("")
     finally:
         for bar in [nli_bar, rep_bar, contr_bar, topic_bar, specter_bar, survey_bar]:
-            bar.close()
+            if bar is not None:
+                bar.close()
 
     if all_results:
         write_summary(all_results, out_dir)

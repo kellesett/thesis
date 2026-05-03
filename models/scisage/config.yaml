@@ -1,0 +1,48 @@
+model_id: scisage
+resume: true
+
+# SciSage is wired to local Qwen aliases internally. The wrapper maps those
+# aliases to this OpenRouter model before importing SciSage modules.
+model: google/gemma-4-31b-it
+base_url: https://openrouter.ai/api/v1
+api_key_env: OPENROUTER_API_KEY
+
+# Academic retrieval in SciSage uses Google Serper to find arXiv papers.
+search_api_key_env: GOOGLE_SERPER_KEY
+require_search_api_key: true
+
+# Aliases used across SciSage internals. Keep llama3-70b here because some
+# reflection configs mention it even when reflection is disabled.
+model_aliases:
+  - Qwen3-8B
+  - Qwen3-14B
+  - Qwen3-32B
+  - Qwen3-32B-think
+  - llama3-70b
+default_model_alias: Qwen3-8B
+
+# OpenRouter request defaults.
+max_tokens: 12000
+temperature: 0.7
+top_p: 0.8
+retry_attempts: 3
+timeout: 600
+
+# Raw SciSage state/results are kept here; canonical generations go to
+# results/generations/<DATASET>_scisage via BaseModel.
+raw_output_dir: tmp/scisage
+
+# Pipeline knobs. Conservative defaults for a first SurGE run: no reflections,
+# three outline sections, academic retrieval only.
+do_query_understand: false
+query_domain: academic
+outline_max_reflections: 1
+outline_max_sections: 3
+outline_min_depth: 1
+section_writer_model_alias: Qwen3-8B
+do_section_reflection: false
+section_reflection_max_turns: 0
+do_global_reflection: false
+global_reflection_max_turns: 1
+global_abstract_conclusion_max_turns: 1
+translate_to_chinese: false

@@ -90,6 +90,34 @@ def build_corpus_index(dataset: str) -> dict[str, str]:
     return index
 
 
+# ── AlignScore cost meter ─────────────────────────────────────────────────────
+# Populated during process_survey to feed the top-k / abstract-cascade
+# calibration appendix (see theory/main/main_full.tex §app:topk_calibration).
+# Reset per survey at the start of process_survey; written into the survey
+# result JSON as the `cost` block. Resume-from-cache keeps the meter at zero —
+# that's by design: cost is meaningful only for fresh runs.
+
+_cost_meter: dict[str, int] = {
+    "n_alignscore_calls":  0,  # number of alignscore_model.score() invocations
+    "n_alignscore_pairs":  0,  # number of (premise, claim) pairs scored
+    "n_chunks_evaluated":  0,  # full-text chunks sent to AlignScore (top-k path)
+    "n_abstract_skip":     0,  # (claim, ref) units closed by abstract cascade
+}
+
+
+def _reset_cost_meter() -> None:
+    for k in _cost_meter:
+        _cost_meter[k] = 0
+
+
+def _add_cost(key: str, value: int) -> None:
+    _cost_meter[key] = _cost_meter.get(key, 0) + int(value)
+
+
+def _get_cost_meter() -> dict[str, int]:
+    return dict(_cost_meter)
+
+
 # ── AlignScore loader ─────────────────────────────────────────────────────────
 
 def load_alignscore(cfg: dict):
@@ -334,6 +362,8 @@ def _score_alignscore_pairs(
         chunk_p = premises[start:start + _ALIGN_CHUNK_SIZE]
         chunk_c = claims[start:start + _ALIGN_CHUNK_SIZE]
         chunk_scores = alignscore_model.score(contexts=chunk_p, claims=chunk_c)
+        _add_cost("n_alignscore_calls", 1)
+        _add_cost("n_alignscore_pairs", len(chunk_c))
         scores.extend(float(s) for s in chunk_scores)
         if bar is not None:
             bar.update(len(chunk_c))
@@ -569,6 +599,8 @@ def _alignscore_per_ref_fulltext_topk(
         fallback_premises.append("\n\n\n".join(premise_parts))
 
     chunks_to_align = sum(pair.get("selected_chunk_count", 0) for pair in fallback_meta)
+    _add_cost("n_chunks_evaluated", chunks_to_align)
+    _add_cost("n_abstract_skip", abstract_skipped)
     _set_topk_bar_postfix(bar, chunks_to_align, abstract_skipped)
 
     if bar is not None:
@@ -754,6 +786,8 @@ def _alignscore_concat_fulltext_topk(
         for pairs in fallback_by_claim.values()
         for pair, _ in pairs
     )
+    _add_cost("n_chunks_evaluated", chunks_to_align)
+    _add_cost("n_abstract_skip", abstract_skipped)
     _set_topk_bar_postfix(bar, chunks_to_align, abstract_skipped)
 
     fallback_claim_indices = sorted(fallback_by_claim)
@@ -1039,6 +1073,8 @@ def process_survey(
     out_file  = out_path / f"{survey_id}.json"
     classification_state_file = classification_checkpoint_dir / f"{survey_id}.json"
     align_state_file          = align_checkpoint_dir / f"{survey_id}.json"
+
+    _reset_cost_meter()
 
     cached = check_and_load_cache(out_file, cfg, survey_id)
     if cached is not None:
@@ -1603,6 +1639,7 @@ def process_survey(
             "out_tokens": per_tokens.out_tokens,
             "cost_usd":   round(per_tokens.cost_usd, 6),
         },
+        "cost": _get_cost_meter(),
     }
 
     with open(out_file, "w") as f:
@@ -1638,13 +1675,25 @@ def process_survey(
 # ── Summary CSV ───────────────────────────────────────────────────────────────
 
 def write_summary(results: list[dict], out_path: Path) -> None:
+    flat = []
+    for r in results:
+        cost = r.get("cost") or {}
+        flat.append({
+            **r,
+            "n_alignscore_calls": cost.get("n_alignscore_calls"),
+            "n_alignscore_pairs": cost.get("n_alignscore_pairs"),
+            "n_chunks_evaluated": cost.get("n_chunks_evaluated"),
+            "n_abstract_skip":    cost.get("n_abstract_skip"),
+        })
     fields = [
         "survey_id", "query", "n_claims", "n_supported",
         "cit_correct_overall",
         "cit_correct_A", "cit_correct_B", "cit_correct_C", "cit_correct_D",
         "latency_sec",
+        "n_alignscore_calls", "n_alignscore_pairs",
+        "n_chunks_evaluated", "n_abstract_skip",
     ]
-    write_summary_csv(results, out_path, fields, "factuality")
+    write_summary_csv(flat, out_path, fields, "factuality")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

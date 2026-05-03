@@ -8,6 +8,7 @@ import logging
 import pathlib
 import re
 import sys
+from datetime import datetime, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -37,6 +38,9 @@ _init_app_logging()
 GENERATIONS_DIR = ROOT / "results" / "generations"
 SCORES_DIR      = ROOT / "results" / "scores"
 HYPEROPT_DIR    = ROOT / "results" / "hyperopt"
+ANALISIS_DIR    = ROOT / "analisis"
+SAMPLES_DIR     = ANALISIS_DIR / "samples"
+MARKUPS_DIR     = ANALISIS_DIR / "markups"
 
 st.set_page_config(page_title="Thesis Viewer", layout="wide")
 
@@ -117,6 +121,43 @@ def load_scores(run_dir: pathlib.Path) -> list[dict]:
     return out
 
 
+@st.cache_data(show_spinner=False)
+def _load_full_text_ref_ids(dataset: str, model: str, survey_id: str) -> set[int] | None:
+    """Refs with cached full text for one generation file."""
+    p = (
+        GENERATIONS_DIR / f"{dataset}_{model}"
+        / "sources" / f"{survey_id}_sources.json"
+    )
+    if not p.exists():
+        return None
+    try:
+        data = load_json(p)
+    except Exception:
+        logger.debug(f"Failed to load sources file {p}", exc_info=True)
+        return None
+
+    refs = data.get("refs") if isinstance(data, dict) else None
+    if isinstance(refs, dict):
+        refs_iter = refs.values()
+    elif isinstance(refs, list):
+        refs_iter = refs
+    else:
+        return None
+
+    out: set[int] = set()
+    for ref in refs_iter:
+        if not isinstance(ref, dict):
+            continue
+        try:
+            idx = int(ref.get("idx"))
+        except (TypeError, ValueError):
+            continue
+        text = ref.get("text") or ref.get("full_text")
+        if isinstance(text, str) and text.strip():
+            out.add(idx)
+    return out
+
+
 # ── Navigation widget ──────────────────────────────────────────────────────────
 
 def nav_arrows(state_key: str, total: int) -> int:
@@ -148,6 +189,231 @@ def reset_idx_on_run_change(run_label: str, idx_key: str, run_key: str) -> None:
     if st.session_state.get(run_key) != run_label:
         st.session_state[idx_key] = 0
         st.session_state[run_key] = run_label
+
+
+# ── Markup helpers ────────────────────────────────────────────────────────────
+
+_STRUCTURAL_MARKUP_CLASSES = {
+    "internal_author_contradiction": (
+        "внутреннее противоречие автора обзора (настоящий дефект)"
+    ),
+    "literature_contradiction": (
+        "зафиксированное противоречие в литературе с явным указанием источников "
+        "(признак критического анализа)"
+    ),
+    "judge_false_positive": "ложное срабатывание judge (артефакт)",
+}
+
+
+def _sample_items(data) -> list[dict]:
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        items = data.get("samples") or data.get("items") or []
+        if isinstance(items, list):
+            return [x for x in items if isinstance(x, dict)]
+    return []
+
+
+def _load_existing_markup(sample_file: pathlib.Path) -> dict:
+    path = MARKUPS_DIR / f"{sample_file.stem}_markup.json"
+    if not path.exists():
+        return {}
+    try:
+        data = load_json(path)
+    except Exception:
+        logger.debug(f"Failed to load markup file {path}", exc_info=True)
+        return {}
+    rows = data.get("markups", []) if isinstance(data, dict) else []
+    if not isinstance(rows, list):
+        return {}
+    return {
+        str(row.get("sample_id")): row
+        for row in rows
+        if isinstance(row, dict) and row.get("sample_id") is not None
+    }
+
+
+def _render_sample_text(label: str, text: str | None) -> None:
+    if not text:
+        return
+    st.markdown(f"**{label}**")
+    st.markdown(str(text))
+
+
+def _markup_sentence_norm(text: str) -> str:
+    text = re.sub(r"\[[^\]]{1,40}\]", "", text or "")
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text
+
+
+def _split_markup_sentences(text: str) -> list[str]:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if not text:
+        return []
+    return [
+        s.strip()
+        for s in re.split(r"(?<=[.!?])\s+(?=[A-Z])", text)
+        if len(s.strip()) > 30
+    ]
+
+
+def _find_sentence_window(
+    full_text: str,
+    paragraph_text: str | None,
+    *,
+    radius: int = 10,
+) -> dict | None:
+    if not full_text or not paragraph_text:
+        return None
+
+    full_sents = _split_markup_sentences(full_text)
+    para_sents = _split_markup_sentences(paragraph_text)
+    if not full_sents or not para_sents:
+        return None
+
+    full_norm = [_markup_sentence_norm(sent) for sent in full_sents]
+    para_norm = [_markup_sentence_norm(sent) for sent in para_sents]
+    para_norm = [sent for sent in para_norm if sent]
+    if not para_norm:
+        return None
+
+    start_idx = None
+    width = min(len(para_norm), len(full_norm))
+    for i in range(0, len(full_norm) - width + 1):
+        if full_norm[i:i + width] == para_norm[:width]:
+            start_idx = i
+            break
+
+    if start_idx is None:
+        first = para_norm[0]
+        for i, sent in enumerate(full_norm):
+            if first in sent or sent in first:
+                start_idx = i
+                break
+
+    if start_idx is None:
+        para_blob = " ".join(para_norm)
+        hits = [i for i, sent in enumerate(full_norm) if sent and sent in para_blob]
+        if hits:
+            start_idx = hits[0]
+
+    if start_idx is None:
+        return None
+
+    end_idx = min(len(full_sents), start_idx + len(para_norm))
+    left = max(0, start_idx - radius)
+    right = min(len(full_sents), end_idx + radius)
+    return {
+        "text": " ".join(full_sents[left:right]),
+        "window_start_sentence": left + 1,
+        "window_end_sentence": right,
+        "paragraph_start_sentence": start_idx + 1,
+        "paragraph_end_sentence": end_idx,
+        "total_sentences": len(full_sents),
+        "radius_sentences": radius,
+    }
+
+
+def _dataset_model_from_structural_run(run_name: str | None) -> tuple[str | None, str | None]:
+    if not run_name or "_structural" not in run_name:
+        return None, None
+    prefix = run_name.split("_structural", 1)[0]
+    if "_" not in prefix:
+        return None, None
+    dataset, model = prefix.split("_", 1)
+    return dataset or None, model or None
+
+
+def _load_generation_text_for_sample(sample: dict) -> str | None:
+    source_file = sample.get("source_file")
+    score_data = {}
+    if source_file:
+        p = ROOT / source_file
+        if not p.exists():
+            p = pathlib.Path(source_file)
+        if p.exists():
+            try:
+                score_data = load_json(p)
+            except Exception:
+                logger.debug(f"Failed to load source score file {p}", exc_info=True)
+
+    dataset = score_data.get("dataset_id")
+    model = score_data.get("model_id")
+    survey_id = str(score_data.get("survey_id") or sample.get("survey_id") or "")
+
+    if not dataset or not model:
+        dataset, model = _dataset_model_from_structural_run(
+            sample.get("source_run") or score_data.get("source_run")
+        )
+    if not dataset or not model or not survey_id:
+        return None
+
+    gen_dirs = [GENERATIONS_DIR / f"{dataset}_{model}"]
+    if str(model).startswith(f"{dataset}_"):
+        gen_dirs.append(GENERATIONS_DIR / str(model))
+
+    gen_file = None
+    for gen_dir in gen_dirs:
+        candidate = gen_dir / f"{survey_id}.json"
+        if candidate.exists():
+            gen_file = candidate
+            break
+    if gen_file is None:
+        return None
+    try:
+        gen = load_json(gen_file)
+    except Exception:
+        logger.debug(f"Failed to load generation file {gen_file}", exc_info=True)
+        return None
+    return gen.get("text") or gen.get("markdown_text")
+
+
+def _context_window_for_sample(sample: dict, side: int) -> dict | None:
+    saved = sample.get(f"context_{side}")
+    if isinstance(saved, dict) and saved.get("text"):
+        return saved
+
+    full_text = _load_generation_text_for_sample(sample)
+    paragraph = sample.get(f"paragraph_{side}")
+    computed = _find_sentence_window(full_text or "", paragraph)
+    if computed:
+        return computed
+
+    if saved:
+        return {"text": str(saved)}
+    return None
+
+
+def _render_context_position(context: dict) -> None:
+    start = context.get("window_start_sentence")
+    end = context.get("window_end_sentence")
+    total = context.get("total_sentences")
+    para_start = context.get("paragraph_start_sentence")
+    para_end = context.get("paragraph_end_sentence")
+    if start is None or end is None:
+        return
+
+    total_part = f" / {total}" if total is not None else ""
+    if para_start is not None and para_end is not None:
+        st.caption(
+            f"Window sentences: {start}-{end}{total_part}; "
+            f"paragraph sentences: {para_start}-{para_end}."
+        )
+    else:
+        st.caption(f"Window sentences: {start}-{end}{total_part}.")
+
+
+def _render_context_window(sample: dict, side: int) -> None:
+    context = _context_window_for_sample(sample, side)
+    if context:
+        _render_sample_text(
+            f"Text window {side} (±10 sentences)",
+            str(context.get("text") or ""),
+        )
+        _render_context_position(context)
+        return
+    _render_sample_text(f"Paragraph {side}", sample.get(f"paragraph_{side}"))
 
 
 # ── Page: Generations ──────────────────────────────────────────────────────────
@@ -489,6 +755,17 @@ def page_evaluations_factuality(run_dir: pathlib.Path, run_name: str) -> None:
         chip_cols[5].metric("AlignScore", "disabled")
 
     st.divider()
+
+    # ── CitCorrect radar ──────────────────────────────────────────────────────
+    if survey.get("alignscore_enabled", True):
+        radar_labels = [label for _, label in _FACTUALITY_RADAR_METRICS]
+        radar_values = [survey.get(key) for key, _ in _FACTUALITY_RADAR_METRICS]
+        _render_radar_chart(
+            "CitCorrect profile",
+            radar_labels,
+            [("current survey", radar_values, "#2196F3")],
+            height=330,
+        )
 
     # ── Category distribution chart ────────────────────────────────────────────
     categories = ["A", "B", "C", "D"]
@@ -832,12 +1109,24 @@ def page_aggregated_metrics() -> None:
     st.divider()
 
     # ── Expert metrics — per-model distributions ─────────────────────────────
-    _render_expert_distributions(dataset)
+    expert_profile = _render_expert_distributions(dataset)
 
     st.divider()
 
     # ── Factuality metrics — per-model distributions ─────────────────────────
-    _render_factuality_distributions(dataset)
+    factuality_profile = _render_factuality_distributions(dataset)
+
+    if expert_profile and factuality_profile:
+        st.divider()
+        _render_aggregate_expert_factuality_profile(
+            expert_profile,
+            factuality_profile,
+        )
+
+    st.divider()
+
+    # ── Structural contradiction metrics — per-model distributions ───────────
+    _render_structural_contradiction_distributions(dataset)
 
 
 # ── Expert distributions renderer ─────────────────────────────────────────────
@@ -852,6 +1141,14 @@ _EXPERT_SCALAR_METRICS: list[tuple[str, str]] = [
     ("m_comp_valid",  "Valid comparisons (m_comp_valid)"),
     ("m_open",        "Open questions (m_open)"),
     ("m_mod",         "Modality entropy (m_mod)"),
+]
+
+_EXPERT_RADAR_METRICS: list[tuple[str, str]] = [
+    ("m_crit",        "Critical"),
+    ("m_comp_total",  "Comparative"),
+    ("m_comp_valid",  "Valid comparisons"),
+    ("m_open",        "Open questions"),
+    ("m_mod",         "Modality entropy"),
 ]
 
 # Colors for modality categories 1..5. Reds → categorical (assertive),
@@ -872,7 +1169,7 @@ _MODALITY_LABELS = {
 }
 
 
-def _render_expert_distributions(dataset: str) -> None:
+def _render_expert_distributions(dataset: str) -> dict | None:
     """Per-model boxplot + strip overlay for each expert metric, plus a
     stacked-bar of mean modality_dist.
 
@@ -1031,6 +1328,21 @@ def _render_expert_distributions(dataset: str) -> None:
                .reindex(selected)                # keep the user's order
                .dropna(how="all")                # drop models with no dist
         )
+        mod_labels = [_MODALITY_LABELS[str(c)] for c in range(1, 6)]
+        mod_series = []
+        for i, model in enumerate(means.index):
+            mod_series.append((
+                model,
+                [float(means.loc[model, str(c)]) for c in range(1, 6)],
+                _RADAR_COLORS[i % len(_RADAR_COLORS)],
+            ))
+        _render_radar_chart(
+            "Average modality mix",
+            mod_labels,
+            mod_series,
+            height=430,
+        )
+
         fig = go.Figure()
         for cat in ("1", "2", "3", "4", "5"):
             fig.add_trace(go.Bar(
@@ -1180,6 +1492,11 @@ def _render_expert_distributions(dataset: str) -> None:
                             width="stretch",
                         )
 
+    return {
+        "selected": selected,
+        "df": df,
+    }
+
 
 # ── Factuality distributions renderer ─────────────────────────────────────────
 
@@ -1209,8 +1526,228 @@ _FACTUALITY_CATEGORY_LABELS = {
     "D": "D · critical",
 }
 
+_FACTUALITY_RADAR_METRICS: list[tuple[str, str]] = [
+    ("cit_correct_overall", "Overall"),
+    ("cit_correct_A",       "A"),
+    ("cit_correct_B",       "B"),
+    ("cit_correct_C",       "C"),
+    ("cit_correct_D",       "D"),
+]
 
-def _render_factuality_distributions(dataset: str) -> None:
+_RADAR_COLORS = [
+    "#2196F3", "#E91E63", "#4CAF50", "#FF9800",
+    "#9C27B0", "#00BCD4", "#FF5722", "#8BC34A",
+]
+
+
+def _claim_scope_refs(claim: dict) -> list[int]:
+    refs = claim.get("scope_citations")
+    if not isinstance(refs, list):
+        return []
+    out: list[int] = []
+    for ref in refs:
+        try:
+            out.append(int(ref))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _claim_has_full_text_for_scope(claim: dict, full_text_ref_ids: set[int]) -> bool:
+    refs = _claim_scope_refs(claim)
+    return bool(refs) and all(ref in full_text_ref_ids for ref in refs)
+
+
+def _cit_correct_profile_from_claims(claims: list[dict]) -> dict[str, float | None]:
+    def _rate(subset: list[dict]) -> float | None:
+        if not subset:
+            return None
+        n_supported = sum(1 for claim in subset if claim.get("supported") is True)
+        return n_supported / len(subset)
+
+    profile = {
+        "cit_correct_overall": _rate(claims),
+    }
+    for cat in ("A", "B", "C", "D"):
+        subset = [claim for claim in claims if claim.get("category") == cat]
+        profile[f"cit_correct_{cat}"] = _rate(subset)
+    return profile
+
+
+def _render_radar_chart(
+    title: str,
+    labels: list[str],
+    series: list[tuple[str, list[float | None], str]],
+    *,
+    height: int = 360,
+    axis_maxima: list[float] | None = None,
+    show_axis_maxima: bool = False,
+) -> None:
+    """Render a compact Plotly radar chart.
+
+    If ``axis_maxima`` is passed, each axis is normalized independently:
+    displayed r = value / axis_max. This keeps small-scale expert metrics
+    readable while preserving raw values in hover text.
+    """
+    fig = go.Figure()
+    if axis_maxima is not None and len(axis_maxima) != len(labels):
+        axis_maxima = None
+
+    axis_labels = labels
+    if axis_maxima is not None and show_axis_maxima:
+        axis_labels = [
+            f"{label}<br>max {max_v:.3g}"
+            for label, max_v in zip(labels, axis_maxima)
+        ]
+    theta = axis_labels + [axis_labels[0]]
+
+    for name, values, color in series:
+        if not any(v is not None for v in values):
+            continue
+        if axis_maxima is None:
+            closed = [
+                float(v) if isinstance(v, (int, float)) else None
+                for v in values + [values[0]]
+            ]
+            customdata = None
+            hovertemplate = "<b>%{fullData.name}</b><br>%{theta}: %{r:.3f}<extra></extra>"
+        else:
+            scaled = []
+            raw = []
+            for v, max_v in zip(values, axis_maxima):
+                raw_v = float(v) if isinstance(v, (int, float)) else None
+                axis_max = float(max_v) if isinstance(max_v, (int, float)) and max_v > 0 else 1.0
+                scaled.append(raw_v / axis_max if raw_v is not None else None)
+                raw.append([raw_v, axis_max])
+            closed = scaled + [scaled[0]]
+            customdata = raw + [raw[0]]
+            hovertemplate = (
+                "<b>%{fullData.name}</b><br>%{theta}<br>"
+                "value: %{customdata[0]:.3f}<br>"
+                "axis max: %{customdata[1]:.3f}<br>"
+                "scaled: %{r:.3f}<extra></extra>"
+            )
+        fig.add_trace(go.Scatterpolar(
+            r=closed,
+            theta=theta,
+            name=name,
+            fill="toself",
+            opacity=0.72,
+            line=dict(color=color, width=2),
+            marker=dict(size=5, color=color),
+            connectgaps=True,
+            customdata=customdata,
+            hovertemplate=hovertemplate,
+        ))
+
+    if not fig.data:
+        st.caption(f"**{title}** — no radar data")
+        return
+
+    fig.update_layout(
+        title=title,
+        height=height,
+        margin=dict(l=30, r=30, t=50, b=30),
+        polar=dict(
+            radialaxis=dict(
+                visible=True,
+                range=[0, 1],
+                tickformat=".1f",
+                gridcolor="rgba(150,150,150,0.25)",
+            ),
+            angularaxis=dict(gridcolor="rgba(150,150,150,0.25)"),
+        ),
+        legend=dict(orientation="h", y=-0.12),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
+def _radar_axis_maxima(
+    series: list[tuple[str, list[float | None], str]],
+    width: int,
+) -> list[float]:
+    maxima: list[float] = []
+    for idx in range(width):
+        vals = [
+            float(values[idx])
+            for _, values, _ in series
+            if idx < len(values) and isinstance(values[idx], (int, float))
+        ]
+        max_v = max(vals) if vals else 1.0
+        maxima.append(max_v if max_v > 0 else 1.0)
+    return maxima
+
+
+def _render_expert_factuality_radar(
+    title: str,
+    series: list[tuple[str, list[float | None], str]],
+    *,
+    height: int,
+) -> None:
+    expert_labels = [f"Expert · {label}" for _, label in _EXPERT_RADAR_METRICS]
+    fact_labels = [f"CitCorrect · {label}" for _, label in _FACTUALITY_RADAR_METRICS]
+    expert_width = len(_EXPERT_RADAR_METRICS)
+    labels = expert_labels + fact_labels
+    axis_maxima = (
+        _radar_axis_maxima(series, expert_width)
+        + [1.0] * len(_FACTUALITY_RADAR_METRICS)
+    )
+    _render_radar_chart(
+        title,
+        labels,
+        series,
+        height=height,
+        axis_maxima=axis_maxima,
+        show_axis_maxima=True,
+    )
+
+
+def _mean_metric(df: pd.DataFrame, model: str, metric_key: str) -> float | None:
+    sub = df[(df["model"] == model) & (df["metric"] == metric_key)]
+    return float(sub["value"].mean()) if not sub.empty else None
+
+
+def _render_aggregate_expert_factuality_profile(
+    expert_profile: dict,
+    factuality_profile: dict,
+) -> None:
+    expert_df = expert_profile["df"]
+    factuality_df = factuality_profile["df"]
+    factuality_models = set(factuality_profile["selected"])
+    selected = [
+        model for model in expert_profile["selected"]
+        if model in factuality_models
+    ]
+    if not selected:
+        st.caption("No overlapping models for combined expert + factuality profile.")
+        return
+
+    series = []
+    for i, model in enumerate(selected):
+        values = (
+            [_mean_metric(expert_df, model, key) for key, _ in _EXPERT_RADAR_METRICS]
+            + [_mean_metric(factuality_df, model, key) for key, _ in _FACTUALITY_RADAR_METRICS]
+        )
+        if any(v is not None for v in values):
+            series.append((model, values, _RADAR_COLORS[i % len(_RADAR_COLORS)]))
+
+    if not series:
+        st.caption("No data for combined expert + factuality profile.")
+        return
+
+    st.subheader("Expert + CitCorrect profile")
+    st.caption(
+        "Expert axes are scaled by the maximum among selected models; "
+        "CitCorrect axes use max 1.0."
+    )
+    _render_expert_factuality_radar(
+        "Average across surveys",
+        series,
+        height=540,
+    )
+
+
+def _render_factuality_distributions(dataset: str) -> dict | None:
     """Per-model distributions for factuality metric.
 
     Mirrors :func:`_render_expert_distributions` but targets
@@ -1285,8 +1822,9 @@ def _render_factuality_distributions(dataset: str) -> None:
         return
 
     # Long-format scalar rows + wide-format category-distribution rows.
-    rows:     list[dict] = []
-    cat_rows: list[dict] = []
+    rows:           list[dict] = []
+    cat_rows:       list[dict] = []
+    full_text_rows: list[dict] = []
     for model in selected:
         run_dir = _find_run_with_suffix(dataset, model, "factuality", variant)
         if run_dir is None:
@@ -1300,6 +1838,7 @@ def _render_factuality_distributions(dataset: str) -> None:
                 logger.debug(f"Failed to load factuality file {f}", exc_info=True)
                 continue
             sid = str(d.get("survey_id") or d.get("id") or f.stem)
+
             for metric_key, _ in _FACTUALITY_SCALAR_METRICS:
                 v = d.get(metric_key)
                 if isinstance(v, (int, float)):
@@ -1309,6 +1848,27 @@ def _render_factuality_distributions(dataset: str) -> None:
                         "metric":    metric_key,
                         "value":     float(v),
                     })
+
+            full_text_ref_ids = _load_full_text_ref_ids(dataset, model, sid)
+            claims = d.get("claims")
+            if full_text_ref_ids and isinstance(claims, list):
+                full_text_claims = [
+                    claim for claim in claims
+                    if isinstance(claim, dict)
+                    and _claim_has_full_text_for_scope(claim, full_text_ref_ids)
+                ]
+                profile = _cit_correct_profile_from_claims(full_text_claims)
+                for metric_key, _ in _FACTUALITY_RADAR_METRICS:
+                    v = profile.get(metric_key)
+                    if isinstance(v, (int, float)):
+                        full_text_rows.append({
+                            "model":     model,
+                            "survey_id": sid,
+                            "metric":    metric_key,
+                            "value":     float(v),
+                            "n_claims":  len(full_text_claims),
+                        })
+
             # category_counts shape:
             #   {"A": {"n": int, "n_supported": int}, "B": ..., "C": ..., "D": ...}
             cc = d.get("category_counts")
@@ -1373,6 +1933,46 @@ def _render_factuality_distributions(dataset: str) -> None:
                 )
                 st.plotly_chart(fig, width="stretch")
 
+    # ── Full-text-covered scope profile — extra spider chart ─────────────
+    # Keeps only claims where every citation in `scope_citations` maps to a
+    # source ref with cached full text. This is viewer-side recomputation
+    # from per-claim support labels; original score files stay unchanged.
+    if full_text_rows:
+        st.markdown("#### CitCorrect profile (full-text-covered scopes only)")
+        ftdf = pd.DataFrame(full_text_rows)
+        radar_labels = [label for _, label in _FACTUALITY_RADAR_METRICS]
+        radar_series = []
+        kept_parts = []
+        for i, model in enumerate(selected):
+            mdf = ftdf[ftdf["model"] == model]
+            if mdf.empty:
+                continue
+            values = []
+            for metric_key, _ in _FACTUALITY_RADAR_METRICS:
+                sub = mdf[mdf["metric"] == metric_key]
+                values.append(float(sub["value"].mean()) if not sub.empty else None)
+            radar_series.append((model, values, _RADAR_COLORS[i % len(_RADAR_COLORS)]))
+
+            per_survey_n = (
+                mdf[["survey_id", "n_claims"]]
+                .drop_duplicates()
+                .set_index("survey_id")["n_claims"]
+            )
+            if not per_survey_n.empty:
+                kept_parts.append(
+                    f"{model}: {per_survey_n.mean():.1f} claims/survey"
+                )
+
+        if radar_series:
+            _render_radar_chart(
+                "Average across surveys",
+                radar_labels,
+                radar_series,
+                height=430,
+            )
+            if kept_parts:
+                st.caption("Filtered subset size — " + "  ·  ".join(kept_parts))
+
     # ── Category distribution (mean per model) — stacked bar ──────────────
     # Shows how claim categories are split across a model's surveys. A
     # skew toward A means the model mostly cites abstract-level stuff; a
@@ -1386,6 +1986,21 @@ def _render_factuality_distributions(dataset: str) -> None:
                .reindex(selected)
                .dropna(how="all")
         )
+        cat_labels = [_FACTUALITY_CATEGORY_LABELS[c] for c in ("A", "B", "C", "D")]
+        cat_series = []
+        for i, model in enumerate(means.index):
+            cat_series.append((
+                model,
+                [float(means.loc[model, c]) for c in ("A", "B", "C", "D")],
+                _RADAR_COLORS[i % len(_RADAR_COLORS)],
+            ))
+        _render_radar_chart(
+            "Average claim-category mix",
+            cat_labels,
+            cat_series,
+            height=430,
+        )
+
         fig = go.Figure()
         for cat in ("A", "B", "C", "D"):
             fig.add_trace(go.Bar(
@@ -1523,6 +2138,264 @@ def _render_factuality_distributions(dataset: str) -> None:
                                 "q90":         "{:+.4f}",
                                 "max":         "{:+.4f}",
                                 "M1 > M2 (%)": "{:.0f}%",
+                            }),
+                            width="stretch",
+                        )
+
+    return {
+        "selected": selected,
+        "df": df,
+    }
+
+
+# ── Structural contradiction distributions renderer ──────────────────────────
+
+_STRUCTURAL_CONTR_METRICS: list[tuple[str, str]] = [
+    ("contr_m_contr",                 "M_contr"),
+    ("contr_n_contradictions",        "# contradictions"),
+    ("contr_n_after_topic_filter",    "# after topic filter"),
+    ("contr_n_candidates_stage1",     "# SPECTER candidates"),
+    ("contr_n_failed",                "# failed checks"),
+]
+
+
+def _render_structural_contradiction_distributions(dataset: str) -> None:
+    st.subheader("Structural contradiction — distributions across surveys")
+
+    all_models = _get_models_for_dataset(dataset)
+    models_with_structural = [
+        m for m in all_models if _list_score_runs(dataset, m, "structural")
+    ]
+    if not models_with_structural:
+        st.caption(f"No structural runs found for dataset **{dataset}**.")
+        return
+
+    all_runs: list[pathlib.Path] = []
+    for model in models_with_structural:
+        all_runs.extend(_list_score_runs(dataset, model, "structural"))
+    all_runs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    suffixes: list[str] = []
+    seen: set[str] = set()
+    for run_dir in all_runs:
+        suffix = _run_suffix(run_dir, dataset, "structural")
+        if suffix not in seen:
+            seen.add(suffix)
+            suffixes.append(suffix)
+
+    if len(suffixes) > 1:
+        variant = st.sidebar.selectbox(
+            "Structural variant",
+            suffixes,
+            index=0,
+            format_func=lambda s: s.lstrip("_") or "(no suffix)",
+            key="agg_structural_variant",
+            help="Same structural run variant is applied across all models.",
+        )
+    else:
+        variant = suffixes[0] if suffixes else ""
+
+    available = [
+        model for model in models_with_structural
+        if _find_run_with_suffix(dataset, model, "structural", variant) is not None
+    ]
+    if not available:
+        st.info("No models have a structural run with the chosen variant.")
+        return
+
+    selected = st.multiselect(
+        "Models",
+        options=available,
+        default=available,
+        key="agg_structural_models",
+    )
+    if not selected:
+        st.info("Select at least one model to plot.")
+        return
+
+    rows: list[dict] = []
+    for model in selected:
+        run_dir = _find_run_with_suffix(dataset, model, "structural", variant)
+        if run_dir is None:
+            continue
+        for f in sorted(run_dir.glob("*.json"), key=_numeric_stem_key):
+            if f.stem in {"summary", "aggregate"}:
+                continue
+            try:
+                d = load_json(f)
+            except Exception:
+                logger.debug(f"Failed to load structural file {f}", exc_info=True)
+                continue
+            sid = str(d.get("survey_id") or d.get("id") or f.stem)
+            for metric_key, _ in _STRUCTURAL_CONTR_METRICS:
+                v = d.get(metric_key)
+                if isinstance(v, (int, float)):
+                    rows.append({
+                        "model":     model,
+                        "survey_id": sid,
+                        "metric":    metric_key,
+                        "value":     float(v),
+                    })
+
+    if not rows:
+        st.info("No contradiction data loaded for the selected models / variant.")
+        return
+
+    df = pd.DataFrame(rows)
+
+    st.markdown("#### Contradiction metrics")
+    cols_per_row = 2
+    for i in range(0, len(_STRUCTURAL_CONTR_METRICS), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for j, col in enumerate(cols):
+            if i + j >= len(_STRUCTURAL_CONTR_METRICS):
+                break
+            metric, label = _STRUCTURAL_CONTR_METRICS[i + j]
+            sub = df[df["metric"] == metric]
+            with col:
+                if sub.empty:
+                    st.caption(f"**{label}** — no data")
+                    continue
+                fig = go.Figure()
+                for model in selected:
+                    mdata = sub[sub["model"] == model]
+                    if mdata.empty:
+                        continue
+                    fig.add_trace(go.Box(
+                        y=mdata["value"],
+                        name=model,
+                        boxpoints="all",
+                        jitter=0.35,
+                        pointpos=0,
+                        marker=dict(size=4, opacity=0.6),
+                        line=dict(width=1),
+                        hovertemplate=(
+                            "<b>%{fullData.name}</b><br>"
+                            "value: %{y:.4f}<br>"
+                            "survey: %{customdata}<extra></extra>"
+                        ),
+                        customdata=mdata["survey_id"],
+                    ))
+                fig.update_layout(
+                    title=label,
+                    yaxis_title="value",
+                    showlegend=False,
+                    height=320,
+                    margin=dict(l=40, r=20, t=40, b=40),
+                )
+                st.plotly_chart(fig, width="stretch")
+
+    with st.expander("Pairwise delta (M1 − M2) across surveys", expanded=False):
+        if len(selected) < 2:
+            st.info("Pick at least 2 models in the multiselect above to compute a pairwise delta.")
+        else:
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                m1 = st.selectbox(
+                    "M1 (minuend)",
+                    options=selected,
+                    index=0,
+                    key="agg_struct_delta_m1",
+                )
+            with col_m2:
+                m2 = st.selectbox(
+                    "M2 (subtrahend)",
+                    options=selected,
+                    index=min(1, len(selected) - 1),
+                    key="agg_struct_delta_m2",
+                )
+            if m1 == m2:
+                st.info("Pick two different models.")
+            else:
+                left = (
+                    df[df["model"] == m1]
+                    [["survey_id", "metric", "value"]]
+                    .rename(columns={"value": "v1"})
+                )
+                right = (
+                    df[df["model"] == m2]
+                    [["survey_id", "metric", "value"]]
+                    .rename(columns={"value": "v2"})
+                )
+                merged = left.merge(right, on=["survey_id", "metric"], how="inner")
+                merged["delta"] = merged["v1"] - merged["v2"]
+
+                if merged.empty:
+                    st.info(
+                        "No overlapping (survey_id × metric) pairs between "
+                        f"**{m1}** and **{m2}**."
+                    )
+                else:
+                    st.caption(f"**{m1} − {m2}** · paired survey deltas")
+                    non_empty = [
+                        (key, label) for key, label in _STRUCTURAL_CONTR_METRICS
+                        if not merged[merged["metric"] == key].empty
+                    ]
+                    if non_empty:
+                        cols = st.columns(len(non_empty))
+                        for col, (metric_key, label) in zip(cols, non_empty):
+                            sub = merged[merged["metric"] == metric_key]
+                            with col:
+                                fig = go.Figure()
+                                fig.add_trace(go.Box(
+                                    y=sub["delta"],
+                                    name=label,
+                                    boxpoints="all",
+                                    jitter=0.35,
+                                    pointpos=0,
+                                    marker=dict(size=5, opacity=0.65),
+                                    line=dict(width=1),
+                                    hovertemplate=(
+                                        "Δ: %{y:.4f}<br>"
+                                        "survey: %{customdata}<extra></extra>"
+                                    ),
+                                    customdata=sub["survey_id"],
+                                ))
+                                fig.add_hline(y=0, line_dash="dash", line_color="gray")
+                                fig.update_layout(
+                                    title=dict(text=label, font=dict(size=13)),
+                                    yaxis_title="Δ",
+                                    showlegend=False,
+                                    height=380,
+                                    margin=dict(l=40, r=10, t=40, b=20),
+                                    xaxis=dict(showticklabels=False),
+                                )
+                                st.plotly_chart(fig, width="stretch")
+
+                    summary_rows = []
+                    for metric_key, label in _STRUCTURAL_CONTR_METRICS:
+                        sub = merged[merged["metric"] == metric_key]
+                        if sub.empty:
+                            continue
+                        d = sub["delta"]
+                        summary_rows.append({
+                            "metric":       label,
+                            "n":            len(d),
+                            "mean Δ":       d.mean(),
+                            "std":          d.std(ddof=0),
+                            "min":          d.min(),
+                            "q10":          d.quantile(0.10),
+                            "q25":          d.quantile(0.25),
+                            "median":       d.median(),
+                            "q75":          d.quantile(0.75),
+                            "q90":          d.quantile(0.90),
+                            "max":          d.max(),
+                            "M1 lower (%)": 100.0 * (d < 0).mean(),
+                        })
+                    if summary_rows:
+                        sum_df = pd.DataFrame(summary_rows).set_index("metric")
+                        st.dataframe(
+                            sum_df.style.format({
+                                "n":            "{:.0f}",
+                                "mean Δ":       "{:+.4f}",
+                                "std":          "{:.4f}",
+                                "min":          "{:+.4f}",
+                                "q10":          "{:+.4f}",
+                                "q25":          "{:+.4f}",
+                                "median":       "{:+.4f}",
+                                "q75":          "{:+.4f}",
+                                "q90":          "{:+.4f}",
+                                "max":          "{:+.4f}",
+                                "M1 lower (%)": "{:.0f}%",
                             }),
                             width="stretch",
                         )
@@ -1880,6 +2753,43 @@ def page_comparison() -> None:
         b = db_.name if db_ else "—"
         return f"<small>🔵 {a}  ·  🔴 {b}</small>"
 
+    ea = _load_survey_json(exp_a, survey_id) if have_expert else None
+    eb = _load_survey_json(exp_b, survey_id) if have_expert else None
+    fa = _load_survey_json(fac_a, survey_id) if have_factuality else None
+    fb = _load_survey_json(fac_b, survey_id) if have_factuality else None
+
+    if (ea or eb) and (fa or fb):
+        st.markdown("### Expert + Factuality")
+        st.markdown(
+            _source_caption(exp_a, exp_b) + "<br>" + _source_caption(fac_a, fac_b),
+            unsafe_allow_html=True,
+        )
+        combined_series = []
+        if ea or fa:
+            combined_series.append((
+                model_a,
+                [ea.get(key) if ea else None for key, _ in _EXPERT_RADAR_METRICS]
+                + [fa.get(key) if fa else None for key, _ in _FACTUALITY_RADAR_METRICS],
+                "#2196F3",
+            ))
+        if eb or fb:
+            combined_series.append((
+                model_b,
+                [eb.get(key) if eb else None for key, _ in _EXPERT_RADAR_METRICS]
+                + [fb.get(key) if fb else None for key, _ in _FACTUALITY_RADAR_METRICS],
+                "#E91E63",
+            ))
+        st.caption(
+            "Expert axes are scaled by the maximum among the visible models; "
+            "CitCorrect axes use max 1.0."
+        )
+        _render_expert_factuality_radar(
+            "Expert + CitCorrect profile",
+            combined_series,
+            height=420,
+        )
+        st.divider()
+
     # ── Diversity table ────────────────────────────────────────────────────────
     if have_diversity:
         st.markdown("### Diversity")
@@ -1900,8 +2810,6 @@ def page_comparison() -> None:
     if have_expert:
         st.markdown("### Expert")
         st.markdown(_source_caption(exp_a, exp_b), unsafe_allow_html=True)
-        ea = _load_survey_json(exp_a, survey_id)
-        eb = _load_survey_json(exp_b, survey_id)
 
         if ea is None and eb is None:
             st.info("No expert data for this survey.")
@@ -1918,6 +2826,35 @@ def page_comparison() -> None:
             if mod_a or mod_b:
                 st.markdown("**Modality distribution**")
                 levels = ["1", "2", "3", "4", "5"]
+                mod_labels = [_MODALITY_LABELS[l] for l in levels]
+                mod_radar_series = []
+
+                def _norm_modality(mdist):
+                    if not isinstance(mdist, dict):
+                        return None
+                    total = sum(
+                        float(mdist.get(l, 0))
+                        for l in levels
+                        if isinstance(mdist.get(l, 0), (int, float))
+                    )
+                    if total <= 0:
+                        return None
+                    return [float(mdist.get(l, 0)) / total for l in levels]
+
+                mod_vals_a = _norm_modality(mod_a)
+                mod_vals_b = _norm_modality(mod_b)
+                if mod_vals_a:
+                    mod_radar_series.append((model_a, mod_vals_a, "#2196F3"))
+                if mod_vals_b:
+                    mod_radar_series.append((model_b, mod_vals_b, "#E91E63"))
+                if mod_radar_series:
+                    _render_radar_chart(
+                        "Modality category mix",
+                        mod_labels,
+                        mod_radar_series,
+                        height=340,
+                    )
+
                 fig = go.Figure()
                 if mod_a:
                     fig.add_trace(go.Bar(
@@ -1947,8 +2884,6 @@ def page_comparison() -> None:
     if have_factuality:
         st.markdown("### Factuality")
         st.markdown(_source_caption(fac_a, fac_b), unsafe_allow_html=True)
-        fa = _load_survey_json(fac_a, survey_id)
-        fb = _load_survey_json(fac_b, survey_id)
 
         if fa is None and fb is None:
             st.info("No factuality data for this survey.")
@@ -1972,6 +2907,32 @@ def page_comparison() -> None:
 
             # ── Table 1: Claim distribution (always) ──────────────────────────
             st.markdown("**Claim distribution**")
+            cat_labels = [name for _, name in _CAT_NAMES]
+            cat_radar_series = []
+
+            def _claim_category_mix(d):
+                total = d.get("n_claims") if d else None
+                if not isinstance(total, (int, float)) or total <= 0:
+                    return None
+                return [
+                    ((_cc(d).get(k) or {}).get("n", 0) / total)
+                    for k, _ in _CAT_NAMES
+                ]
+
+            cat_vals_a = _claim_category_mix(fa)
+            cat_vals_b = _claim_category_mix(fb)
+            if cat_vals_a:
+                cat_radar_series.append((model_a, cat_vals_a, "#2196F3"))
+            if cat_vals_b:
+                cat_radar_series.append((model_b, cat_vals_b, "#E91E63"))
+            if cat_radar_series:
+                _render_radar_chart(
+                    "Claim-category mix",
+                    cat_labels,
+                    cat_radar_series,
+                    height=340,
+                )
+
             dist_rows = [
                 (name, None, _n(fa, k), _n(fb, k))
                 for k, name in _CAT_NAMES
@@ -2158,6 +3119,138 @@ def page_hyperopt() -> None:
         page_hyperopt_specter_thr()
 
 
+# ── Page: Markup ──────────────────────────────────────────────────────────────
+
+def page_markup() -> None:
+    st.header("Разметка")
+
+    metric = st.sidebar.selectbox("Metric", ["Structural"], key="markup_metric")
+    st.sidebar.divider()
+
+    sample_files = sorted(SAMPLES_DIR.glob("*.json"))
+    if not sample_files:
+        st.info(
+            "No sample files found. Generate one into "
+            "`analisis/samples/` from the analysis notebook first."
+        )
+        return
+
+    sample_file = st.sidebar.selectbox(
+        "Sample file",
+        sample_files,
+        format_func=lambda p: p.name,
+        key="markup_sample_file",
+    )
+
+    try:
+        data = load_json(sample_file)
+    except Exception as e:
+        st.error(f"Failed to load sample file: {e}")
+        return
+
+    samples = _sample_items(data)
+    if not samples:
+        st.warning("Selected sample file has no samples/items.")
+        return
+
+    existing = _load_existing_markup(sample_file)
+    options = list(_STRUCTURAL_MARKUP_CLASSES.keys())
+
+    if isinstance(data, dict):
+        st.caption(
+            f"metric={metric} · source={data.get('source_run', '—')} · "
+            f"sample_file={sample_file.name} · n={len(samples)}"
+        )
+    else:
+        st.caption(f"metric={metric} · sample_file={sample_file.name} · n={len(samples)}")
+
+    answers = []
+    with st.form("markup_form"):
+        for i, sample in enumerate(samples, 1):
+            sample_id = str(sample.get("sample_id") or f"{sample_file.stem}:{i}")
+            saved = existing.get(sample_id, {})
+            saved_class = saved.get("class")
+            saved_comment = saved.get("comment") or ""
+            default_index = options.index(saved_class) if saved_class in options else None
+
+            st.markdown("---")
+            st.markdown(f"### {i}. Survey `{sample.get('survey_id', '—')}`")
+            st.caption(
+                f"id={sample_id} · type={sample.get('contradiction_type', '—')} · "
+                f"similarity={sample.get('similarity', '—')}"
+            )
+            if sample.get("query"):
+                st.markdown(f"**{sample.get('query')}**")
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown(f"**Section 1:** {sample.get('section_1', '—')}")
+                _render_sample_text("Statement 1", sample.get("statement_1"))
+            with col_b:
+                st.markdown(f"**Section 2:** {sample.get('section_2', '—')}")
+                _render_sample_text("Statement 2", sample.get("statement_2"))
+
+            if sample.get("reasoning"):
+                with st.expander("Judge reasoning", expanded=False):
+                    st.markdown(sample["reasoning"])
+
+            with st.expander("Paragraph context", expanded=False):
+                c1, c2 = st.columns(2)
+                with c1:
+                    _render_context_window(sample, 1)
+                with c2:
+                    _render_context_window(sample, 2)
+
+            cls = st.radio(
+                "Класс",
+                options,
+                index=default_index,
+                format_func=lambda x: _STRUCTURAL_MARKUP_CLASSES[x],
+                key=f"markup_class_{sample_file.stem}_{i}",
+            )
+            comment = st.text_area(
+                "Комментарий",
+                value=saved_comment,
+                key=f"markup_comment_{sample_file.stem}_{i}",
+            )
+            answers.append({
+                "sample_id": sample_id,
+                "class": cls,
+                "comment": comment.strip(),
+                "sample": sample,
+            })
+
+        submitted = st.form_submit_button("Submit")
+
+    if not submitted:
+        return
+
+    missing = [row["sample_id"] for row in answers if row["class"] is None]
+    if missing:
+        st.error(
+            "Not all samples are marked: " + ", ".join(missing[:5])
+            + (" ..." if len(missing) > 5 else "")
+        )
+        return
+
+    MARKUPS_DIR.mkdir(parents=True, exist_ok=True)
+    out_file = MARKUPS_DIR / f"{sample_file.stem}_markup.json"
+    payload = {
+        "metric": metric,
+        "sample_file": str(sample_file.relative_to(ROOT)),
+        "source_run": data.get("source_run") if isinstance(data, dict) else None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "n_samples": len(answers),
+        "classes": _STRUCTURAL_MARKUP_CLASSES,
+        "markups": answers,
+    }
+    out_file.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    st.success(f"Saved markup → {out_file.relative_to(ROOT)}")
+
+
 # ── Routing ────────────────────────────────────────────────────────────────────
 
 # Reset nav indices when switching pages
@@ -2172,7 +3265,14 @@ def _on_page_change() -> None:
 
 page = st.sidebar.radio(
     "View",
-    ["Generations", "Evaluations", "PointsMetrics", "AggregatedMetrics", "HyperOpt"],
+    [
+        "Generations",
+        "Evaluations",
+        "PointsMetrics",
+        "AggregatedMetrics",
+        "Разметка",
+        "HyperOpt",
+    ],
     index=0, on_change=_on_page_change
 )
 st.sidebar.divider()
@@ -2183,6 +3283,8 @@ elif page == "PointsMetrics":
     page_comparison()
 elif page == "AggregatedMetrics":
     page_aggregated_metrics()
+elif page == "Разметка":
+    page_markup()
 elif page == "HyperOpt":
     page_hyperopt()
 else:

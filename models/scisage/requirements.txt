@@ -1,0 +1,21 @@
+# SciSage-specific dependencies. The base thesis env already contains torch,
+# transformers, spacy, nltk, openai, requests, tqdm, etc.; duplicates are fine.
+langchain>=0.1.0
+langchain-openai>=0.1.0
+langgraph
+func_timeout
+cachetools
+biopython
+gevent
+PyMuPDF
+uvicorn
+fastapi
+crawl4ai==0.6.3
+pdfminer.six>=20221105
+arxiv>=1.4.0
+semanticscholar>=0.3.0
+json5>=0.9.0
+jsonlines>=3.1.0
+asyncio-throttle>=1.0.2
+aiohttp>=3.8.0
+backoff>=2.2.0

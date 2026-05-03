@@ -13,7 +13,6 @@ computes four metrics via LLM-as-judge (C.1–C.4):
 
   M_crit       — fraction of claims that are critical (C.1)
   M_comp_total — fraction of claims that are comparative (C.2)
-  M_comp_valid — fraction of comparative claims that are valid (C.2)
   M_open       — fraction of claims that formulate open questions (C.3)
   M_mod        — Shannon entropy of epistemic modality distribution (C.4)
 
@@ -315,9 +314,6 @@ def process_survey(
     m_crit       = round(sum(1 for c in judged_claims if c.get("is_critical")) / n, 4) if n else 0.0
     m_comp_total = round(sum(1 for c in judged_claims if c.get("is_comparative")) / n, 4) if n else 0.0
     comparative  = [c for c in judged_claims if c.get("is_comparative")]
-
-    # m_comp_valid not yet computed — judge_valid_comparison not wired in
-    m_comp_valid = None
 
     m_open = round(sum(1 for c in judged_claims if c.get("is_open_question")) / n, 4) if n else 0.0
 

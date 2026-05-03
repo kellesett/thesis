@@ -7,19 +7,26 @@ nli_model_path:     models_cache/microsoft--deberta-v2-xlarge-mnli
 specter_model_path: models_cache/sentence-transformers--allenai-specter
 
 # ── LLM судья (через OpenRouter) ─────────────────────────────────────────────
-judge_model:       qwen/qwen3-32b
+judge_model:       google/gemma-4-31b-it
 judge_base_url:    https://openrouter.ai/api/v1
 judge_api_key_env: OPENROUTER_API_KEY
-judge_provider:    alibaba        # опционально — явно указать провайдера
-judge_reasoning:     false          # отключить thinking токены
-judge_log_reasoning: false          # не включать поле reasoning в JSON-схему промпта (~10x меньше output токенов)
-judge_id:          qwen3
+# judge_provider:    alibaba        # опционально — явно указать провайдера
+judge_reasoning:     true          # отключить thinking токены
+judge_log_reasoning: true          # не включать поле reasoning в JSON-схему промпта (~10x меньше output токенов)
+judge_id:          gemma-4-31b
 judge_comment:     run1
 
 # ── A.1 — Противоречия (новый pipeline) ──────────────────────────────────────
-similarity_threshold:   0.6    # cosine similarity порог для кандидатов (SPECTER)
+run_m_contr: true
+run_m_rep:   false
+contradiction_unit: paragraph # sentence | paragraph
+min_similarity_threshold: 0.6  # минимальный cosine similarity для кандидатов (SPECTER)
+top_k_per_sentence:     10     # оставить top-k cross-section соседей для каждого предложения
+paragraph_min_similarity_threshold: 0.6 # минимальный cosine similarity для пар параграфов
+paragraph_top_k:        10     # оставить top-k cross-section параграфов для каждого параграфа
+paragraph_max_chars:    1800   # максимум символов параграфа в contradiction prompt
 embedding_batch_size:   32     # batch size для SPECTER кодирования
-judge_workers:          25     # параллельные LLM вызовы (topic filter + contradiction)
+judge_workers:          50     # параллельные LLM вызовы (topic filter + contradiction)
 max_retries:            3      # retry попыток на LLM вызов
 cache_dir:              tmp/structural/cache    # diskcache директория, репо-относительный путь
 
