@@ -1739,6 +1739,14 @@ def main() -> None:
                         help="Override cfg.evidence_aggregation.")
     parser.add_argument("--max-ancestor-depth", type=int, default=None,
                         help="Override cfg.section_max_ancestor_depth (None in config = unlimited).")
+    parser.add_argument("--full-text-top-k-chunks", type=int, default=None,
+                        help="Override cfg.full_text_top_k_chunks. 0 disables top-k retrieval "
+                             "and falls back to scoring all chunks of the full text.")
+    parser.add_argument("--full-text-abstract-skip-threshold", type=float, default=None,
+                        help="Override cfg.full_text_abstract_skip_threshold. AlignScore on "
+                             "the abstract above this value short-circuits the full-text fallback.")
+    parser.add_argument("--full-text-chunk-words", type=int, default=None,
+                        help="Override cfg.full_text_chunk_words (chunk size, in words).")
     parser.add_argument("--debug-claim-idx", type=int, default=None,
                         help="For the claim at this index (0-based, within each survey) "
                              "log detailed scope / evidence / class / support to the log "
@@ -1758,6 +1766,12 @@ def main() -> None:
         cfg["evidence_aggregation"] = args.evidence_aggregation
     if args.max_ancestor_depth is not None:
         cfg["section_max_ancestor_depth"] = args.max_ancestor_depth
+    if args.full_text_top_k_chunks is not None:
+        cfg["full_text_top_k_chunks"] = args.full_text_top_k_chunks
+    if args.full_text_abstract_skip_threshold is not None:
+        cfg["full_text_abstract_skip_threshold"] = args.full_text_abstract_skip_threshold
+    if args.full_text_chunk_words is not None:
+        cfg["full_text_chunk_words"] = args.full_text_chunk_words
     # Pass --debug-claim-idx through the cfg dict to process_survey. Using
     # an underscore-prefixed key to signal "internal / not from config.yaml".
     if args.debug_claim_idx is not None:
